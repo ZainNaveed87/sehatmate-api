@@ -10,6 +10,12 @@ import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import mysql from 'mysql2/promise';
 
+import {
+  AiServiceError,
+  aiConfiguration,
+  generateAiText,
+} from './ai_service.js';
+
 const requiredEnvironment = [
   'DB_HOST',
   'DB_NAME',
@@ -99,6 +105,17 @@ const uploadLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many document uploads. Please try again later.',
+  },
+});
+
+const aiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 15,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many AI requests. Please try again later.',
   },
 });
 
@@ -462,8 +479,36 @@ app.get('/health', async (_req, res, next) => {
       success: true,
       service: 'sehatroute-auth-api',
       database: 'connected',
+      ai: aiConfiguration(),
     });
   } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/ai/test', authenticate, aiLimiter, async (_req, res, next) => {
+  try {
+    const result = await generateAiText({
+      systemPrompt:
+        'You are a connection test. Follow the user instruction exactly and add nothing else.',
+      userPrompt: 'Reply with exactly: SEHATMATE_AI_OK',
+      temperature: 0,
+      maxTokens: 20,
+    });
+
+    res.json({
+      success: true,
+      message: 'AI provider connected successfully.',
+      data: result,
+    });
+  } catch (error) {
+    if (error instanceof AiServiceError) {
+      res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+      return;
+    }
     next(error);
   }
 });
