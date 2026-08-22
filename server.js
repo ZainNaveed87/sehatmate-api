@@ -2,6 +2,7 @@ import 'dotenv/config';
 
 import bcrypt from 'bcryptjs';
 import cors from 'cors';
+import crypto from 'node:crypto';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { OAuth2Client } from 'google-auth-library';
@@ -72,12 +73,12 @@ app.use(
 
       callback(new Error('Origin is not allowed by CORS.'));
     },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
   }),
 );
 
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '28mb' }));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -87,6 +88,17 @@ const authLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many attempts. Please try again later.',
+  },
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many document uploads. Please try again later.',
   },
 });
 
@@ -117,6 +129,19 @@ const carePlanStatuses = new Set([
   'active',
   'completed',
 ]);
+const documentTypes = new Set([
+  'prescription',
+  'discharge',
+  'followup',
+  'lab',
+  'other',
+]);
+const allowedDocumentMimeTypes = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+]);
+const maximumDocumentBytes = 20 * 1024 * 1024;
 const allowedStatusTransitions = {
   draft: new Set(['processing']),
   processing: new Set(['needs_review']),
@@ -324,6 +349,28 @@ function parseStoredJson(value) {
   } catch {
     return [];
   }
+}
+
+function safeDocumentName(value) {
+  const cleaned = typeof value === 'string'
+    ? value.replace(/\\/g, '/').split('/').pop().trim()
+    : '';
+  return cleaned.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 255);
+}
+
+function validDocumentSignature(buffer, mimeType) {
+  if (mimeType === 'application/pdf') {
+    return buffer.length >= 5 && buffer.subarray(0, 5).toString() === '%PDF-';
+  }
+  if (mimeType === 'image/jpeg') {
+    return buffer.length >= 3 &&
+      buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+  }
+  if (mimeType === 'image/png') {
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    return buffer.length >= 8 && buffer.subarray(0, 8).equals(pngSignature);
+  }
+  return false;
 }
 
 async function saveProfile(userId, profile, onboardingCompleted) {
@@ -832,6 +879,199 @@ app.post('/api/care-plans', authenticate, async (req, res, next) => {
   }
 });
 
+app.post(
+  '/api/care-plans/:id/documents',
+  authenticate,
+  uploadLimiter,
+  async (req, res, next) => {
+    const planId = req.params.id;
+    const documentType = cleanText(req.body?.documentType, 40);
+    const originalName = safeDocumentName(req.body?.originalName);
+    const mimeType = cleanText(req.body?.mimeType, 100).toLowerCase();
+    const contentBase64 = typeof req.body?.contentBase64 === 'string'
+      ? req.body.contentBase64.trim()
+      : '';
+
+    if (!idPattern.test(planId)) {
+      res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+      return;
+    }
+    if (!documentTypes.has(documentType)) {
+      res.status(422).json({ success: false, message: 'Select a valid document type.' });
+      return;
+    }
+    if (originalName.length < 1 || !allowedDocumentMimeTypes.has(mimeType)) {
+      res.status(422).json({
+        success: false,
+        message: 'Only PDF, JPG and PNG documents are supported.',
+      });
+      return;
+    }
+    if (
+      contentBase64.length === 0 ||
+      contentBase64.length > Math.ceil(maximumDocumentBytes * 4 / 3) + 4 ||
+      !/^[A-Za-z0-9+/]+={0,2}$/.test(contentBase64)
+    ) {
+      res.status(422).json({ success: false, message: 'The document data is invalid.' });
+      return;
+    }
+
+    const fileBuffer = Buffer.from(contentBase64, 'base64');
+    if (
+      fileBuffer.length === 0 ||
+      fileBuffer.length > maximumDocumentBytes ||
+      !validDocumentSignature(fileBuffer, mimeType)
+    ) {
+      res.status(422).json({
+        success: false,
+        message: 'The document is invalid or exceeds the 20 MB limit.',
+      });
+      return;
+    }
+
+    try {
+      const [plans] = await pool.execute(
+        'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+        [planId, req.auth.userId],
+      );
+      if (plans.length === 0) {
+        res.status(404).json({ success: false, message: 'Care plan not found.' });
+        return;
+      }
+
+      const extension = mimeType === 'application/pdf'
+        ? 'pdf'
+        : mimeType === 'image/png'
+          ? 'png'
+          : 'jpg';
+      const storedName = `${crypto.randomUUID()}.${extension}`;
+      const storagePath = `mysql://care_documents/${storedName}`;
+      const sha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+      const [result] = await pool.execute(
+        `INSERT INTO care_documents (
+          care_plan_id, user_id, document_type, original_name, stored_name,
+          mime_type, file_size_bytes, storage_path, file_data, file_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          planId,
+          req.auth.userId,
+          documentType,
+          originalName,
+          storedName,
+          mimeType,
+          fileBuffer.length,
+          storagePath,
+          fileBuffer,
+          sha256,
+        ],
+      );
+
+      await pool.execute(
+        `UPDATE care_plans SET status = CASE
+          WHEN status = 'draft' THEN 'processing'
+          ELSE status
+         END WHERE id = ? AND user_id = ?`,
+        [planId, req.auth.userId],
+      );
+
+      const [documents] = await pool.execute(
+        `SELECT id, document_type, original_name, mime_type, file_size_bytes,
+          page_count, processing_status, processing_error, created_at
+         FROM care_documents WHERE id = ? AND user_id = ? LIMIT 1`,
+        [result.insertId, req.auth.userId],
+      );
+
+      res.status(201).json({
+        success: true,
+        message: 'Document uploaded successfully.',
+        data: {
+          document: {
+            ...documents[0],
+            id: String(documents[0].id),
+          },
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.get('/api/documents/:id/file', authenticate, async (req, res, next) => {
+  const documentId = req.params.id;
+  if (!idPattern.test(documentId)) {
+    res.status(422).json({ success: false, message: 'Invalid document ID.' });
+    return;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT original_name, mime_type, file_size_bytes, file_data
+       FROM care_documents WHERE id = ? AND user_id = ? LIMIT 1`,
+      [documentId, req.auth.userId],
+    );
+    const document = rows[0];
+    if (!document || !document.file_data) {
+      res.status(404).json({ success: false, message: 'Document file not found.' });
+      return;
+    }
+
+    const fallbackName = safeDocumentName(document.original_name)
+      .replace(/[^A-Za-z0-9._-]/g, '_');
+    res.setHeader('Content-Type', document.mime_type);
+    res.setHeader('Content-Length', String(document.file_size_bytes));
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(document.original_name)}`,
+    );
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(document.file_data);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/documents/:id', authenticate, async (req, res, next) => {
+  const documentId = req.params.id;
+  if (!idPattern.test(documentId)) {
+    res.status(422).json({ success: false, message: 'Invalid document ID.' });
+    return;
+  }
+
+  try {
+    const [documents] = await pool.execute(
+      `SELECT id, care_plan_id FROM care_documents
+       WHERE id = ? AND user_id = ? LIMIT 1`,
+      [documentId, req.auth.userId],
+    );
+    const document = documents[0];
+    if (!document) {
+      res.status(404).json({ success: false, message: 'Document not found.' });
+      return;
+    }
+
+    await pool.execute(
+      'DELETE FROM care_documents WHERE id = ? AND user_id = ?',
+      [documentId, req.auth.userId],
+    );
+    const [[counts]] = await pool.execute(
+      'SELECT COUNT(*) AS document_count FROM care_documents WHERE care_plan_id = ?',
+      [document.care_plan_id],
+    );
+    if (Number(counts.document_count || 0) === 0) {
+      await pool.execute(
+        `UPDATE care_plans SET status = 'draft'
+         WHERE id = ? AND user_id = ? AND status = 'processing'`,
+        [document.care_plan_id, req.auth.userId],
+      );
+    }
+
+    res.json({ success: true, message: 'Document removed successfully.', data: {} });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   if (!idPattern.test(planId)) {
@@ -1029,11 +1269,14 @@ app.use((error, _req, res, _next) => {
 
   const corsError =
     error?.message === 'Origin is not allowed by CORS.';
+  const bodyTooLarge = error?.type === 'entity.too.large';
 
-  res.status(corsError ? 403 : 500).json({
+  res.status(corsError ? 403 : bodyTooLarge ? 413 : 500).json({
     success: false,
     message: corsError
       ? error.message
+      : bodyTooLarge
+        ? 'The uploaded document exceeds the 20 MB limit.'
       : 'The server could not complete this request.',
   });
 });
