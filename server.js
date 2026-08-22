@@ -13,6 +13,7 @@ import mysql from 'mysql2/promise';
 import {
   AiServiceError,
   aiConfiguration,
+  extractCareInstructions,
   generateAiText,
 } from './ai_service.js';
 
@@ -159,6 +160,13 @@ const allowedDocumentMimeTypes = new Set([
   'image/png',
 ]);
 const maximumDocumentBytes = 20 * 1024 * 1024;
+const instructionCategories = new Set([
+  'medicine',
+  'follow_up',
+  'lab_test',
+  'care_task',
+  'other',
+]);
 const allowedStatusTransitions = {
   draft: new Set(['processing']),
   processing: new Set(['needs_review']),
@@ -388,6 +396,82 @@ function validDocumentSignature(buffer, mimeType) {
     return buffer.length >= 8 && buffer.subarray(0, 8).equals(pngSignature);
   }
   return false;
+}
+
+function parseAiInstructions(text) {
+  const cleaned = String(text || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '');
+  let value;
+  try {
+    value = JSON.parse(cleaned);
+  } catch {
+    throw new AiServiceError('AI could not return readable structured instructions. Please retry.', 502);
+  }
+
+  if (!value || !Array.isArray(value.instructions)) {
+    throw new AiServiceError('AI returned an invalid instruction list. Please retry.', 502);
+  }
+
+  return value.instructions.slice(0, 40).map((item) => {
+    const category = cleanText(item?.category, 40).toLowerCase();
+    const title = cleanText(item?.title, 160);
+    const instruction = cleanText(item?.instruction, 4000);
+    const timing = cleanText(item?.timing, 160);
+    const sourcePage = cleanText(item?.sourcePage, 80);
+    const confidence = Number(item?.confidenceScore);
+    const requestedStatus = cleanText(item?.reviewStatus, 20).toLowerCase();
+
+    if (!title || !instruction) return null;
+    const confidenceScore = Number.isFinite(confidence)
+      ? Math.max(0, Math.min(100, Math.round(confidence)))
+      : null;
+    const reviewStatus = requestedStatus === 'unclear' ||
+      !timing || confidenceScore == null || confidenceScore < 70
+      ? 'unclear'
+      : 'pending';
+
+    return {
+      category: instructionCategories.has(category) ? category : 'other',
+      title,
+      instruction,
+      timing: timing || null,
+      sourcePage: sourcePage || null,
+      confidenceScore,
+      reviewStatus,
+    };
+  }).filter(Boolean);
+}
+
+async function logAiUsage({
+  userId,
+  carePlanId,
+  result,
+  status,
+  errorCode = null,
+}) {
+  const configuration = aiConfiguration();
+  try {
+    await pool.execute(
+      `INSERT INTO ai_usage_logs (
+        user_id, care_plan_id, feature_name, provider_name, model_name,
+        input_tokens, output_tokens, request_status, error_code
+      ) VALUES (?, ?, 'document_extraction', ?, ?, ?, ?, ?, ?)`,
+      [
+        userId,
+        carePlanId,
+        result?.provider || configuration.provider || 'openrouter',
+        result?.model || configuration.model || 'unknown',
+        Number(result?.inputTokens || 0),
+        Number(result?.outputTokens || 0),
+        status,
+        errorCode,
+      ],
+    );
+  } catch (error) {
+    console.error('Could not save AI usage log:', error?.message || error);
+  }
 }
 
 async function saveProfile(userId, profile, onboardingCompleted) {
@@ -1112,6 +1196,237 @@ app.delete('/api/documents/:id', authenticate, async (req, res, next) => {
     }
 
     res.json({ success: true, message: 'Document removed successfully.', data: {} });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post(
+  '/api/care-plans/:id/extract',
+  authenticate,
+  aiLimiter,
+  async (req, res, next) => {
+    const planId = req.params.id;
+    if (!idPattern.test(planId)) {
+      res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+      return;
+    }
+
+    try {
+      const [plans] = await pool.execute(
+        'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+        [planId, req.auth.userId],
+      );
+      if (plans.length === 0) {
+        res.status(404).json({ success: false, message: 'Care plan not found.' });
+        return;
+      }
+
+      const [documents] = await pool.execute(
+        `SELECT id, document_type, original_name, mime_type, file_data
+         FROM care_documents
+         WHERE care_plan_id = ? AND user_id = ?
+           AND processing_status IN ('uploaded', 'failed')
+         ORDER BY id`,
+        [planId, req.auth.userId],
+      );
+      if (documents.length === 0) {
+        const [[existing]] = await pool.execute(
+          'SELECT COUNT(*) AS instruction_count FROM extracted_instructions WHERE care_plan_id = ?',
+          [planId],
+        );
+        if (Number(existing.instruction_count || 0) > 0) {
+          res.json({
+            success: true,
+            message: 'Documents were already processed.',
+            data: { instructionCount: Number(existing.instruction_count), failedDocuments: [] },
+          });
+          return;
+        }
+        res.status(409).json({ success: false, message: 'Upload a document before extraction.' });
+        return;
+      }
+
+      let instructionCount = 0;
+      const failedDocuments = [];
+      for (const document of documents) {
+        await pool.execute(
+          `UPDATE care_documents
+           SET processing_status = 'processing', processing_error = NULL
+           WHERE id = ? AND user_id = ?`,
+          [document.id, req.auth.userId],
+        );
+
+        let aiResult;
+        try {
+          if (!document.file_data) {
+            throw new AiServiceError('Stored document data was not found.', 404);
+          }
+          aiResult = await extractCareInstructions({
+            fileBuffer: Buffer.from(document.file_data),
+            fileName: document.original_name,
+            mimeType: document.mime_type,
+            documentType: document.document_type,
+          });
+          const instructions = parseAiInstructions(aiResult.text);
+          if (instructions.length === 0) {
+            throw new AiServiceError('No clear care instructions were found in this document.', 422);
+          }
+
+          const connection = await pool.getConnection();
+          try {
+            await connection.beginTransaction();
+            await connection.execute(
+              `DELETE FROM extracted_instructions
+               WHERE document_id = ? AND review_status IN ('pending', 'unclear')`,
+              [document.id],
+            );
+            for (const instruction of instructions) {
+              await connection.execute(
+                `INSERT INTO extracted_instructions (
+                  care_plan_id, document_id, category, title, instruction,
+                  timing, source_page, confidence_score, review_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                  planId,
+                  document.id,
+                  instruction.category,
+                  instruction.title,
+                  instruction.instruction,
+                  instruction.timing,
+                  instruction.sourcePage,
+                  instruction.confidenceScore,
+                  instruction.reviewStatus,
+                ],
+              );
+            }
+            await connection.execute(
+              `UPDATE care_documents
+               SET processing_status = 'processed', processing_error = NULL
+               WHERE id = ? AND user_id = ?`,
+              [document.id, req.auth.userId],
+            );
+            await connection.commit();
+            instructionCount += instructions.length;
+          } catch (error) {
+            await connection.rollback();
+            throw error;
+          } finally {
+            connection.release();
+          }
+          await logAiUsage({
+            userId: req.auth.userId,
+            carePlanId: planId,
+            result: aiResult,
+            status: 'success',
+          });
+        } catch (error) {
+          const safeMessage = error instanceof AiServiceError
+            ? error.message
+            : 'Document extraction failed.';
+          failedDocuments.push({ id: String(document.id), message: safeMessage });
+          await pool.execute(
+            `UPDATE care_documents
+             SET processing_status = 'failed', processing_error = ?
+             WHERE id = ? AND user_id = ?`,
+            [safeMessage.slice(0, 500), document.id, req.auth.userId],
+          );
+          await logAiUsage({
+            userId: req.auth.userId,
+            carePlanId: planId,
+            result: aiResult,
+            status: 'failed',
+            errorCode: error?.statusCode ? String(error.statusCode) : 'extraction_failed',
+          });
+        }
+      }
+
+      const [[totals]] = await pool.execute(
+        'SELECT COUNT(*) AS instruction_count FROM extracted_instructions WHERE care_plan_id = ?',
+        [planId],
+      );
+      const totalInstructions = Number(totals.instruction_count || 0);
+      await pool.execute(
+        'UPDATE care_plans SET status = ? WHERE id = ? AND user_id = ?',
+        [totalInstructions > 0 ? 'needs_review' : 'processing', planId, req.auth.userId],
+      );
+
+      if (totalInstructions === 0) {
+        res.status(422).json({
+          success: false,
+          message: failedDocuments[0]?.message || 'No care instructions could be extracted.',
+          data: { instructionCount: 0, failedDocuments },
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: failedDocuments.length === 0
+          ? 'Instructions extracted. Please verify every item against the original document.'
+          : 'Some documents were processed. Review the failed documents and retry them.',
+        data: { instructionCount: totalInstructions, failedDocuments },
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
+  const instructionId = req.params.id;
+  const title = cleanText(req.body?.title, 160);
+  const instruction = cleanText(req.body?.instruction, 4000);
+  const timing = cleanText(req.body?.timing, 160);
+  const reviewStatus = cleanText(req.body?.reviewStatus, 20).toLowerCase();
+
+  if (!idPattern.test(instructionId)) {
+    res.status(422).json({ success: false, message: 'Invalid instruction ID.' });
+    return;
+  }
+  if (!['verified', 'unclear', 'rejected'].includes(reviewStatus)) {
+    res.status(422).json({ success: false, message: 'Select a valid review status.' });
+    return;
+  }
+  if (reviewStatus === 'verified' && (!title || !instruction)) {
+    res.status(422).json({ success: false, message: 'Verified instructions require a title and instruction.' });
+    return;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT extracted_instructions.id
+       FROM extracted_instructions
+       JOIN care_plans ON care_plans.id = extracted_instructions.care_plan_id
+       WHERE extracted_instructions.id = ? AND care_plans.user_id = ? LIMIT 1`,
+      [instructionId, req.auth.userId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ success: false, message: 'Instruction not found.' });
+      return;
+    }
+
+    await pool.execute(
+      `UPDATE extracted_instructions SET
+        title = CASE WHEN ? <> '' THEN ? ELSE title END,
+        instruction = CASE WHEN ? <> '' THEN ? ELSE instruction END,
+        timing = NULLIF(?, ''),
+        review_status = ?,
+        verified_by = CASE WHEN ? = 'verified' THEN ? ELSE NULL END,
+        verified_at = CASE WHEN ? = 'verified' THEN CURRENT_TIMESTAMP ELSE NULL END
+       WHERE id = ?`,
+      [
+        title, title,
+        instruction, instruction,
+        timing,
+        reviewStatus,
+        reviewStatus, req.auth.userId,
+        reviewStatus,
+        instructionId,
+      ],
+    );
+
+    res.json({ success: true, message: 'Instruction review saved.', data: {} });
   } catch (error) {
     next(error);
   }
