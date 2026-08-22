@@ -91,6 +91,10 @@ export async function generateAiText({
         ],
         temperature,
         max_tokens: maxTokens,
+        reasoning: {
+          effort: 'low',
+          exclude: true,
+        },
         provider: {
           data_collection: 'deny',
         },

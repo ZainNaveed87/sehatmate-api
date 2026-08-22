@@ -493,7 +493,7 @@ app.post('/api/ai/test', authenticate, aiLimiter, async (_req, res, next) => {
         'You are a connection test. Follow the user instruction exactly and add nothing else.',
       userPrompt: 'Reply with exactly: SEHATMATE_AI_OK',
       temperature: 0,
-      maxTokens: 20,
+      maxTokens: 300,
     });
 
     res.json({
