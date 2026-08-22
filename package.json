@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Secure Node.js, Express and MySQL authentication API for SehatRoute AI.",
+  "description": "Secure Node.js, Express, MySQL and Google authentication API for SehatRoute AI.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -18,6 +18,7 @@
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
+    "google-auth-library": "^11.0.2",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mysql2": "^3.14.3"
