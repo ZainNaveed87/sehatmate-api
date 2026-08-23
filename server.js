@@ -488,6 +488,82 @@ function parseSafetyCheck(text, citations) {
   };
 }
 
+function trustedSourceFallback(instruction) {
+  const title = cleanText(instruction?.title, 160) || 'care instruction';
+  const query = encodeURIComponent(title);
+  const category = cleanText(instruction?.category, 40).toLowerCase();
+
+  const sources = category === 'medicine'
+    ? [
+        {
+          title: `DailyMed medicine search for ${title}`,
+          url: `https://dailymed.nlm.nih.gov/dailymed/search.cfm?query=${query}`,
+        },
+        {
+          title: 'NHS Medicines A to Z',
+          url: 'https://www.nhs.uk/medicines/',
+        },
+        {
+          title: 'MedlinePlus Drugs and Supplements',
+          url: 'https://medlineplus.gov/druginformation.html',
+        },
+      ]
+    : category === 'lab_test'
+      ? [
+          {
+            title: 'MedlinePlus Medical Tests',
+            url: 'https://medlineplus.gov/lab-tests/',
+          },
+          {
+            title: 'NHS Health A to Z',
+            url: 'https://www.nhs.uk/conditions/',
+          },
+        ]
+      : [
+          {
+            title: 'MedlinePlus Health Topics',
+            url: 'https://medlineplus.gov/healthtopics.html',
+          },
+          {
+            title: 'NHS Health A to Z',
+            url: 'https://www.nhs.uk/conditions/',
+          },
+        ];
+
+  return {
+    status: 'source_not_found',
+    summary:
+      'The current AI model could not complete an automatic source comparison. Relevant trusted reference pages are listed below for manual checking. The extracted instruction has not been changed.',
+    possibleInterpretation: null,
+    questionForProfessional:
+      `Please confirm whether “${title}” and its exact amount, timing, frequency, route, and duration match the original instruction.`,
+    sources,
+  };
+}
+
+async function storeInstructionSafetyCheck(instructionId, check) {
+  await pool.execute(
+    `UPDATE extracted_instructions SET
+      safety_check_status = ?, safety_check_summary = ?,
+      safety_possible_interpretation = ?, safety_question = ?,
+      safety_sources = ?, safety_checked_at = CURRENT_TIMESTAMP,
+      requires_professional_confirmation = CASE
+        WHEN ? IN ('needs_confirmation', 'source_not_found') THEN 1
+        ELSE requires_professional_confirmation
+      END
+     WHERE id = ?`,
+    [
+      check.status,
+      check.summary || null,
+      check.possibleInterpretation || null,
+      check.questionForProfessional,
+      JSON.stringify(check.sources),
+      check.status,
+      instructionId,
+    ],
+  );
+}
+
 async function logAiUsage({
   userId,
   carePlanId,
@@ -1457,26 +1533,7 @@ app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async 
         timing: instruction.timing,
       });
       const check = parseSafetyCheck(aiResult.text, aiResult.citations);
-      await pool.execute(
-        `UPDATE extracted_instructions SET
-          safety_check_status = ?, safety_check_summary = ?,
-          safety_possible_interpretation = ?, safety_question = ?,
-          safety_sources = ?, safety_checked_at = CURRENT_TIMESTAMP,
-          requires_professional_confirmation = CASE
-            WHEN ? IN ('needs_confirmation', 'source_not_found') THEN 1
-            ELSE requires_professional_confirmation
-          END
-         WHERE id = ?`,
-        [
-          check.status,
-          check.summary || null,
-          check.possibleInterpretation || null,
-          check.questionForProfessional,
-          JSON.stringify(check.sources),
-          check.status,
-          instructionId,
-        ],
-      );
+      await storeInstructionSafetyCheck(instructionId, check);
       await logAiUsage({
         userId: req.auth.userId,
         carePlanId: instruction.care_plan_id,
@@ -1500,7 +1557,13 @@ app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async 
         errorCode: error?.statusCode ? String(error.statusCode) : 'safety_check_failed',
         featureName: 'instruction_safety_check',
       });
-      throw error;
+      const check = trustedSourceFallback(instruction);
+      await storeInstructionSafetyCheck(instructionId, check);
+      res.json({
+        success: true,
+        message: 'Trusted reference pages are ready for manual checking.',
+        data: { safetyCheck: check },
+      });
     }
   } catch (error) {
     next(error);
@@ -1772,14 +1835,17 @@ app.use((error, _req, res, _next) => {
   const corsError =
     error?.message === 'Origin is not allowed by CORS.';
   const bodyTooLarge = error?.type === 'entity.too.large';
+  const aiError = error instanceof AiServiceError;
 
-  res.status(corsError ? 403 : bodyTooLarge ? 413 : 500).json({
+  res.status(corsError ? 403 : bodyTooLarge ? 413 : aiError ? error.statusCode : 500).json({
     success: false,
     message: corsError
       ? error.message
       : bodyTooLarge
         ? 'The uploaded document exceeds the 20 MB limit.'
-      : 'The server could not complete this request.',
+        : aiError
+          ? error.message
+          : 'The server could not complete this request.',
   });
 });
 
