@@ -13,6 +13,7 @@ import mysql from 'mysql2/promise';
 import {
   AiServiceError,
   aiConfiguration,
+  checkCareInstructionSafety,
   extractCareInstructions,
   generateAiText,
 } from './ai_service.js';
@@ -422,12 +423,17 @@ function parseAiInstructions(text) {
     const sourcePage = cleanText(item?.sourcePage, 80);
     const confidence = Number(item?.confidenceScore);
     const requestedStatus = cleanText(item?.reviewStatus, 20).toLowerCase();
+    const requiresProfessionalConfirmation = Boolean(item?.requiresProfessionalConfirmation);
+    const ambiguityReason = cleanText(item?.ambiguityReason, 2000);
+    const possibleInterpretation = cleanText(item?.possibleInterpretation, 2000);
+    const safetyNote = cleanText(item?.safetyNote, 1000);
 
     if (!title || !instruction) return null;
     const confidenceScore = Number.isFinite(confidence)
       ? Math.max(0, Math.min(100, Math.round(confidence)))
       : null;
     const reviewStatus = requestedStatus === 'unclear' ||
+      requiresProfessionalConfirmation ||
       !timing || confidenceScore == null || confidenceScore < 70
       ? 'unclear'
       : 'pending';
@@ -440,8 +446,46 @@ function parseAiInstructions(text) {
       sourcePage: sourcePage || null,
       confidenceScore,
       reviewStatus,
+      requiresProfessionalConfirmation: reviewStatus === 'unclear' || requiresProfessionalConfirmation,
+      ambiguityReason: ambiguityReason || null,
+      possibleInterpretation: possibleInterpretation || null,
+      safetyNote: safetyNote || null,
     };
   }).filter(Boolean);
+}
+
+function parseSafetyCheck(text, citations) {
+  const cleaned = String(text || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '');
+  let value;
+  try {
+    value = JSON.parse(cleaned);
+  } catch {
+    throw new AiServiceError('AI could not return a readable safety check. Please retry.', 502);
+  }
+
+  const sources = Array.isArray(citations) ? citations.slice(0, 5) : [];
+  const requestedStatus = cleanText(value?.status, 30).toLowerCase();
+  const allowedStatuses = new Set(['no_issue_found', 'needs_confirmation', 'source_not_found']);
+  const hasSources = sources.length > 0;
+  const status = hasSources && allowedStatuses.has(requestedStatus)
+    ? requestedStatus
+    : 'source_not_found';
+
+  return {
+    status,
+    summary: hasSources
+      ? cleanText(value?.summary, 2500)
+      : 'No matching trusted source was found. The written instruction has not been changed.',
+    possibleInterpretation: hasSources
+      ? cleanText(value?.possibleInterpretation, 2000)
+      : null,
+    questionForProfessional: cleanText(value?.questionForProfessional, 1000) ||
+      'Please confirm the exact medicine, amount per dose, frequency, route, and duration written here.',
+    sources,
+  };
 }
 
 async function logAiUsage({
@@ -450,6 +494,7 @@ async function logAiUsage({
   result,
   status,
   errorCode = null,
+  featureName = 'document_extraction',
 }) {
   const configuration = aiConfiguration();
   try {
@@ -457,10 +502,11 @@ async function logAiUsage({
       `INSERT INTO ai_usage_logs (
         user_id, care_plan_id, feature_name, provider_name, model_name,
         input_tokens, output_tokens, request_status, error_code
-      ) VALUES (?, ?, 'document_extraction', ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         userId,
         carePlanId,
+        featureName,
         result?.provider || configuration.provider || 'openrouter',
         result?.model || configuration.model || 'unknown',
         Number(result?.inputTokens || 0),
@@ -1285,8 +1331,10 @@ app.post(
               await connection.execute(
                 `INSERT INTO extracted_instructions (
                   care_plan_id, document_id, category, title, instruction,
-                  timing, source_page, confidence_score, review_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  timing, source_page, confidence_score, review_status,
+                  requires_professional_confirmation, ambiguity_reason,
+                  possible_interpretation, safety_note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                   planId,
                   document.id,
@@ -1297,6 +1345,10 @@ app.post(
                   instruction.sourcePage,
                   instruction.confidenceScore,
                   instruction.reviewStatus,
+                  instruction.requiresProfessionalConfirmation ? 1 : 0,
+                  instruction.ambiguityReason,
+                  instruction.possibleInterpretation,
+                  instruction.safetyNote,
                 ],
               );
             }
@@ -1373,6 +1425,88 @@ app.post(
   },
 );
 
+app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async (req, res, next) => {
+  const instructionId = req.params.id;
+  if (!idPattern.test(instructionId)) {
+    res.status(422).json({ success: false, message: 'Invalid instruction ID.' });
+    return;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT extracted_instructions.id, extracted_instructions.care_plan_id,
+        extracted_instructions.category, extracted_instructions.title,
+        extracted_instructions.instruction, extracted_instructions.timing
+       FROM extracted_instructions
+       JOIN care_plans ON care_plans.id = extracted_instructions.care_plan_id
+       WHERE extracted_instructions.id = ? AND care_plans.user_id = ? LIMIT 1`,
+      [instructionId, req.auth.userId],
+    );
+    const instruction = rows[0];
+    if (!instruction) {
+      res.status(404).json({ success: false, message: 'Instruction not found.' });
+      return;
+    }
+
+    let aiResult;
+    try {
+      aiResult = await checkCareInstructionSafety({
+        category: instruction.category,
+        title: instruction.title,
+        instruction: instruction.instruction,
+        timing: instruction.timing,
+      });
+      const check = parseSafetyCheck(aiResult.text, aiResult.citations);
+      await pool.execute(
+        `UPDATE extracted_instructions SET
+          safety_check_status = ?, safety_check_summary = ?,
+          safety_possible_interpretation = ?, safety_question = ?,
+          safety_sources = ?, safety_checked_at = CURRENT_TIMESTAMP,
+          requires_professional_confirmation = CASE
+            WHEN ? IN ('needs_confirmation', 'source_not_found') THEN 1
+            ELSE requires_professional_confirmation
+          END
+         WHERE id = ?`,
+        [
+          check.status,
+          check.summary || null,
+          check.possibleInterpretation || null,
+          check.questionForProfessional,
+          JSON.stringify(check.sources),
+          check.status,
+          instructionId,
+        ],
+      );
+      await logAiUsage({
+        userId: req.auth.userId,
+        carePlanId: instruction.care_plan_id,
+        result: aiResult,
+        status: 'success',
+        featureName: 'instruction_safety_check',
+      });
+      res.json({
+        success: true,
+        message: check.status === 'source_not_found'
+          ? 'No matching trusted source was found. Please confirm with a professional.'
+          : 'Trusted-source safety check completed.',
+        data: { safetyCheck: check },
+      });
+    } catch (error) {
+      await logAiUsage({
+        userId: req.auth.userId,
+        carePlanId: instruction.care_plan_id,
+        result: aiResult,
+        status: 'failed',
+        errorCode: error?.statusCode ? String(error.statusCode) : 'safety_check_failed',
+        featureName: 'instruction_safety_check',
+      });
+      throw error;
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
   const instructionId = req.params.id;
   const title = cleanText(req.body?.title, 160);
@@ -1412,6 +1546,7 @@ app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
         instruction = CASE WHEN ? <> '' THEN ? ELSE instruction END,
         timing = NULLIF(?, ''),
         review_status = ?,
+        requires_professional_confirmation = CASE WHEN ? = 'verified' THEN 0 ELSE requires_professional_confirmation END,
         verified_by = CASE WHEN ? = 'verified' THEN ? ELSE NULL END,
         verified_at = CASE WHEN ? = 'verified' THEN CURRENT_TIMESTAMP ELSE NULL END
        WHERE id = ?`,
@@ -1419,6 +1554,7 @@ app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
         title, title,
         instruction, instruction,
         timing,
+        reviewStatus,
         reviewStatus,
         reviewStatus, req.auth.userId,
         reviewStatus,
@@ -1458,7 +1594,12 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
     );
     const [instructions] = await pool.execute(
       `SELECT id, document_id, category, title, instruction, timing,
-        source_page, confidence_score, review_status, verified_at
+        source_page, confidence_score, review_status,
+        requires_professional_confirmation, ambiguity_reason,
+        possible_interpretation, safety_note, safety_check_status,
+        safety_check_summary, safety_possible_interpretation,
+        safety_question, safety_sources,
+        safety_checked_at, verified_at
        FROM extracted_instructions
        WHERE care_plan_id = ? ORDER BY id`,
       [planId],
@@ -1501,6 +1642,7 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
           ...item,
           id: String(item.id),
           document_id: item.document_id == null ? null : String(item.document_id),
+          safety_sources: parseStoredJson(item.safety_sources),
         })),
         tasks: tasks.map((item) => ({
           ...item,
