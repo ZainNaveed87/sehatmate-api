@@ -177,6 +177,11 @@ export async function extractCareInstructions({
 }) {
   const prompt = `Extract only care instructions explicitly visible in this ${documentType} document.
 Do not diagnose, recommend, infer, correct, complete, or change any medicine, dose, date, timing, test, appointment, or care instruction.
+Create one JSON object only for each complete, actionable instruction. The number of objects must come entirely from the document; never create empty category placeholders or a fixed number of items.
+Combine fields that belong together into one object. For example, a medicine name, dose, frequency, timing, route, and duration must be part of the same medicine instruction—not separate cards.
+Never return headings, labels, empty sections, "none", "not mentioned", or standalone metadata such as "Duration of treatment", "Dose", "Frequency", or "Timing".
+If a duration, dose, frequency, or timing cannot be safely connected to a clearly identified medicine or care instruction, omit that orphan field instead of creating a separate instruction.
+If no medicine is explicitly present, return no medicine item. Apply the same rule to follow-ups, lab tests, care tasks, and other instructions.
 Treat handwriting, abbreviations, decimal points, dose units, totals, frequency, medicine names, dates, and times as safety-critical.
 If any safety-critical text is unreadable, can reasonably be read in more than one way, appears internally inconsistent, or has been inferred rather than clearly seen:
 - preserve only the readable text;

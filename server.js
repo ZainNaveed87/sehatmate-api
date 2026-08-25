@@ -415,10 +415,31 @@ function parseAiInstructions(text) {
     throw new AiServiceError('AI returned an invalid instruction list. Please retry.', 502);
   }
 
+  const placeholderValues = new Set([
+    'none',
+    'n/a',
+    'na',
+    'not mentioned',
+    'not available',
+    'no medicine',
+    'no medicines',
+    'no treatment',
+  ]);
+  const orphanFieldTitles = new Set([
+    'duration',
+    'duration of treatment',
+    'treatment duration',
+    'course duration',
+    'dosage',
+    'dose',
+    'frequency',
+    'timing',
+  ]);
+
   return value.instructions.slice(0, 40).map((item) => {
     const category = cleanText(item?.category, 40).toLowerCase();
-    const title = cleanText(item?.title, 160);
-    const instruction = cleanText(item?.instruction, 4000);
+    const title = cleanText(item?.title, 160).replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
+    const instruction = cleanText(item?.instruction, 4000).replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
     const timing = cleanText(item?.timing, 160);
     const sourcePage = cleanText(item?.sourcePage, 80);
     const confidence = Number(item?.confidenceScore);
@@ -428,7 +449,16 @@ function parseAiInstructions(text) {
     const possibleInterpretation = cleanText(item?.possibleInterpretation, 2000);
     const safetyNote = cleanText(item?.safetyNote, 1000);
 
-    if (!title || !instruction) return null;
+    const normalizedTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (
+      !title ||
+      !instruction ||
+      placeholderValues.has(title.toLowerCase()) ||
+      placeholderValues.has(instruction.toLowerCase()) ||
+      orphanFieldTitles.has(normalizedTitle)
+    ) {
+      return null;
+    }
     const confidenceScore = Number.isFinite(confidence)
       ? Math.max(0, Math.min(100, Math.round(confidence)))
       : null;
