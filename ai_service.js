@@ -203,7 +203,7 @@ confidenceScore must be a whole number from 0 to 100. Return an empty instructio
         image_url: { url: dataUrl },
       };
 
-  return requestCompletion({
+  const requestBody = {
     messages: [
       {
         role: 'system',
@@ -224,7 +224,57 @@ confidenceScore must be a whole number from 0 to 100. Return an empty instructio
     plugins: mimeType === 'application/pdf'
       ? [{ id: 'file-parser', pdf: { engine: 'cloudflare-ai' } }]
       : undefined,
-  });
+  };
+
+  const firstPass = await requestCompletion(requestBody);
+  const verificationMode = (process.env.AI_SECOND_PASS || 'unclear').trim().toLowerCase();
+  const firstPassHasMedicine = /"category"\s*:\s*"medicine"/i.test(firstPass.text);
+  const firstPassIsUnclear = /"reviewStatus"\s*:\s*"unclear"/i.test(firstPass.text) ||
+    /"requiresProfessionalConfirmation"\s*:\s*true/i.test(firstPass.text);
+  const shouldVerify = verificationMode === 'all' ||
+    (verificationMode === 'medicine' && firstPassHasMedicine) ||
+    (verificationMode === 'unclear' && firstPassIsUnclear);
+
+  if (!shouldVerify || verificationMode === 'off') return firstPass;
+
+  const verificationPrompt = `Independently re-read the attached document and audit the first transcription below.
+Do not assume that the first transcription is correct.
+If both readings agree, preserve the exact visible wording.
+If they disagree on a medicine name, decimal point, amount, unit, route, frequency, timing, or duration, keep only the text supported by both readings, set reviewStatus to "unclear", set requiresProfessionalConfirmation to true, and describe the disagreement without choosing a winner.
+Never correct a medicine name or dose from general medical knowledge.
+Keep one object per medicine and keep its duration in the same object.
+Return the same JSON shape as the first pass and return JSON only.
+
+First transcription:
+${firstPass.text}`;
+
+  try {
+    const secondPass = await requestCompletion({
+      ...requestBody,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are the independent verification pass for safety-critical care-document transcription. Re-read the image or PDF, preserve uncertainty, never prescribe, and output JSON only.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: verificationPrompt },
+            attachment,
+          ],
+        },
+      ],
+    });
+    return {
+      ...secondPass,
+      inputTokens: firstPass.inputTokens + secondPass.inputTokens,
+      outputTokens: firstPass.outputTokens + secondPass.outputTokens,
+    };
+  } catch (error) {
+    // Availability is more important than discarding a valid first pass. The
+    // first pass still goes through deterministic ambiguity rules and human review.
+    return firstPass;
+  }
 }
 
 export async function checkCareInstructionSafety({

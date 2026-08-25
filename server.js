@@ -441,7 +441,7 @@ function parseAiInstructions(text) {
       ? 'unclear'
       : 'pending';
 
-    return {
+    const parsed = {
       category: instructionCategories.has(category) ? category : 'other',
       title,
       instruction,
@@ -454,6 +454,22 @@ function parseAiInstructions(text) {
       possibleInterpretation: possibleInterpretation || null,
       safetyNote: safetyNote || null,
     };
+
+    // Deterministic guardrail for common prescription notation ambiguity.
+    // The rule only flags the text; it never calculates or changes a dose.
+    const slashDoseFrequency = /\b\d+(?:\.\d+)?\s*(?:mcg|mg|g|ml|iu|units?)\s*\/\s*\d+\s*(?:x|times?|daily|day)\b/i;
+    if (parsed.category === 'medicine' && slashDoseFrequency.test(`${parsed.instruction} ${parsed.timing || ''}`)) {
+      parsed.reviewStatus = 'unclear';
+      parsed.requiresProfessionalConfirmation = true;
+      parsed.ambiguityReason = parsed.ambiguityReason ||
+        'The slash between the amount and frequency may be interpreted in more than one way.';
+      parsed.possibleInterpretation = parsed.possibleInterpretation ||
+        'The written amount may be an amount per dose or a total amount divided across the stated frequency.';
+      parsed.safetyNote = parsed.safetyNote ||
+        'Confirm whether the written amount is per dose or the total daily amount before using this instruction.';
+    }
+
+    return parsed;
   }).filter(Boolean);
 
   const merged = [];
@@ -612,6 +628,11 @@ function dailyMedLabelUrl(setId) {
   return `https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid=${encodeURIComponent(setId)}`;
 }
 
+function openFdaRecordUrl(setId) {
+  const query = encodeURIComponent(`openfda.spl_set_id:"${setId}"`);
+  return `https://api.fda.gov/drug/label.json?search=${query}&limit=1`;
+}
+
 async function fetchTrustedJson(url, timeoutMs = 8000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -642,10 +663,13 @@ async function trustedSourceCheck(instruction) {
   const rxNormApiUrl = `https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodedTerm}&search=2`;
   const approximateApiUrl = `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodedTerm}&maxEntries=6&option=1`;
   const dailyMedApiUrl = `https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json?drug_name=${encodedTerm}&pagesize=5&page=1`;
+  const openFdaSearch = encodeURIComponent(`openfda.brand_name:"${lookupTerm}" OR openfda.generic_name:"${lookupTerm}"`);
+  const openFdaApiUrl = `https://api.fda.gov/drug/label.json?search=${openFdaSearch}&limit=3`;
 
-  const [rxNormResult, dailyMedResult] = await Promise.allSettled([
+  const [rxNormResult, dailyMedResult, openFdaResult] = await Promise.allSettled([
     fetchTrustedJson(rxNormApiUrl),
     fetchTrustedJson(dailyMedApiUrl),
+    fetchTrustedJson(openFdaApiUrl),
   ]);
 
   const rxNormIds = rxNormResult.status === 'fulfilled' && Array.isArray(rxNormResult.value?.idGroup?.rxnormId)
@@ -660,7 +684,24 @@ async function trustedSourceCheck(instruction) {
         .filter((item) => item.name && item.setId)
         .slice(0, 3)
     : [];
-  const sourceReached = rxNormResult.status === 'fulfilled' || dailyMedResult.status === 'fulfilled';
+  const openFdaLabels = openFdaResult.status === 'fulfilled' && Array.isArray(openFdaResult.value?.results)
+    ? openFdaResult.value.results
+        .map((item) => ({
+          name: sourceTitle(
+            item?.openfda?.brand_name?.[0] ||
+            item?.openfda?.generic_name?.[0] ||
+            item?.openfda?.substance_name?.[0],
+            200,
+          ),
+          setId: cleanText(item?.openfda?.spl_set_id?.[0] || item?.set_id, 100),
+        }))
+        .filter((item) => item.name && item.setId)
+        .filter((item, index, all) => all.findIndex((candidate) => candidate.setId === item.setId) === index)
+        .slice(0, 3)
+    : [];
+  const sourceReached = rxNormResult.status === 'fulfilled' ||
+    dailyMedResult.status === 'fulfilled' ||
+    openFdaResult.status === 'fulfilled';
   if (!sourceReached) {
     return trustedSourceFallback(instruction, 'the official medicine databases could not be reached');
   }
@@ -679,7 +720,7 @@ async function trustedSourceCheck(instruction) {
     .slice(0, 3);
 
   let similarMatches = [];
-  if (exactMatches.length === 0 && dailyMedLabels.length === 0) {
+  if (exactMatches.length === 0 && dailyMedLabels.length === 0 && openFdaLabels.length === 0) {
     const approximateResult = await Promise.allSettled([fetchTrustedJson(approximateApiUrl)]);
     const candidates = approximateResult[0].status === 'fulfilled' && Array.isArray(approximateResult[0].value?.approximateGroup?.candidate)
       ? approximateResult[0].value.approximateGroup.candidate
@@ -706,6 +747,10 @@ async function trustedSourceCheck(instruction) {
       title: `DailyMed label: ${label.name}`,
       url: dailyMedLabelUrl(label.setId),
     })),
+    ...openFdaLabels.map((label) => ({
+      title: `openFDA official label record: ${label.name}`,
+      url: openFdaRecordUrl(label.setId),
+    })),
     ...similarMatches.map((match) => ({
       title: `Similar RxNorm name — not confirmed: ${match.name}`,
       url: rxNormRecordUrl(match.rxcui),
@@ -724,7 +769,11 @@ async function trustedSourceCheck(instruction) {
     };
   }
 
-  const exactNames = [...exactMatches.map((match) => match.name), ...dailyMedLabels.map((label) => label.name)];
+  const exactNames = [
+    ...exactMatches.map((match) => match.name),
+    ...dailyMedLabels.map((label) => label.name),
+    ...openFdaLabels.map((label) => label.name),
+  ].filter((name, index, all) => all.indexOf(name) === index);
   const similarNames = similarMatches.map((match) => match.name);
   const candidateText = similarNames.length > 0
     ? `RxNorm found these real but unconfirmed similar names: ${similarNames.map((name) => `“${name}”`).join(', ')}.`
