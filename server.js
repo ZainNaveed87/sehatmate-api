@@ -13,7 +13,6 @@ import mysql from 'mysql2/promise';
 import {
   AiServiceError,
   aiConfiguration,
-  checkCareInstructionSafety,
   extractCareInstructions,
   generateAiText,
 } from './ai_service.js';
@@ -288,7 +287,11 @@ function validateGoogleName(name, email) {
 
 function cleanText(value, maxLength) {
   return typeof value === 'string'
-    ? value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
+    ? value
+        .replace(/[\u0000-\u001f\u007f\u200b-\u200d\u2060\ufeff]/g, '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .slice(0, maxLength)
     : '';
 }
 
@@ -608,7 +611,7 @@ async function storeInstructionSafetyCheck(instructionId, check) {
       safety_possible_interpretation = ?, safety_question = ?,
       safety_sources = ?, safety_checked_at = CURRENT_TIMESTAMP,
       requires_professional_confirmation = CASE
-        WHEN ? IN ('needs_confirmation', 'source_not_found') THEN 1
+        WHEN ? = 1 THEN 1
         ELSE requires_professional_confirmation
       END
      WHERE id = ?`,
@@ -618,7 +621,7 @@ async function storeInstructionSafetyCheck(instructionId, check) {
       check.possibleInterpretation || null,
       check.questionForProfessional,
       JSON.stringify(check.sources),
-      check.status,
+      check.status === 'needs_confirmation' || check.status === 'source_not_found' ? 1 : 0,
       instructionId,
     ],
   );
@@ -1735,12 +1738,17 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
       data: {
         plan: carePlanJson(plans[0]),
         documents: documents.map((item) => ({ ...item, id: String(item.id) })),
-        instructions: instructions.map((item) => ({
-          ...item,
-          id: String(item.id),
-          document_id: item.document_id == null ? null : String(item.document_id),
-          safety_sources: parseStoredJson(item.safety_sources),
-        })),
+        instructions: instructions
+          .filter((item) => cleanText(item.title, 160) && cleanText(item.instruction, 4000))
+          .map((item) => ({
+            ...item,
+            id: String(item.id),
+            title: cleanText(item.title, 160),
+            instruction: cleanText(item.instruction, 4000),
+            timing: cleanText(item.timing, 160) || null,
+            document_id: item.document_id == null ? null : String(item.document_id),
+            safety_sources: parseStoredJson(item.safety_sources),
+          })),
         tasks: tasks.map((item) => ({
           ...item,
           id: String(item.id),
