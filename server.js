@@ -551,7 +551,7 @@ function parseSafetyCheck(text, citations) {
   };
 }
 
-function trustedSourceFallback(instruction) {
+function trustedSourceFallback(instruction, reason = 'automatic lookup unavailable') {
   const title = cleanText(instruction?.title, 160) || 'care instruction';
   const query = encodeURIComponent(title);
   const category = cleanText(instruction?.category, 40).toLowerCase();
@@ -596,10 +596,98 @@ function trustedSourceFallback(instruction) {
   return {
     status: 'source_not_found',
     summary:
-      'The current AI model could not complete an automatic source comparison. Relevant trusted reference pages are listed below for manual checking. The extracted instruction has not been changed.',
+      `Trusted databases could not verify “${title}” because ${reason}. This does not mean the instruction is correct or incorrect. The extracted instruction has not been changed.`,
     possibleInterpretation: null,
     questionForProfessional:
       `Please confirm whether “${title}” and its exact amount, timing, frequency, route, and duration match the original instruction.`,
+    sources,
+  };
+}
+
+function medicineLookupTerm(value) {
+  return cleanText(value, 160)
+    .replace(/\b\d+(?:\.\d+)?\s*(?:mcg|micrograms?|mg|milligrams?|g|grams?|ml|millilit(?:er|re)s?|iu|units?)\b/gi, ' ')
+    .replace(/\b(?:tablets?|capsules?|syrups?|suspensions?|injections?|drops?|cream|ointment)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function fetchTrustedJson(url, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`Trusted source returned HTTP ${response.status}.`);
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function trustedSourceCheck(instruction) {
+  const category = cleanText(instruction?.category, 40).toLowerCase();
+  if (category !== 'medicine') {
+    return trustedSourceFallback(
+      instruction,
+      'this instruction type cannot be safely verified by a medicine-name database',
+    );
+  }
+
+  const originalTitle = cleanText(instruction?.title, 160) || 'medicine';
+  const lookupTerm = medicineLookupTerm(originalTitle) || originalTitle;
+  const encodedTerm = encodeURIComponent(lookupTerm);
+  const rxNormApiUrl = `https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodedTerm}&search=2`;
+  const dailyMedApiUrl = `https://dailymed.nlm.nih.gov/dailymed/services/v2/drugnames.json?drug_name=${encodedTerm}&name_type=both&pagesize=5&page=1`;
+  const dailyMedSearchUrl = `https://dailymed.nlm.nih.gov/dailymed/search.cfm?query=${encodedTerm}`;
+
+  const [rxNormResult, dailyMedResult] = await Promise.allSettled([
+    fetchTrustedJson(rxNormApiUrl),
+    fetchTrustedJson(dailyMedApiUrl),
+  ]);
+
+  const rxNormIds = rxNormResult.status === 'fulfilled' && Array.isArray(rxNormResult.value?.idGroup?.rxnormId)
+    ? rxNormResult.value.idGroup.rxnormId.map((id) => cleanText(id, 40)).filter(Boolean).slice(0, 3)
+    : [];
+  const dailyMedNames = dailyMedResult.status === 'fulfilled' && Array.isArray(dailyMedResult.value?.data)
+    ? dailyMedResult.value.data
+        .map((item) => cleanText(item?.drug_name, 200))
+        .filter(Boolean)
+        .slice(0, 3)
+    : [];
+  const sourceReached = rxNormResult.status === 'fulfilled' || dailyMedResult.status === 'fulfilled';
+  const sources = [
+    { title: `RxNorm exact/normalized lookup for “${lookupTerm}”`, url: rxNormApiUrl },
+    { title: `DailyMed label search for “${lookupTerm}”`, url: dailyMedSearchUrl },
+  ];
+
+  if (rxNormIds.length === 0 && dailyMedNames.length === 0) {
+    if (!sourceReached) {
+      return trustedSourceFallback(instruction, 'the official services could not be reached');
+    }
+    return {
+      status: 'source_not_found',
+      summary:
+        `No exact or normalized medicine-name match for “${lookupTerm}” was found in RxNorm or DailyMed. It may be a local brand, a supplement, or unclear handwriting; this result does not prove the product is invalid. The extracted instruction has not been changed.`,
+      possibleInterpretation: null,
+      questionForProfessional:
+        `Please confirm the exact spelling and active ingredients of “${originalTitle}”, plus the amount per dose, frequency, route, and duration.`,
+      sources,
+    };
+  }
+
+  const matchedText = dailyMedNames.length > 0
+    ? dailyMedNames.map((name) => `“${name}”`).join(', ')
+    : `${rxNormIds.length} RxNorm concept${rxNormIds.length === 1 ? '' : 's'}`;
+  return {
+    status: 'needs_confirmation',
+    summary:
+      `A trusted medicine-name lookup returned ${matchedText} for “${lookupTerm}”. This confirms only that a similar database name exists; it does not verify the handwriting, patient-specific dose, frequency, route, or duration. The extracted instruction has not been changed.`,
+    possibleInterpretation: null,
+    questionForProfessional:
+      `Please confirm whether “${originalTitle}” is the intended medicine and confirm its exact active ingredients, amount per dose, frequency, route, and duration.`,
     sources,
   };
 }
@@ -1587,9 +1675,9 @@ app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async 
       return;
     }
 
-    // This action must remain available even when the selected free AI model
-    // does not support OpenRouter's web-search plugin.
-    const check = trustedSourceFallback(instruction);
+    // Use official NLM medicine databases directly, so this does not consume
+    // AI tokens and does not depend on a free model supporting web search.
+    const check = await trustedSourceCheck(instruction);
     try {
       await storeInstructionSafetyCheck(instructionId, check);
     } catch (storageError) {
@@ -1599,7 +1687,9 @@ app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async 
     }
     res.json({
       success: true,
-      message: 'Trusted reference pages are ready for manual checking.',
+      message: check.status === 'source_not_found'
+        ? 'Trusted-source lookup completed, but no reliable match was found.'
+        : 'Trusted-source lookup completed. Professional confirmation is still required.',
       data: { safetyCheck: check },
     });
   } catch (error) {
