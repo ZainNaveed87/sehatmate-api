@@ -553,24 +553,12 @@ function parseSafetyCheck(text, citations) {
 
 function trustedSourceFallback(instruction, reason = 'automatic lookup unavailable') {
   const title = cleanText(instruction?.title, 160) || 'care instruction';
-  const query = encodeURIComponent(title);
   const category = cleanText(instruction?.category, 40).toLowerCase();
 
   const sources = category === 'medicine'
-    ? [
-        {
-          title: `DailyMed medicine search for ${title}`,
-          url: `https://dailymed.nlm.nih.gov/dailymed/search.cfm?query=${query}`,
-        },
-        {
-          title: 'NHS Medicines A to Z',
-          url: 'https://www.nhs.uk/medicines/',
-        },
-        {
-          title: 'MedlinePlus Drugs and Supplements',
-          url: 'https://medlineplus.gov/druginformation.html',
-        },
-      ]
+    // Do not show generic medicine sites as if they were evidence for a
+    // handwritten name. Medicine links must point to a returned, real record.
+    ? []
     : category === 'lab_test'
       ? [
           {
@@ -612,6 +600,18 @@ function medicineLookupTerm(value) {
     .trim();
 }
 
+function sourceTitle(value, limit = 180) {
+  return cleanText(value, limit).replace(/[\r\n]+/g, ' ').trim();
+}
+
+function rxNormRecordUrl(rxcui) {
+  return `https://rxnav.nlm.nih.gov/REST/rxcui/${encodeURIComponent(rxcui)}/properties.json`;
+}
+
+function dailyMedLabelUrl(setId) {
+  return `https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid=${encodeURIComponent(setId)}`;
+}
+
 async function fetchTrustedJson(url, timeoutMs = 8000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -640,8 +640,8 @@ async function trustedSourceCheck(instruction) {
   const lookupTerm = medicineLookupTerm(originalTitle) || originalTitle;
   const encodedTerm = encodeURIComponent(lookupTerm);
   const rxNormApiUrl = `https://rxnav.nlm.nih.gov/REST/rxcui.json?name=${encodedTerm}&search=2`;
-  const dailyMedApiUrl = `https://dailymed.nlm.nih.gov/dailymed/services/v2/drugnames.json?drug_name=${encodedTerm}&name_type=both&pagesize=5&page=1`;
-  const dailyMedSearchUrl = `https://dailymed.nlm.nih.gov/dailymed/search.cfm?query=${encodedTerm}`;
+  const approximateApiUrl = `https://rxnav.nlm.nih.gov/REST/approximateTerm.json?term=${encodedTerm}&maxEntries=6&option=1`;
+  const dailyMedApiUrl = `https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json?drug_name=${encodedTerm}&pagesize=5&page=1`;
 
   const [rxNormResult, dailyMedResult] = await Promise.allSettled([
     fetchTrustedJson(rxNormApiUrl),
@@ -651,43 +651,91 @@ async function trustedSourceCheck(instruction) {
   const rxNormIds = rxNormResult.status === 'fulfilled' && Array.isArray(rxNormResult.value?.idGroup?.rxnormId)
     ? rxNormResult.value.idGroup.rxnormId.map((id) => cleanText(id, 40)).filter(Boolean).slice(0, 3)
     : [];
-  const dailyMedNames = dailyMedResult.status === 'fulfilled' && Array.isArray(dailyMedResult.value?.data)
+  const dailyMedLabels = dailyMedResult.status === 'fulfilled' && Array.isArray(dailyMedResult.value?.data)
     ? dailyMedResult.value.data
-        .map((item) => cleanText(item?.drug_name, 200))
-        .filter(Boolean)
+        .map((item) => ({
+          name: sourceTitle(item?.title || item?.drug_name || item?.name, 200),
+          setId: cleanText(item?.setid || item?.set_id, 100),
+        }))
+        .filter((item) => item.name && item.setId)
         .slice(0, 3)
     : [];
   const sourceReached = rxNormResult.status === 'fulfilled' || dailyMedResult.status === 'fulfilled';
+  if (!sourceReached) {
+    return trustedSourceFallback(instruction, 'the official medicine databases could not be reached');
+  }
+
+  // An exact/normalised RxNorm ID still needs its official display name before
+  // it can be shown to the user. Never manufacture a name from handwriting.
+  const exactProperties = await Promise.allSettled(
+    rxNormIds.map(async (rxcui) => {
+      const record = await fetchTrustedJson(rxNormRecordUrl(rxcui));
+      return { rxcui, name: sourceTitle(record?.properties?.name, 200) };
+    }),
+  );
+  const exactMatches = exactProperties
+    .filter((result) => result.status === 'fulfilled' && result.value.name)
+    .map((result) => result.value)
+    .slice(0, 3);
+
+  let similarMatches = [];
+  if (exactMatches.length === 0 && dailyMedLabels.length === 0) {
+    const approximateResult = await Promise.allSettled([fetchTrustedJson(approximateApiUrl)]);
+    const candidates = approximateResult[0].status === 'fulfilled' && Array.isArray(approximateResult[0].value?.approximateGroup?.candidate)
+      ? approximateResult[0].value.approximateGroup.candidate
+      : [];
+    // Score is supplied by RxNorm. A conservative threshold avoids displaying
+    // unrelated medicines merely because the handwriting was difficult.
+    similarMatches = candidates
+      .map((candidate) => ({
+        rxcui: cleanText(candidate?.rxcui, 40),
+        name: sourceTitle(candidate?.name, 200),
+        score: Number(candidate?.score || 0),
+      }))
+      .filter((candidate) => candidate.rxcui && candidate.name && candidate.score >= 80)
+      .filter((candidate, index, all) => all.findIndex((item) => item.rxcui === candidate.rxcui) === index)
+      .slice(0, 3);
+  }
+
   const sources = [
-    { title: `RxNorm exact/normalized lookup for “${lookupTerm}”`, url: rxNormApiUrl },
-    { title: `DailyMed label search for “${lookupTerm}”`, url: dailyMedSearchUrl },
+    ...exactMatches.map((match) => ({
+      title: `RxNorm official record: ${match.name}`,
+      url: rxNormRecordUrl(match.rxcui),
+    })),
+    ...dailyMedLabels.map((label) => ({
+      title: `DailyMed label: ${label.name}`,
+      url: dailyMedLabelUrl(label.setId),
+    })),
+    ...similarMatches.map((match) => ({
+      title: `Similar RxNorm name — not confirmed: ${match.name}`,
+      url: rxNormRecordUrl(match.rxcui),
+    })),
   ];
 
-  if (rxNormIds.length === 0 && dailyMedNames.length === 0) {
-    if (!sourceReached) {
-      return trustedSourceFallback(instruction, 'the official services could not be reached');
-    }
+  if (sources.length === 0) {
     return {
       status: 'source_not_found',
       summary:
-        `No exact or normalized medicine-name match for “${lookupTerm}” was found in RxNorm or DailyMed. It may be a local brand, a supplement, or unclear handwriting; this result does not prove the product is invalid. The extracted instruction has not been changed.`,
+        `No exact or sufficiently close official medicine record was found for “${lookupTerm}”. This may be a local brand, supplement, or unclear handwriting; it does not prove the product is invalid. The extracted instruction has not been changed.`,
       possibleInterpretation: null,
       questionForProfessional:
         `Please confirm the exact spelling and active ingredients of “${originalTitle}”, plus the amount per dose, frequency, route, and duration.`,
-      sources,
+      sources: [],
     };
   }
 
-  const matchedText = dailyMedNames.length > 0
-    ? dailyMedNames.map((name) => `“${name}”`).join(', ')
-    : `${rxNormIds.length} RxNorm concept${rxNormIds.length === 1 ? '' : 's'}`;
+  const exactNames = [...exactMatches.map((match) => match.name), ...dailyMedLabels.map((label) => label.name)];
+  const similarNames = similarMatches.map((match) => match.name);
+  const candidateText = similarNames.length > 0
+    ? `RxNorm found these real but unconfirmed similar names: ${similarNames.map((name) => `“${name}”`).join(', ')}.`
+    : `Official records were found for ${exactNames.map((name) => `“${name}”`).join(', ')}.`;
   return {
     status: 'needs_confirmation',
     summary:
-      `A trusted medicine-name lookup returned ${matchedText} for “${lookupTerm}”. This confirms only that a similar database name exists; it does not verify the handwriting, patient-specific dose, frequency, route, or duration. The extracted instruction has not been changed.`,
+      `${candidateText} These records prove only that those database names exist; they do not identify unclear handwriting or verify a patient-specific dose, frequency, route, or duration. The extracted instruction has not been changed.`,
     possibleInterpretation: null,
     questionForProfessional:
-      `Please confirm whether “${originalTitle}” is the intended medicine and confirm its exact active ingredients, amount per dose, frequency, route, and duration.`,
+      `Please compare the original writing with the official records above and confirm the exact medicine/active ingredients, amount per dose, frequency, route, and duration before use.`,
     sources,
   };
 }
@@ -1730,26 +1778,31 @@ app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
       return;
     }
 
+    // Build values in JavaScript instead of comparing text values inside MySQL.
+    // This avoids the utf8mb4_general_ci / utf8mb4_unicode_ci collation error.
+    const verified = reviewStatus === 'verified' ? 1 : 0;
+    const updates = [];
+    const values = [];
+    if (title) {
+      updates.push('title = ?');
+      values.push(title);
+    }
+    if (instruction) {
+      updates.push('instruction = ?');
+      values.push(instruction);
+    }
+    updates.push('timing = ?', 'review_status = ?');
+    values.push(timing || null, reviewStatus);
+    updates.push('requires_professional_confirmation = CASE WHEN ? = 1 THEN 0 ELSE requires_professional_confirmation END');
+    values.push(verified);
+    updates.push('verified_by = CASE WHEN ? = 1 THEN ? ELSE NULL END');
+    values.push(verified, req.auth.userId);
+    updates.push('verified_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END');
+    values.push(verified, instructionId);
+
     await pool.execute(
-      `UPDATE extracted_instructions SET
-        title = CASE WHEN ? <> '' THEN ? ELSE title END,
-        instruction = CASE WHEN ? <> '' THEN ? ELSE instruction END,
-        timing = NULLIF(?, ''),
-        review_status = ?,
-        requires_professional_confirmation = CASE WHEN ? = 'verified' THEN 0 ELSE requires_professional_confirmation END,
-        verified_by = CASE WHEN ? = 'verified' THEN ? ELSE NULL END,
-        verified_at = CASE WHEN ? = 'verified' THEN CURRENT_TIMESTAMP ELSE NULL END
-       WHERE id = ?`,
-      [
-        title, title,
-        instruction, instruction,
-        timing,
-        reviewStatus,
-        reviewStatus,
-        reviewStatus, req.auth.userId,
-        reviewStatus,
-        instructionId,
-      ],
+      `UPDATE extracted_instructions SET ${updates.join(', ')} WHERE id = ?`,
+      values,
     );
 
     res.json({ success: true, message: 'Instruction review saved.', data: {} });
