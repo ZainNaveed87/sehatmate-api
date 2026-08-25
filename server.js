@@ -415,31 +415,10 @@ function parseAiInstructions(text) {
     throw new AiServiceError('AI returned an invalid instruction list. Please retry.', 502);
   }
 
-  const placeholderValues = new Set([
-    'none',
-    'n/a',
-    'na',
-    'not mentioned',
-    'not available',
-    'no medicine',
-    'no medicines',
-    'no treatment',
-  ]);
-  const orphanFieldTitles = new Set([
-    'duration',
-    'duration of treatment',
-    'treatment duration',
-    'course duration',
-    'dosage',
-    'dose',
-    'frequency',
-    'timing',
-  ]);
-
-  return value.instructions.slice(0, 40).map((item) => {
+  const instructions = value.instructions.slice(0, 40).map((item) => {
     const category = cleanText(item?.category, 40).toLowerCase();
-    const title = cleanText(item?.title, 160).replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
-    const instruction = cleanText(item?.instruction, 4000).replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
+    const title = cleanText(item?.title, 160);
+    const instruction = cleanText(item?.instruction, 4000);
     const timing = cleanText(item?.timing, 160);
     const sourcePage = cleanText(item?.sourcePage, 80);
     const confidence = Number(item?.confidenceScore);
@@ -449,16 +428,7 @@ function parseAiInstructions(text) {
     const possibleInterpretation = cleanText(item?.possibleInterpretation, 2000);
     const safetyNote = cleanText(item?.safetyNote, 1000);
 
-    const normalizedTitle = title.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-    if (
-      !title ||
-      !instruction ||
-      placeholderValues.has(title.toLowerCase()) ||
-      placeholderValues.has(instruction.toLowerCase()) ||
-      orphanFieldTitles.has(normalizedTitle)
-    ) {
-      return null;
-    }
+    if (!title || !instruction) return null;
     const confidenceScore = Number.isFinite(confidence)
       ? Math.max(0, Math.min(100, Math.round(confidence)))
       : null;
@@ -482,6 +452,66 @@ function parseAiInstructions(text) {
       safetyNote: safetyNote || null,
     };
   }).filter(Boolean);
+
+  const merged = [];
+  const genericDurationTitle = /^(duration(?:\s+of\s+(?:treatment|course))?|treatment\s+duration|course\s+duration|treatment\s+period|how\s+long)$/i;
+
+  for (const current of instructions) {
+    const durationOnly = genericDurationTitle.test(current.title.trim()) &&
+      (current.category === 'medicine' || current.category === 'other');
+
+    if (durationOnly) {
+      const medicineCandidates = instructions.filter((candidate) =>
+        candidate !== current &&
+        candidate.category === 'medicine' &&
+        (!current.sourcePage || !candidate.sourcePage || candidate.sourcePage === current.sourcePage),
+      );
+
+      // Only merge when the document makes the parent medicine unambiguous.
+      if (medicineCandidates.length === 1) {
+        const medicine = medicineCandidates[0];
+        const durationText = [current.instruction, current.timing]
+          .filter(Boolean)
+          .join(' · ')
+          .replace(/^duration\s*:\s*/i, '')
+          .trim();
+        if (durationText && !medicine.instruction.toLowerCase().includes(durationText.toLowerCase())) {
+          medicine.instruction = `${medicine.instruction} · Duration: ${durationText}`;
+        }
+        medicine.confidenceScore = medicine.confidenceScore == null
+          ? current.confidenceScore
+          : current.confidenceScore == null
+            ? medicine.confidenceScore
+            : Math.min(medicine.confidenceScore, current.confidenceScore);
+        const durationIsActuallyAmbiguous = Boolean(
+          current.ambiguityReason ||
+          current.possibleInterpretation ||
+          current.safetyNote,
+        );
+        if (medicine.reviewStatus === 'unclear' || durationIsActuallyAmbiguous) {
+          medicine.reviewStatus = 'unclear';
+          medicine.requiresProfessionalConfirmation = true;
+        }
+        medicine.ambiguityReason = [medicine.ambiguityReason, current.ambiguityReason]
+          .filter(Boolean)
+          .join(' ')
+          .slice(0, 2000) || null;
+        medicine.possibleInterpretation = [medicine.possibleInterpretation, current.possibleInterpretation]
+          .filter(Boolean)
+          .join(' ')
+          .slice(0, 2000) || null;
+        medicine.safetyNote = [medicine.safetyNote, current.safetyNote]
+          .filter(Boolean)
+          .join(' ')
+          .slice(0, 1000) || null;
+        continue;
+      }
+    }
+
+    merged.push(current);
+  }
+
+  return merged;
 }
 
 function parseSafetyCheck(text, citations) {
@@ -1554,47 +1584,21 @@ app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async 
       return;
     }
 
-    let aiResult;
+    // This action must remain available even when the selected free AI model
+    // does not support OpenRouter's web-search plugin.
+    const check = trustedSourceFallback(instruction);
     try {
-      aiResult = await checkCareInstructionSafety({
-        category: instruction.category,
-        title: instruction.title,
-        instruction: instruction.instruction,
-        timing: instruction.timing,
-      });
-      const check = parseSafetyCheck(aiResult.text, aiResult.citations);
       await storeInstructionSafetyCheck(instructionId, check);
-      await logAiUsage({
-        userId: req.auth.userId,
-        carePlanId: instruction.care_plan_id,
-        result: aiResult,
-        status: 'success',
-        featureName: 'instruction_safety_check',
-      });
-      res.json({
-        success: true,
-        message: check.status === 'source_not_found'
-          ? 'No matching trusted source was found. Please confirm with a professional.'
-          : 'Trusted-source safety check completed.',
-        data: { safetyCheck: check },
-      });
-    } catch (error) {
-      await logAiUsage({
-        userId: req.auth.userId,
-        carePlanId: instruction.care_plan_id,
-        result: aiResult,
-        status: 'failed',
-        errorCode: error?.statusCode ? String(error.statusCode) : 'safety_check_failed',
-        featureName: 'instruction_safety_check',
-      });
-      const check = trustedSourceFallback(instruction);
-      await storeInstructionSafetyCheck(instructionId, check);
-      res.json({
-        success: true,
-        message: 'Trusted reference pages are ready for manual checking.',
-        data: { safetyCheck: check },
-      });
+    } catch (storageError) {
+      // The user can still see the trusted references even if an older
+      // database has not received the optional safety-check columns yet.
+      console.error('Could not persist safety check:', storageError?.message || storageError);
     }
+    res.json({
+      success: true,
+      message: 'Trusted reference pages are ready for manual checking.',
+      data: { safetyCheck: check },
+    });
   } catch (error) {
     next(error);
   }
