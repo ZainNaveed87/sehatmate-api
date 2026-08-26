@@ -12,7 +12,9 @@ import mysql from 'mysql2/promise';
 
 import {
   AiServiceError,
+  analyzeMedicineLabel,
   aiConfiguration,
+  checkIngredientPurpose,
   extractCareInstructions,
   generateAiText,
 } from './ai_service.js';
@@ -567,6 +569,78 @@ function parseSafetyCheck(text, citations) {
   };
 }
 
+function parseJsonObject(text, errorMessage) {
+  const cleaned = String(text || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '');
+  try {
+    const value = JSON.parse(cleaned);
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  } catch {
+    // The public error below intentionally hides provider output.
+  }
+  throw new AiServiceError(errorMessage, 502);
+}
+
+function parseIngredientLabel(text) {
+  const value = parseJsonObject(
+    text,
+    'AI could not read a structured ingredient label. Please use a clearer photo.',
+  );
+  const activeIngredients = Array.isArray(value.activeIngredients)
+    ? value.activeIngredients
+        .slice(0, 8)
+        .map((item) => ({
+          name: cleanText(item?.name, 160),
+          strength: cleanText(item?.strength, 80),
+        }))
+        .filter((item) => item.name)
+    : [];
+  const confidence = Number(value.confidenceScore);
+  return {
+    brandName: cleanText(value.brandName, 160) || null,
+    activeIngredients,
+    dosageForm: cleanText(value.dosageForm, 80) || null,
+    manufacturer: cleanText(value.manufacturer, 160) || null,
+    confidenceScore: Number.isFinite(confidence)
+      ? Math.max(0, Math.min(100, Math.round(confidence)))
+      : null,
+    labelNeedsConfirmation: Boolean(value.labelNeedsConfirmation) || activeIngredients.length === 0,
+    labelNote: cleanText(value.labelNote, 800) ||
+      (activeIngredients.length === 0
+        ? 'No active ingredient was readable. Try a clear photo of the ingredients panel.'
+        : 'Confirm the extracted label text against the package.'),
+  };
+}
+
+function parsePurposeCheck(text, citations) {
+  const value = parseJsonObject(
+    text,
+    'AI could not complete the ingredient-purpose comparison.',
+  );
+  const requestedStatus = cleanText(value.status, 40).toLowerCase();
+  const allowedStatuses = new Set([
+    'broadly_consistent',
+    'purpose_not_stated',
+    'needs_confirmation',
+  ]);
+  const sources = Array.isArray(citations) ? citations.slice(0, 6) : [];
+  const status = allowedStatuses.has(requestedStatus)
+    ? requestedStatus
+    : 'needs_confirmation';
+  return {
+    status: status === 'broadly_consistent' && sources.length === 0
+      ? 'needs_confirmation'
+      : status,
+    summary: cleanText(value.summary, 1000) ||
+      'The ingredient and written purpose could not be compared reliably.',
+    questionForProfessional: cleanText(value.questionForProfessional, 800) ||
+      'Please confirm that this package is the medicine intended for this instruction.',
+    sources,
+  };
+}
+
 function trustedSourceFallback(instruction, reason = 'automatic lookup unavailable') {
   const title = cleanText(instruction?.title, 160) || 'care instruction';
   const category = cleanText(instruction?.category, 40).toLowerCase();
@@ -600,10 +674,10 @@ function trustedSourceFallback(instruction, reason = 'automatic lookup unavailab
   return {
     status: 'source_not_found',
     summary:
-      `Trusted databases could not verify “${title}” because ${reason}. This does not mean the instruction is correct or incorrect. The extracted instruction has not been changed.`,
+      `Trusted databases could not verify ${title} because ${reason}. This result does not confirm or reject the instruction.`,
     possibleInterpretation: null,
     questionForProfessional:
-      `Please confirm whether “${title}” and its exact amount, timing, frequency, route, and duration match the original instruction.`,
+      `Please confirm the exact name, amount, timing, frequency, route and duration for ${title}.`,
     sources,
   };
 }
@@ -761,10 +835,10 @@ async function trustedSourceCheck(instruction) {
     return {
       status: 'source_not_found',
       summary:
-        `No exact or sufficiently close official medicine record was found for “${lookupTerm}”. This may be a local brand, supplement, or unclear handwriting; it does not prove the product is invalid. The extracted instruction has not been changed.`,
+        `No sufficiently close official medicine record was found for ${lookupTerm}. It may be a regional brand, a supplement or unclear handwriting.`,
       possibleInterpretation: null,
       questionForProfessional:
-        `Please confirm the exact spelling and active ingredients of “${originalTitle}”, plus the amount per dose, frequency, route, and duration.`,
+        `Please confirm the exact spelling and active ingredients of ${originalTitle}, plus the amount per dose, frequency, route and duration.`,
       sources: [],
     };
   }
@@ -776,15 +850,15 @@ async function trustedSourceCheck(instruction) {
   ].filter((name, index, all) => all.indexOf(name) === index);
   const similarNames = similarMatches.map((match) => match.name);
   const candidateText = similarNames.length > 0
-    ? `RxNorm found these real but unconfirmed similar names: ${similarNames.map((name) => `“${name}”`).join(', ')}.`
-    : `Official records were found for ${exactNames.map((name) => `“${name}”`).join(', ')}.`;
+    ? `RxNorm found these real but unconfirmed similar names: ${similarNames.join(', ')}.`
+    : `Official records were found for ${exactNames.join(', ')}.`;
   return {
     status: 'needs_confirmation',
     summary:
-      `${candidateText} These records prove only that those database names exist; they do not identify unclear handwriting or verify a patient-specific dose, frequency, route, or duration. The extracted instruction has not been changed.`,
+      `${candidateText} The records identify database names only. They do not confirm unclear handwriting or a patient-specific instruction.`,
     possibleInterpretation: null,
     questionForProfessional:
-      `Please compare the original writing with the official records above and confirm the exact medicine/active ingredients, amount per dose, frequency, route, and duration before use.`,
+      'Please compare the original writing with these records and confirm the medicine, active ingredients, amount, frequency, route and duration.',
     sources,
   };
 }
@@ -1788,6 +1862,139 @@ app.post('/api/instructions/:id/safety-check', authenticate, authLimiter, async 
         ? 'Trusted-source lookup completed, but no reliable match was found.'
         : 'Trusted-source lookup completed. Professional confirmation is still required.',
       data: { safetyCheck: check },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/instructions/:id/ingredient-evidence', authenticate, aiLimiter, async (req, res, next) => {
+  const instructionId = req.params.id;
+  const mimeType = cleanText(req.body?.mimeType, 100).toLowerCase();
+  const originalName = safeDocumentName(cleanText(req.body?.originalName, 255)) || 'medicine-label.jpg';
+  const contentBase64 = typeof req.body?.contentBase64 === 'string'
+    ? req.body.contentBase64.trim()
+    : '';
+
+  if (!idPattern.test(instructionId)) {
+    res.status(422).json({ success: false, message: 'Invalid instruction ID.' });
+    return;
+  }
+  if (!['image/jpeg', 'image/png'].includes(mimeType)) {
+    res.status(422).json({ success: false, message: 'Upload a JPG or PNG image of the ingredient label.' });
+    return;
+  }
+
+  let imageBuffer;
+  try {
+    imageBuffer = Buffer.from(contentBase64, 'base64');
+  } catch {
+    imageBuffer = Buffer.alloc(0);
+  }
+  if (!imageBuffer.length || imageBuffer.length > 10 * 1024 * 1024 || !hasValidFileSignature(imageBuffer, mimeType)) {
+    res.status(422).json({ success: false, message: 'The label image is invalid or exceeds the 10 MB limit.' });
+    return;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT extracted_instructions.id, extracted_instructions.care_plan_id,
+        extracted_instructions.category, extracted_instructions.title,
+        extracted_instructions.instruction, extracted_instructions.timing
+       FROM extracted_instructions
+       JOIN care_plans ON care_plans.id = extracted_instructions.care_plan_id
+       WHERE extracted_instructions.id = ? AND care_plans.user_id = ? LIMIT 1`,
+      [instructionId, req.auth.userId],
+    );
+    const instruction = rows[0];
+    if (!instruction) {
+      res.status(404).json({ success: false, message: 'Instruction not found.' });
+      return;
+    }
+    if (cleanText(instruction.category, 40).toLowerCase() !== 'medicine') {
+      res.status(422).json({ success: false, message: 'Ingredient-label evidence is available for medicine instructions only.' });
+      return;
+    }
+
+    const labelAiResult = await analyzeMedicineLabel({
+      fileBuffer: imageBuffer,
+      fileName: originalName,
+      mimeType,
+      prescriptionTitle: instruction.title,
+      prescriptionInstruction: instruction.instruction,
+      prescriptionTiming: instruction.timing,
+    });
+    const label = parseIngredientLabel(labelAiResult.text);
+
+    const ingredientChecks = await Promise.all(
+      label.activeIngredients.slice(0, 4).map(async (ingredient) => ({
+        ingredient,
+        check: await trustedSourceCheck({
+          category: 'medicine',
+          title: ingredient.name,
+          instruction: ingredient.strength,
+          timing: '',
+        }),
+      })),
+    );
+
+    let purposeCheck = {
+      status: 'needs_confirmation',
+      summary: label.activeIngredients.length === 0
+        ? 'No active ingredient was readable, so purpose consistency could not be checked.'
+        : 'Purpose consistency could not be checked automatically.',
+      questionForProfessional: 'Please confirm that this package belongs to the medicine written in the prescription.',
+      sources: [],
+    };
+    let purposeAiResult = null;
+    if (label.activeIngredients.length > 0) {
+      try {
+        purposeAiResult = await checkIngredientPurpose({
+          activeIngredients: label.activeIngredients,
+          prescriptionTitle: instruction.title,
+          prescriptionInstruction: instruction.instruction,
+          prescriptionTiming: instruction.timing,
+        });
+        purposeCheck = parsePurposeCheck(purposeAiResult.text, purposeAiResult.citations);
+      } catch (purposeError) {
+        console.error('Ingredient purpose check unavailable:', purposeError?.message || purposeError);
+      }
+    }
+
+    const sourceMap = new Map();
+    for (const source of [
+      ...ingredientChecks.flatMap((item) => item.check.sources || []),
+      ...(purposeCheck.sources || []),
+    ]) {
+      if (source?.url && !sourceMap.has(source.url)) sourceMap.set(source.url, source);
+    }
+    const sources = [...sourceMap.values()].slice(0, 8);
+
+    await logAiUsage({
+      userId: req.auth.userId,
+      carePlanId: instruction.care_plan_id,
+      result: {
+        ...labelAiResult,
+        inputTokens: Number(labelAiResult.inputTokens || 0) + Number(purposeAiResult?.inputTokens || 0),
+        outputTokens: Number(labelAiResult.outputTokens || 0) + Number(purposeAiResult?.outputTokens || 0),
+      },
+      status: 'success',
+      featureName: 'ingredient_evidence',
+    });
+
+    res.json({
+      success: true,
+      message: 'Ingredient-label evidence is ready for review.',
+      data: {
+        evidence: {
+          ...label,
+          purposeStatus: purposeCheck.status,
+          purposeSummary: purposeCheck.summary,
+          questionForProfessional: purposeCheck.questionForProfessional,
+          sources,
+          prescriptionChanged: false,
+        },
+      },
     });
   } catch (error) {
     next(error);

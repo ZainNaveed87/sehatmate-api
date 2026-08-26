@@ -187,6 +187,9 @@ If any safety-critical text is unreadable, can reasonably be read in more than o
 - explain the exact ambiguity in ambiguityReason without choosing one interpretation;
 - place the plausible readings in possibleInterpretation, clearly labelled as possibilities and never as instructions;
 - add a short safetyNote telling the user not to act on the uncertain detail until a doctor or pharmacist confirms it.
+Write ambiguityReason, possibleInterpretation and safetyNote as short natural sentences for a patient-facing mobile UI.
+Do not repeat the same warning. Avoid quotation marks, brackets, symbols, headings and technical reasoning unless an exact visible character is the ambiguity itself.
+Keep ambiguityReason to two short sentences, possibleInterpretation to two short possibilities, and safetyNote to one sentence.
 Never silently normalize a dose. For example, do not turn a total daily amount into a per-dose amount or vice versa.
 Return JSON only, with this exact shape:
 {"instructions":[{"category":"medicine|follow_up|lab_test|care_task|other","title":"short exact label","instruction":"exact readable instruction from document","timing":"exact readable timing or empty string","sourcePage":"page number/label or empty string","confidenceScore":0,"reviewStatus":"pending|unclear","requiresProfessionalConfirmation":false,"ambiguityReason":"empty string when clear","possibleInterpretation":"empty string when clear","safetyNote":"empty string when clear"}]}
@@ -275,6 +278,117 @@ ${firstPass.text}`;
     // first pass still goes through deterministic ambiguity rules and human review.
     return firstPass;
   }
+}
+
+export async function analyzeMedicineLabel({
+  fileBuffer,
+  fileName,
+  mimeType,
+  prescriptionTitle,
+  prescriptionInstruction,
+  prescriptionTiming,
+}) {
+  const dataUrl = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+  const prompt = `Read only the medicine package or ingredient-label image.
+The prescription card currently contains:
+Title: ${prescriptionTitle || 'not readable'}
+Instruction: ${prescriptionInstruction || 'not readable'}
+Timing: ${prescriptionTiming || 'not readable'}
+
+Rules:
+- Transcribe the brand, active ingredients, strength, dosage form and manufacturer only when visible.
+- Active ingredients are not flavours, colours, sweeteners or preservatives.
+- Never infer an ingredient from the prescription or brand name.
+- Never say that this package proves what the doctor intended.
+- Never recommend a dose or say that the medicine is correct for this patient.
+- If a field is unclear, leave it empty and explain the exact problem in labelNote.
+- Use short natural sentences. Avoid quotation marks unless copying exact visible label text.
+- Output JSON only.
+
+Return this exact shape:
+{"brandName":"","activeIngredients":[{"name":"","strength":""}],"dosageForm":"","manufacturer":"","confidenceScore":0,"labelNeedsConfirmation":true,"labelNote":""}`;
+
+  return requestCompletion({
+    messages: [
+      {
+        role: 'system',
+        content: 'You are a medicine-label transcription tool. You identify visible package text but never prescribe, diagnose, or decide what a doctor intended. Output JSON only.',
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: prompt },
+          {
+            type: 'image_url',
+            image_url: { url: dataUrl },
+          },
+        ],
+      },
+    ],
+    temperature: 0,
+    max_tokens: 1000,
+    reasoning: { effort: 'none' },
+    response_format: { type: 'json_object' },
+  });
+}
+
+export async function checkIngredientPurpose({
+  activeIngredients,
+  prescriptionTitle,
+  prescriptionInstruction,
+  prescriptionTiming,
+}) {
+  const ingredients = activeIngredients
+    .map((item) => `${item.name}${item.strength ? ` ${item.strength}` : ''}`)
+    .join(', ');
+  const prompt = `Compare the medicine-label ingredients with the purpose explicitly written in the extracted prescription instruction.
+
+Label ingredients: ${ingredients || 'none readable'}
+Prescription title: ${prescriptionTitle || 'not readable'}
+Prescription instruction: ${prescriptionInstruction || 'not readable'}
+Prescription timing: ${prescriptionTiming || 'not readable'}
+
+Rules:
+- Use only reliable sources returned by the web tool.
+- Do not assume a diagnosis or purpose that is not explicitly written.
+- Common-use consistency does not prove that a medicine, dose, or schedule is correct for this patient.
+- Never recommend a dose, treatment, substitute, or medicine.
+- If the purpose is absent, return purpose_not_stated.
+- If evidence is insufficient or mixed, return needs_confirmation.
+- Return broadly_consistent only when the written purpose is clearly among the ingredient's common official uses.
+- Use two short natural sentences at most and avoid unnecessary quotation marks.
+- Output JSON only.
+
+Return this exact shape:
+{"status":"broadly_consistent|purpose_not_stated|needs_confirmation","summary":"","questionForProfessional":""}`;
+
+  return requestCompletion({
+    messages: [
+      {
+        role: 'system',
+        content: 'You are a source-grounded ingredient and purpose consistency checker. You never prescribe, diagnose, or decide patient suitability. Output JSON only.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0,
+    max_tokens: 700,
+    reasoning: { effort: 'none' },
+    response_format: { type: 'json_object' },
+    plugins: [
+      {
+        id: 'web',
+        engine: 'exa',
+        max_results: 4,
+        include_domains: [
+          'dailymed.nlm.nih.gov',
+          'medlineplus.gov',
+          'fda.gov',
+          'nhs.uk',
+          'who.int',
+        ],
+      },
+    ],
+  });
 }
 
 export async function checkCareInstructionSafety({
