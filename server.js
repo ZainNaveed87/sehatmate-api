@@ -2335,19 +2335,173 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
       res.status(404).json({ success: false, message: 'Schedule item not found.' });
       return;
     }
-    await pool.execute(
-      `UPDATE care_schedule_items
-       SET display_time = COALESCE(NULLIF(?, ''), display_time),
-           requires_confirmation = 0,
-           confirmation_status = 'ready',
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND user_id = ?`,
-      [displayTime, itemId, req.auth.userId],
-    );
+    if (displayTime) {
+      await pool.execute(
+        `UPDATE care_schedule_items
+         SET display_time = ?, requires_confirmation = 0,
+             confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`,
+        [displayTime, itemId, req.auth.userId],
+      );
+    } else {
+      await pool.execute(
+        `UPDATE care_schedule_items
+         SET requires_confirmation = 0,
+             confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`,
+        [itemId, req.auth.userId],
+      );
+    }
     res.json({ success: true, message: 'Schedule time confirmed.', data: {} });
   } catch (error) {
     next(error);
   }
+});
+
+function realityQuestionTemplates(tasks) {
+  const text = tasks.map((item) => `${item.title} ${item.display_time || ''} ${item.recurrence_text || ''} ${item.reason || ''}`).join(' ').toLowerCase();
+  const kinds = new Set(tasks.map((item) => item.task_kind));
+  const questions = [];
+  const add = (key, category, question, options) => {
+    if (!questions.some((item) => item.key === key)) questions.push({ key, category, question, options });
+  };
+
+  if (/morning|breakfast|before food|after food/.test(text)) {
+    add('morning_routine', 'Routine', 'Which option best matches your usual morning routine?', [
+      { label: 'I can follow the stated morning or meal instruction', points: 0 },
+      { label: 'My morning time changes on some days', points: 8 },
+      { label: 'This timing is usually difficult for me', points: 15 },
+    ]);
+  }
+  if (/afternoon|midday|lunch|3 times|three times/.test(text)) {
+    add('daytime_access', 'Routine', 'Can you access this medicine or task during the daytime?', [
+      { label: 'Yes, reliably', points: 0 },
+      { label: 'Sometimes', points: 8 },
+      { label: 'Usually not', points: 15 },
+    ]);
+  }
+  if (/evening|night|bedtime|dinner/.test(text)) {
+    add('evening_routine', 'Routine', 'Can you follow the stated evening or bedtime instruction?', [
+      { label: 'Yes, reliably', points: 0 },
+      { label: 'My evening routine changes', points: 8 },
+      { label: 'This timing is usually difficult', points: 15 },
+    ]);
+  }
+  if (kinds.has('care_task') || /assist|caregiver|dressing/.test(text)) {
+    add('caregiver_support', 'Support', 'Is the required help available for this care task?', [
+      { label: 'Yes, when needed', points: 0 },
+      { label: 'Only sometimes', points: 10 },
+      { label: 'No help is currently available', points: 20 },
+    ]);
+  }
+  if (kinds.has('follow_up') || kinds.has('lab_test')) {
+    add('travel_access', 'Visits and tests', 'Can you reach the clinic or laboratory at the stated time?', [
+      { label: 'Yes, transport is arranged', points: 0 },
+      { label: 'Transport still needs arranging', points: 10 },
+      { label: 'I cannot reach it at that time', points: 20 },
+    ]);
+  }
+  if (kinds.has('medicine')) {
+    add('medicine_access', 'Medicine access', 'Have you obtained the medicines listed in this verified plan?', [
+      { label: 'Yes, all of them', points: 0 },
+      { label: 'Some are still missing', points: 12 },
+      { label: 'None yet', points: 20 },
+    ]);
+  }
+  return questions.slice(0, 6);
+}
+
+app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  try {
+    const [plans] = await pool.execute('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1', [planId, req.auth.userId]);
+    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    const [tasks] = await pool.execute(
+      `SELECT task_kind, title, display_time, recurrence_text, reason
+       FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ? ORDER BY id`,
+      [planId, req.auth.userId],
+    );
+    if (!tasks.length) return res.status(409).json({ success: false, message: 'Generate the schedule before starting the reality check.' });
+    const templates = realityQuestionTemplates(tasks);
+    const [saved] = await pool.execute(
+      `SELECT question_key, selected_answer, note FROM care_reality_answers
+       WHERE care_plan_id = ? AND user_id = ?`,
+      [planId, req.auth.userId],
+    );
+    const savedByKey = new Map(saved.map((item) => [item.question_key, item]));
+    res.json({ success: true, data: { questions: templates.map((item) => ({
+      ...item,
+      options: item.options.map((option) => option.label),
+      selectedAnswer: savedByKey.get(item.key)?.selected_answer || '',
+      note: savedByKey.get(item.key)?.note || '',
+    })) } });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
+  if (!idPattern.test(planId) || !answers.length) return res.status(422).json({ success: false, message: 'Complete the relevant reality-check questions.' });
+  const connection = await pool.getConnection();
+  try {
+    const [plans] = await connection.execute('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1', [planId, req.auth.userId]);
+    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    const [tasks] = await connection.execute('SELECT task_kind, title, display_time, recurrence_text, reason FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ?', [planId, req.auth.userId]);
+    const templates = realityQuestionTemplates(tasks);
+    const byKey = new Map(templates.map((item) => [item.key, item]));
+    await connection.beginTransaction();
+    for (const answer of answers) {
+      const key = cleanText(answer?.key, 80);
+      const selected = cleanText(answer?.answer, 240);
+      const template = byKey.get(key);
+      const option = template?.options.find((item) => item.label === selected);
+      if (!template || !option) throw new Error('INVALID_REALITY_ANSWER');
+      await connection.execute(
+        `INSERT INTO care_reality_answers (care_plan_id, user_id, question_key, category, question_text, selected_answer, risk_points, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE selected_answer = VALUES(selected_answer), risk_points = VALUES(risk_points), note = VALUES(note), updated_at = CURRENT_TIMESTAMP`,
+        [planId, req.auth.userId, key, template.category, template.question, selected, option.points, cleanText(answer?.note, 500)],
+      );
+    }
+    await connection.commit();
+    res.json({ success: true, message: 'Reality-check answers saved.', data: {} });
+  } catch (error) {
+    await connection.rollback();
+    if (error?.message === 'INVALID_REALITY_ANSWER') return res.status(422).json({ success: false, message: 'Select a valid answer for every question.' });
+    next(error);
+  } finally { connection.release(); }
+});
+
+app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  try {
+    const [plans] = await pool.execute('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1', [planId, req.auth.userId]);
+    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    const [tasks] = await pool.execute(
+      `SELECT id, title, task_kind, schedule_date, TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+        display_time, recurrence_text, reason, requires_confirmation
+       FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ? ORDER BY schedule_date, schedule_time, id`,
+      [planId, req.auth.userId],
+    );
+    const [answers] = await pool.execute('SELECT question_key, category, question_text, selected_answer, risk_points, note FROM care_reality_answers WHERE care_plan_id = ? AND user_id = ?', [planId, req.auth.userId]);
+    const unanswered = Math.max(0, realityQuestionTemplates(tasks).length - answers.length);
+    const answerPenalty = answers.reduce((sum, item) => sum + Number(item.risk_points || 0), 0);
+    const unclear = tasks.filter((item) => Boolean(item.requires_confirmation)).length;
+    const atRisk = answers.filter((item) => Number(item.risk_points || 0) > 0 && Number(item.risk_points || 0) < 20).length;
+    const blocked = answers.filter((item) => Number(item.risk_points || 0) >= 20).length;
+    const ready = Math.max(0, tasks.length - unclear);
+    const readiness = Math.max(0, Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)));
+    await pool.execute('UPDATE care_plans SET readiness_score = ?, status = ? WHERE id = ? AND user_id = ?', [readiness, blocked || atRisk || unclear || unanswered ? 'needs_attention' : 'reality_check', planId, req.auth.userId]);
+    res.json({ success: true, data: {
+      readiness,
+      metrics: { blocked, atRisk, ready, unclear },
+      tasks: tasks.map((item) => ({ ...item, id: String(item.id), status: item.requires_confirmation ? 'unclear' : 'ready' })),
+      findings: answers.filter((item) => Number(item.risk_points || 0) > 0).map((item) => ({ category: item.category, question: item.question_text, answer: item.selected_answer, severity: Number(item.risk_points) >= 20 ? 'blocked' : 'at_risk' })),
+      unanswered,
+    } });
+  } catch (error) { next(error); }
 });
 
 app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
