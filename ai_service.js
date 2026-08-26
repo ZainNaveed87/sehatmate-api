@@ -443,3 +443,41 @@ Return JSON only:
     ],
   });
 }
+
+export async function generateGroundedCareSchedule({ instructions, today }) {
+  const prompt = `Turn these already verified care instructions into a care-plan schedule.
+
+Today: ${today}
+Verified instructions JSON:
+${JSON.stringify(instructions)}
+
+Safety rules:
+- Use only details present in each verified instruction. Never change a medicine, amount, route, frequency, duration, date or written time.
+- Create schedule items only for the supplied instruction IDs.
+- If an exact clock time or date is written, copy it and set grounding to explicit.
+- Morning, afternoon, evening, bedtime, before food and after food may be copied as displayTime, but must not be converted into a clock time.
+- If a frequency is written without usable times, you may offer short patient-facing time-slot suggestions, but set time to an empty string, grounding to suggested and requiresConfirmation to true.
+- Never convert a total daily amount into an amount per dose.
+- Never calculate dose intervals, treatment duration, missed-dose advice, start dates or end dates.
+- A suggestion is only an organisation draft and must not activate a reminder until confirmed.
+- Keep one schedule item per distinct occurrence explicitly supported by the instruction. Maximum 40 items.
+- Use short natural language and no medical advice.
+- Return JSON only.
+
+Return exactly:
+{"items":[{"instructionId":"","title":"","taskKind":"medicine|lab_test|follow_up|care_task|other","date":"YYYY-MM-DD or empty","time":"HH:MM or empty","displayTime":"copied wording or short suggested slot","recurrence":"copied frequency or empty","grounding":"explicit|suggested","requiresConfirmation":false,"reason":"short explanation"}]}`;
+
+  return requestCompletion({
+    messages: [
+      {
+        role: 'system',
+        content: 'You organize verified care instructions into a grounded schedule. You never prescribe, calculate doses, or invent clinical timings. Output JSON only.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0,
+    max_tokens: 2600,
+    reasoning: { effort: 'none' },
+    response_format: { type: 'json_object' },
+  });
+}

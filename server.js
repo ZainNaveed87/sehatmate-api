@@ -16,6 +16,7 @@ import {
   aiConfiguration,
   checkIngredientPurpose,
   extractCareInstructions,
+  generateGroundedCareSchedule,
   generateAiText,
 } from './ai_service.js';
 
@@ -581,6 +582,39 @@ function parseJsonObject(text, errorMessage) {
     // The public error below intentionally hides provider output.
   }
   throw new AiServiceError(errorMessage, 502);
+}
+
+function parseCareSchedule(text, allowedInstructionIds) {
+  const value = parseJsonObject(text, 'AI could not return a valid care schedule. Please retry.');
+  const allowedKinds = new Set(['medicine', 'lab_test', 'follow_up', 'care_task', 'other']);
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+  const items = Array.isArray(value.items) ? value.items : [];
+  return items.slice(0, 40).map((item) => {
+    const instructionId = cleanText(item?.instructionId, 30);
+    if (!allowedInstructionIds.has(instructionId)) return null;
+    const title = cleanText(item?.title, 160);
+    if (!title) return null;
+    const taskKind = cleanText(item?.taskKind, 30).toLowerCase();
+    const grounding = cleanText(item?.grounding, 20).toLowerCase() === 'explicit'
+      ? 'explicit'
+      : 'suggested';
+    const date = cleanText(item?.date, 10);
+    const time = cleanText(item?.time, 5);
+    const requiresConfirmation = grounding !== 'explicit' || Boolean(item?.requiresConfirmation);
+    return {
+      instructionId,
+      title,
+      taskKind: allowedKinds.has(taskKind) ? taskKind : 'other',
+      date: datePattern.test(date) ? date : null,
+      time: grounding === 'explicit' && timePattern.test(time) ? `${time}:00` : null,
+      displayTime: cleanText(item?.displayTime, 160) || null,
+      recurrence: cleanText(item?.recurrence, 160) || null,
+      grounding,
+      requiresConfirmation,
+      reason: cleanText(item?.reason, 500) || null,
+    };
+  }).filter(Boolean);
 }
 
 function parseIngredientLabel(text) {
@@ -2163,6 +2197,159 @@ app.post('/api/care-plans/:id/finalize-review', authenticate, async (req, res, n
   }
 });
 
+app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) {
+    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+    return;
+  }
+
+  try {
+    const [plans] = await pool.execute(
+      'SELECT id, status FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    if (plans.length === 0) {
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+    if (!['reality_check', 'needs_attention', 'active'].includes(plans[0].status)) {
+      res.status(409).json({ success: false, message: 'Finalize the instruction review before generating a schedule.' });
+      return;
+    }
+
+    const [instructions] = await pool.execute(
+      `SELECT id, category, title, instruction, timing
+       FROM extracted_instructions
+       WHERE care_plan_id = ? AND review_status = 'verified'
+       ORDER BY id`,
+      [planId],
+    );
+    if (instructions.length === 0) {
+      res.status(409).json({ success: false, message: 'No verified instructions are available for scheduling.' });
+      return;
+    }
+
+    const aiResult = await generateGroundedCareSchedule({
+      today: new Date().toISOString().slice(0, 10),
+      instructions: instructions.map((item) => ({
+        id: String(item.id),
+        category: item.category,
+        title: cleanText(item.title, 160),
+        instruction: cleanText(item.instruction, 4000),
+        timing: cleanText(item.timing, 160),
+      })),
+    });
+    const allowedIds = new Set(instructions.map((item) => String(item.id)));
+    const schedule = parseCareSchedule(aiResult.text, allowedIds);
+    if (schedule.length === 0) {
+      throw new AiServiceError('No schedulable details were found in the verified instructions.', 422);
+    }
+
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.execute(
+        'DELETE FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ?',
+        [planId, req.auth.userId],
+      );
+      for (const item of schedule) {
+        await connection.execute(
+          `INSERT INTO care_schedule_items (
+            care_plan_id, user_id, instruction_id, title, task_kind,
+            schedule_date, schedule_time, display_time, recurrence_text,
+            grounding, requires_confirmation, confirmation_status, reason
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            planId,
+            req.auth.userId,
+            item.instructionId,
+            item.title,
+            item.taskKind,
+            item.date,
+            item.time,
+            item.displayTime,
+            item.recurrence,
+            item.grounding,
+            item.requiresConfirmation ? 1 : 0,
+            item.requiresConfirmation ? 'needs_confirmation' : 'ready',
+            item.reason,
+          ],
+        );
+      }
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    await logAiUsage({
+      userId: req.auth.userId,
+      carePlanId: planId,
+      result: aiResult,
+      status: 'success',
+      featureName: 'schedule_generation',
+    });
+
+    res.json({
+      success: true,
+      message: 'A prescription-grounded schedule draft is ready.',
+      data: {
+        itemCount: schedule.length,
+        readyCount: schedule.filter((item) => !item.requiresConfirmation).length,
+        confirmationCount: schedule.filter((item) => item.requiresConfirmation).length,
+      },
+    });
+  } catch (error) {
+    if (error instanceof AiServiceError) {
+      await logAiUsage({
+        userId: req.auth.userId,
+        carePlanId: planId,
+        result: null,
+        status: 'failed',
+        errorCode: String(error.statusCode),
+        featureName: 'schedule_generation',
+      });
+      res.status(error.statusCode).json({ success: false, message: error.message });
+      return;
+    }
+    next(error);
+  }
+});
+
+app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next) => {
+  const itemId = req.params.id;
+  const displayTime = cleanText(req.body?.displayTime, 160);
+  if (!idPattern.test(itemId)) {
+    res.status(422).json({ success: false, message: 'Invalid schedule item ID.' });
+    return;
+  }
+  try {
+    const [rows] = await pool.execute(
+      'SELECT id FROM care_schedule_items WHERE id = ? AND user_id = ? LIMIT 1',
+      [itemId, req.auth.userId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ success: false, message: 'Schedule item not found.' });
+      return;
+    }
+    await pool.execute(
+      `UPDATE care_schedule_items
+       SET display_time = COALESCE(NULLIF(?, ''), display_time),
+           requires_confirmation = 0,
+           confirmation_status = 'ready',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`,
+      [displayTime, itemId, req.auth.userId],
+    );
+    res.json({ success: true, message: 'Schedule time confirmed.', data: {} });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   if (!idPattern.test(planId)) {
@@ -2200,11 +2387,18 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
       [planId],
     );
     const [tasks] = await pool.execute(
-      `SELECT id, instruction_id, caregiver_id, task_date, task_time,
-        title, note, task_kind, status, completed_at
-       FROM care_tasks WHERE care_plan_id = ?
-       ORDER BY task_date, task_time, id`,
-      [planId],
+      `SELECT id, instruction_id, NULL AS caregiver_id,
+        schedule_date AS task_date,
+        COALESCE(TIME_FORMAT(schedule_time, '%H:%i'), NULLIF(display_time, ''), 'Review timing') AS task_time,
+        title,
+        CONCAT_WS(' · ', NULLIF(recurrence_text, ''), NULLIF(display_time, ''), NULLIF(reason, '')) AS note,
+        task_kind,
+        CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
+        NULL AS completed_at
+       FROM care_schedule_items
+       WHERE care_plan_id = ? AND user_id = ?
+       ORDER BY schedule_date, schedule_time, id`,
+      [planId, req.auth.userId],
     );
     const [gaps] = await pool.execute(
       `SELECT id, task_id, category, title, status, when_text, summary,
