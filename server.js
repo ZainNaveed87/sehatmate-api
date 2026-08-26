@@ -617,6 +617,15 @@ function parseCareSchedule(text, allowedInstructionIds) {
   }).filter(Boolean);
 }
 
+function scheduleWindow(displayTime) {
+  const label = String(displayTime || '').toLowerCase();
+  if (/\bmorning\b/.test(label)) return { start: 4 * 60, end: 11 * 60 + 59, label: 'morning (4:00 AM–11:59 AM)' };
+  if (/\bafternoon\b/.test(label)) return { start: 12 * 60, end: 16 * 60 + 59, label: 'afternoon (12:00 PM–4:59 PM)' };
+  if (/\bevening\b/.test(label)) return { start: 17 * 60, end: 21 * 60 + 59, label: 'evening (5:00 PM–9:59 PM)' };
+  if (/\b(bedtime|night)\b/.test(label)) return { start: 18 * 60, end: 23 * 60 + 59, label: 'night/bedtime (6:00 PM–11:59 PM)' };
+  return null;
+}
+
 function parseIngredientLabel(text) {
   const value = parseJsonObject(
     text,
@@ -2337,12 +2346,24 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   }
   try {
     const [rows] = await pool.execute(
-      'SELECT id FROM care_schedule_items WHERE id = ? AND user_id = ? LIMIT 1',
+      'SELECT id, display_time FROM care_schedule_items WHERE id = ? AND user_id = ? LIMIT 1',
       [itemId, req.auth.userId],
     );
     if (rows.length === 0) {
       res.status(404).json({ success: false, message: 'Schedule item not found.' });
       return;
+    }
+    const window = scheduleWindow(rows[0].display_time);
+    if (window) {
+      const [hour, minute] = scheduleTime.split(':').map(Number);
+      const selectedMinutes = (hour * 60) + minute;
+      if (selectedMinutes < window.start || selectedMinutes > window.end) {
+        res.status(422).json({
+          success: false,
+          message: `Select a time within ${window.label} for this schedule item.`,
+        });
+        return;
+      }
     }
     await pool.execute(
       `UPDATE care_schedule_items
