@@ -2741,35 +2741,36 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
     }
 
     if (nextStatus === 'active') {
-      const [[instructionCounts]] = await pool.execute(
-        `SELECT
-          SUM(review_status = 'verified') AS verified_count,
-          SUM(review_status = 'pending') AS pending_count
+      const [instructionRows] = await pool.execute(
+        `SELECT review_status
          FROM extracted_instructions WHERE care_plan_id = ?`,
         [planId],
       );
-      const [[gapCounts]] = await pool.execute(
-        `SELECT COUNT(*) AS open_count FROM care_gaps
-         WHERE care_plan_id = ? AND status <> 'resolved'`,
+      const [gapRows] = await pool.execute(
+        `SELECT status FROM care_gaps
+         WHERE care_plan_id = ?`,
         [planId],
       );
-      const [[scheduleCounts]] = await pool.execute(
-        `SELECT
-          COUNT(*) AS task_count,
-          SUM(schedule_time IS NULL) AS missing_time_count,
-          SUM(requires_confirmation = 1) AS confirmation_count
+      const [scheduleRows] = await pool.execute(
+        `SELECT schedule_time, requires_confirmation
          FROM care_schedule_items
          WHERE care_plan_id = ? AND user_id = ?`,
         [planId, req.auth.userId],
       );
 
+      const verifiedCount = instructionRows.filter((item) => item.review_status === 'verified').length;
+      const pendingCount = instructionRows.filter((item) => item.review_status === 'pending').length;
+      const openGapCount = gapRows.filter((item) => item.status !== 'resolved').length;
+      const missingTimeCount = scheduleRows.filter((item) => item.schedule_time == null).length;
+      const confirmationCount = scheduleRows.filter((item) => Boolean(item.requires_confirmation)).length;
+
       if (
-        Number(instructionCounts.verified_count || 0) === 0 ||
-        Number(instructionCounts.pending_count || 0) > 0 ||
-        Number(gapCounts.open_count || 0) > 0 ||
-        Number(scheduleCounts.task_count || 0) === 0 ||
-        Number(scheduleCounts.missing_time_count || 0) > 0 ||
-        Number(scheduleCounts.confirmation_count || 0) > 0
+        verifiedCount === 0 ||
+        pendingCount > 0 ||
+        openGapCount > 0 ||
+        scheduleRows.length === 0 ||
+        missingTimeCount > 0 ||
+        confirmationCount > 0
       ) {
         res.status(409).json({
           success: false,
@@ -2779,20 +2780,26 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       }
     }
 
-    await pool.execute(
-      `UPDATE care_plans SET
-        status = ?,
-        activated_at = CASE
-          WHEN ? = 'active' THEN COALESCE(activated_at, CURRENT_TIMESTAMP)
-          ELSE activated_at
-        END,
-        completed_at = CASE
-          WHEN ? = 'completed' THEN COALESCE(completed_at, CURRENT_TIMESTAMP)
-          ELSE completed_at
-        END
-       WHERE id = ? AND user_id = ?`,
-      [nextStatus, nextStatus, nextStatus, planId, req.auth.userId],
-    );
+    if (nextStatus === 'active') {
+      await pool.execute(
+        `UPDATE care_plans
+         SET status = ?, activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP)
+         WHERE id = ? AND user_id = ?`,
+        [nextStatus, planId, req.auth.userId],
+      );
+    } else if (nextStatus === 'completed') {
+      await pool.execute(
+        `UPDATE care_plans
+         SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+         WHERE id = ? AND user_id = ?`,
+        [nextStatus, planId, req.auth.userId],
+      );
+    } else {
+      await pool.execute(
+        'UPDATE care_plans SET status = ? WHERE id = ? AND user_id = ?',
+        [nextStatus, planId, req.auth.userId],
+      );
+    }
     const [updated] = await pool.execute(
       'SELECT * FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
       [planId, req.auth.userId],
