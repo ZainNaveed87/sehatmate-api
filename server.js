@@ -1856,6 +1856,16 @@ app.post(
           const safeMessage = error instanceof AiServiceError
             ? error.message
             : 'Document extraction failed.';
+          console.error('AI document extraction failed', {
+            documentId: String(document.id),
+            carePlanId: String(planId),
+            mimeType: document.mime_type,
+            statusCode: error?.statusCode || 500,
+            upstreamStatus: error?.upstreamStatus || null,
+            providerCode: error?.providerCode || null,
+            providerName: error?.providerName || null,
+            message: safeMessage,
+          });
           failedDocuments.push({ id: String(document.id), message: safeMessage });
           await pool.execute(
             `UPDATE care_documents
@@ -1868,7 +1878,9 @@ app.post(
             carePlanId: planId,
             result: aiResult,
             status: 'failed',
-            errorCode: error?.statusCode ? String(error.statusCode) : 'extraction_failed',
+            errorCode: error?.providerCode ||
+              (error?.upstreamStatus ? `upstream_${error.upstreamStatus}` : null) ||
+              (error?.statusCode ? String(error.statusCode) : 'extraction_failed'),
           });
         }
       }

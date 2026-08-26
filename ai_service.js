@@ -2,11 +2,63 @@ const openRouterUrl = 'https://openrouter.ai/api/v1/chat/completions';
 const requestTimeoutMs = 45_000;
 
 export class AiServiceError extends Error {
-  constructor(message, statusCode = 502) {
+  constructor(message, statusCode = 502, details = {}) {
     super(message);
     this.name = 'AiServiceError';
     this.statusCode = statusCode;
+    this.upstreamStatus = details.upstreamStatus || null;
+    this.providerCode = details.providerCode || null;
+    this.providerName = details.providerName || null;
   }
+}
+
+function sanitizedProviderText(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, '[redacted]')
+    .replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/gi, '[image omitted]')
+    .replace(/[A-Za-z0-9+/=]{500,}/g, '[large value omitted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);
+}
+
+function nestedProviderError(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function providerFailure(payload, upstreamStatus) {
+  const error = payload?.error || {};
+  const metadata = error?.metadata || {};
+  const raw = nestedProviderError(metadata?.raw);
+  const rawError = raw?.error || raw || {};
+  const generic = sanitizedProviderText(error?.message);
+  const candidates = [
+    rawError?.message,
+    rawError?.detail,
+    metadata?.message,
+    metadata?.error,
+    error?.message,
+  ];
+  const specific = candidates
+    .map(sanitizedProviderText)
+    .find((message) => message && message.toLowerCase() !== 'provider returned error');
+  const message = specific || generic || `AI provider request failed (HTTP ${upstreamStatus}).`;
+  const providerCode = sanitizedProviderText(
+    rawError?.code?.toString?.() || error?.code?.toString?.() || '',
+  ) || null;
+  const providerName = sanitizedProviderText(metadata?.provider_name || payload?.provider || '') || null;
+
+  return { message, providerCode, providerName };
 }
 
 function configuredProvider() {
@@ -127,11 +179,16 @@ async function requestCompletion(body) {
     }
 
     if (!response.ok) {
-      const providerMessage = payload?.error?.message;
-      const safeMessage = typeof providerMessage === 'string'
-        ? providerMessage.slice(0, 300)
-        : 'The AI request failed.';
-      throw new AiServiceError(safeMessage, response.status === 429 ? 429 : 502);
+      const failure = providerFailure(payload, response.status);
+      throw new AiServiceError(
+        failure.message,
+        response.status === 429 ? 429 : 502,
+        {
+          upstreamStatus: response.status,
+          providerCode: failure.providerCode,
+          providerName: failure.providerName,
+        },
+      );
     }
 
     return {
