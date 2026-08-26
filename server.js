@@ -1464,6 +1464,45 @@ app.get('/api/care-plans', authenticate, async (req, res, next) => {
   }
 });
 
+app.delete('/api/care-plans/:id', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) {
+    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+    return;
+  }
+
+  try {
+    const [plans] = await pool.execute(
+      'SELECT id, status FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    const plan = plans[0];
+    if (!plan) {
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+    if (['active', 'completed'].includes(plan.status)) {
+      res.status(409).json({
+        success: false,
+        message: 'Active or completed care plans cannot be deleted from drafts.',
+      });
+      return;
+    }
+
+    await pool.execute(
+      'DELETE FROM care_plans WHERE id = ? AND user_id = ?',
+      [planId, req.auth.userId],
+    );
+    res.json({
+      success: true,
+      message: 'Draft care plan deleted.',
+      data: { planId: String(planId) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/api/care-plans', authenticate, async (req, res, next) => {
   const title = cleanText(req.body?.title, 120);
   if (title.length < 2) {
@@ -2702,15 +2741,27 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
          WHERE care_plan_id = ? AND status <> 'resolved'`,
         [planId],
       );
+      const [[scheduleCounts]] = await pool.execute(
+        `SELECT
+          COUNT(*) AS task_count,
+          SUM(schedule_time IS NULL) AS missing_time_count,
+          SUM(requires_confirmation = 1) AS confirmation_count
+         FROM care_schedule_items
+         WHERE care_plan_id = ? AND user_id = ?`,
+        [planId, req.auth.userId],
+      );
 
       if (
         Number(instructionCounts.verified_count || 0) === 0 ||
         Number(instructionCounts.pending_count || 0) > 0 ||
-        Number(gapCounts.open_count || 0) > 0
+        Number(gapCounts.open_count || 0) > 0 ||
+        Number(scheduleCounts.task_count || 0) === 0 ||
+        Number(scheduleCounts.missing_time_count || 0) > 0 ||
+        Number(scheduleCounts.confirmation_count || 0) > 0
       ) {
         res.status(409).json({
           success: false,
-          message: 'Review every instruction and resolve every care gap before activation. Doctor Questions remain excluded until confirmed.',
+          message: 'Review every instruction, resolve every care gap, and confirm an exact time for every scheduled task before activation.',
         });
         return;
       }
