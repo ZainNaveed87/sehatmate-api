@@ -177,7 +177,7 @@ const allowedStatusTransitions = {
   reality_check: new Set(['needs_attention', 'active']),
   needs_attention: new Set(['active']),
   active: new Set(['completed']),
-  completed: new Set(),
+  completed: new Set(['active']),
 };
 
 function publicUser(row) {
@@ -364,6 +364,9 @@ function carePlanJson(row) {
     understandingScore: Number(row.understanding_score || 0),
     activatedAt: row.activated_at,
     completedAt: row.completed_at,
+    durationMode: row.duration_mode || 'prescription',
+    suggestedEndDate: row.suggested_end_date,
+    plannedEndDate: row.planned_end_date,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     documentCount: Number(row.document_count || 0),
@@ -1440,7 +1443,7 @@ app.post('/api/onboarding/complete', authenticate, async (req, res, next) => {
 
 app.get('/api/care-plans', authenticate, async (req, res, next) => {
   try {
-    const [rows] = await pool.execute(
+    let [rows] = await pool.execute(
       `SELECT care_plans.*,
         (SELECT COUNT(*) FROM care_documents
           WHERE care_documents.care_plan_id = care_plans.id) AS document_count,
@@ -1454,6 +1457,24 @@ app.get('/api/care-plans', authenticate, async (req, res, next) => {
        ORDER BY care_plans.updated_at DESC`,
       [req.auth.userId],
     );
+
+    const today = new Date().toISOString().slice(0, 10);
+    const expiredIds = rows
+      .filter((row) => row.status === 'active' && row.planned_end_date &&
+        String(row.planned_end_date).slice(0, 10) < today)
+      .map((row) => row.id);
+    for (const id of expiredIds) {
+      await pool.execute(
+        `UPDATE care_plans SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+         WHERE id = ? AND user_id = ?`,
+        ['completed', id, req.auth.userId],
+      );
+      const row = rows.find((item) => String(item.id) === String(id));
+      if (row) {
+        row.status = 'completed';
+        row.completed_at = row.completed_at || new Date().toISOString();
+      }
+    }
 
     res.json({
       success: true,
@@ -1473,7 +1494,7 @@ app.delete('/api/care-plans/:id', authenticate, async (req, res, next) => {
 
   try {
     const [plans] = await pool.execute(
-      'SELECT id, status FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      'SELECT id, status, duration_mode FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
       [planId, req.auth.userId],
     );
     const plan = plans[0];
@@ -1481,26 +1502,58 @@ app.delete('/api/care-plans/:id', authenticate, async (req, res, next) => {
       res.status(404).json({ success: false, message: 'Care plan not found.' });
       return;
     }
-    if (['active', 'completed'].includes(plan.status)) {
-      res.status(409).json({
-        success: false,
-        message: 'Active or completed care plans cannot be deleted from drafts.',
-      });
-      return;
-    }
-
     await pool.execute(
       'DELETE FROM care_plans WHERE id = ? AND user_id = ?',
       [planId, req.auth.userId],
     );
     res.json({
       success: true,
-      message: 'Draft care plan deleted.',
+      message: 'Care plan deleted.',
       data: { planId: String(planId) },
     });
   } catch (error) {
     next(error);
   }
+});
+
+app.post('/api/care-plans/bulk-delete', authenticate, async (req, res, next) => {
+  const ids = [...new Set((Array.isArray(req.body?.planIds) ? req.body.planIds : [])
+    .map((value) => String(value))
+    .filter((value) => idPattern.test(value)))].slice(0, 100);
+  if (!ids.length) return res.status(422).json({ success: false, message: 'Select at least one care plan.' });
+  try {
+    const placeholders = ids.map(() => '?').join(',');
+    const [result] = await pool.execute(
+      `DELETE FROM care_plans WHERE user_id = ? AND id IN (${placeholders})`,
+      [req.auth.userId, ...ids],
+    );
+    res.json({ success: true, message: 'Selected care plans deleted.', data: { deletedCount: Number(result.affectedRows || 0) } });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/care-plans/:id/duration', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  const mode = cleanText(req.body?.mode, 20);
+  const allowedModes = new Set(['prescription', 'custom', 'ongoing']);
+  const endDate = cleanText(req.body?.endDate, 10);
+  if (!idPattern.test(planId) || !allowedModes.has(mode)) {
+    return res.status(422).json({ success: false, message: 'Select a valid plan duration.' });
+  }
+  if (mode !== 'ongoing' && !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    return res.status(422).json({ success: false, message: 'Select a valid plan end date.' });
+  }
+  if (mode !== 'ongoing' && endDate < new Date().toISOString().slice(0, 10)) {
+    return res.status(422).json({ success: false, message: 'Plan end date cannot be in the past.' });
+  }
+  try {
+    const [result] = await pool.execute(
+      `UPDATE care_plans SET duration_mode = ?, planned_end_date = ?
+       WHERE id = ? AND user_id = ?`,
+      [mode, mode === 'ongoing' ? null : endDate, planId, req.auth.userId],
+    );
+    if (!result.affectedRows) return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    res.json({ success: true, message: 'Plan duration saved.', data: { mode, endDate: mode === 'ongoing' ? null : endDate } });
+  } catch (error) { next(error); }
 });
 
 app.post('/api/care-plans', authenticate, async (req, res, next) => {
@@ -2306,6 +2359,27 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
       throw new AiServiceError('No schedulable details were found in the verified instructions.', 422);
     }
 
+    const durationCandidates = [];
+    for (const instruction of instructions) {
+      const text = `${instruction.instruction || ''} ${instruction.timing || ''}`;
+      for (const match of text.matchAll(/\b(\d{1,3})\s*days?\b/gi)) durationCandidates.push(Number(match[1]));
+      for (const match of text.matchAll(/\b(\d{1,2})\s*weeks?\b/gi)) durationCandidates.push(Number(match[1]) * 7);
+    }
+    const explicitDays = durationCandidates.filter((value) => value > 0 && value <= 3650);
+    const scheduleDates = schedule.map((item) => item.date).filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value || ''));
+    const today = new Date();
+    let suggestedEndDate;
+    if (explicitDays.length) {
+      const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+      end.setUTCDate(end.getUTCDate() + Math.max(...explicitDays) - 1);
+      suggestedEndDate = end.toISOString().slice(0, 10);
+    } else if (scheduleDates.length) {
+      suggestedEndDate = scheduleDates.sort().at(-1);
+    } else {
+      const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + 6));
+      suggestedEndDate = end.toISOString().slice(0, 10);
+    }
+
     const connection = await pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -2335,6 +2409,18 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
             item.requiresConfirmation ? 'needs_confirmation' : 'ready',
             item.reason,
           ],
+        );
+      }
+      if ((plans[0].duration_mode || 'prescription') === 'prescription') {
+        await connection.execute(
+          `UPDATE care_plans SET suggested_end_date = ?, planned_end_date = ?
+           WHERE id = ? AND user_id = ?`,
+          [suggestedEndDate, suggestedEndDate, planId, req.auth.userId],
+        );
+      } else {
+        await connection.execute(
+          'UPDATE care_plans SET suggested_end_date = ? WHERE id = ? AND user_id = ?',
+          [suggestedEndDate, planId, req.auth.userId],
         );
       }
       await connection.commit();
@@ -2741,6 +2827,10 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
     }
 
     if (nextStatus === 'active') {
+      if (plan.duration_mode !== 'ongoing' && !plan.planned_end_date) {
+        res.status(409).json({ success: false, message: 'Choose the plan duration before activation.' });
+        return;
+      }
       const [instructionRows] = await pool.execute(
         `SELECT review_status
          FROM extracted_instructions WHERE care_plan_id = ?`,
