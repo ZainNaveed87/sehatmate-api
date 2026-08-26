@@ -2067,6 +2067,102 @@ app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
   }
 });
 
+app.post('/api/care-plans/:id/finalize-review', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) {
+    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+    return;
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const [plans] = await connection.execute(
+      'SELECT id, status FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1 FOR UPDATE',
+      [planId, req.auth.userId],
+    );
+    const plan = plans[0];
+    if (!plan) {
+      await connection.rollback();
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+
+    const [[counts]] = await connection.execute(
+      `SELECT
+        COUNT(*) AS total_count,
+        SUM(review_status = 'verified') AS verified_count,
+        SUM(review_status = 'rejected') AS rejected_count,
+        SUM(review_status = 'pending') AS pending_count,
+        SUM(review_status = 'unclear') AS question_count
+       FROM extracted_instructions
+       WHERE care_plan_id = ?`,
+      [planId],
+    );
+
+    const totalCount = Number(counts.total_count || 0);
+    const verifiedCount = Number(counts.verified_count || 0);
+    const rejectedCount = Number(counts.rejected_count || 0);
+    const pendingCount = Number(counts.pending_count || 0);
+    const questionCount = Number(counts.question_count || 0);
+
+    if (totalCount === 0 || verifiedCount === 0) {
+      await connection.rollback();
+      res.status(409).json({
+        success: false,
+        message: 'Confirm at least one instruction before continuing.',
+      });
+      return;
+    }
+    if (pendingCount > 0) {
+      await connection.rollback();
+      res.status(409).json({
+        success: false,
+        message: 'Review every instruction before continuing.',
+        data: { totalCount, verifiedCount, rejectedCount, pendingCount, questionCount },
+      });
+      return;
+    }
+
+    if (plan.status === 'needs_review') {
+      await connection.execute(
+        `UPDATE care_plans
+         SET status = 'reality_check', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`,
+        [planId, req.auth.userId],
+      );
+    } else if (!['reality_check', 'needs_attention', 'active', 'completed'].includes(plan.status)) {
+      await connection.rollback();
+      res.status(409).json({
+        success: false,
+        message: `This care plan cannot be finalized while it is ${plan.status}.`,
+      });
+      return;
+    }
+
+    await connection.commit();
+    res.json({
+      success: true,
+      message: 'Verified instructions are ready for the care plan.',
+      data: {
+        planId: String(planId),
+        status: plan.status === 'needs_review' ? 'reality_check' : plan.status,
+        totalCount,
+        verifiedCount,
+        rejectedCount,
+        pendingCount,
+        questionCount,
+      },
+    });
+  } catch (error) {
+    await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
+  }
+});
+
 app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   if (!idPattern.test(planId)) {
@@ -2148,6 +2244,20 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
             document_id: item.document_id == null ? null : String(item.document_id),
             safety_sources: parseStoredJson(item.safety_sources),
           })),
+        verifiedInstructions: instructions
+          .filter((item) =>
+            item.review_status === 'verified' &&
+            cleanText(item.title, 160) &&
+            cleanText(item.instruction, 4000))
+          .map((item) => ({
+            ...item,
+            id: String(item.id),
+            title: cleanText(item.title, 160),
+            instruction: cleanText(item.instruction, 4000),
+            timing: cleanText(item.timing, 160) || null,
+            document_id: item.document_id == null ? null : String(item.document_id),
+            safety_sources: parseStoredJson(item.safety_sources),
+          })),
         tasks: tasks.map((item) => ({
           ...item,
           id: String(item.id),
@@ -2211,7 +2321,7 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       const [[instructionCounts]] = await pool.execute(
         `SELECT
           SUM(review_status = 'verified') AS verified_count,
-          SUM(review_status IN ('pending', 'unclear')) AS unresolved_count
+          SUM(review_status = 'pending') AS pending_count
          FROM extracted_instructions WHERE care_plan_id = ?`,
         [planId],
       );
@@ -2223,12 +2333,12 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
 
       if (
         Number(instructionCounts.verified_count || 0) === 0 ||
-        Number(instructionCounts.unresolved_count || 0) > 0 ||
+        Number(instructionCounts.pending_count || 0) > 0 ||
         Number(gapCounts.open_count || 0) > 0
       ) {
         res.status(409).json({
           success: false,
-          message: 'Verify instructions and resolve every care gap before activation.',
+          message: 'Review every instruction and resolve every care gap before activation. Doctor Questions remain excluded until confirmed.',
         });
         return;
       }
