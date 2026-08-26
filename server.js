@@ -2322,8 +2322,17 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
 app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next) => {
   const itemId = req.params.id;
   const displayTime = cleanText(req.body?.displayTime, 160);
+  const scheduleTime = cleanText(req.body?.scheduleTime, 5);
+  const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
   if (!idPattern.test(itemId)) {
     res.status(422).json({ success: false, message: 'Invalid schedule item ID.' });
+    return;
+  }
+  if (!timePattern.test(scheduleTime)) {
+    res.status(422).json({
+      success: false,
+      message: 'Select an exact reminder time before confirming this schedule item.',
+    });
     return;
   }
   try {
@@ -2335,24 +2344,18 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
       res.status(404).json({ success: false, message: 'Schedule item not found.' });
       return;
     }
-    if (displayTime) {
-      await pool.execute(
-        `UPDATE care_schedule_items
-         SET display_time = ?, requires_confirmation = 0,
-             confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND user_id = ?`,
-        [displayTime, itemId, req.auth.userId],
-      );
-    } else {
-      await pool.execute(
-        `UPDATE care_schedule_items
-         SET requires_confirmation = 0,
-             confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND user_id = ?`,
-        [itemId, req.auth.userId],
-      );
-    }
-    res.json({ success: true, message: 'Schedule time confirmed.', data: {} });
+    await pool.execute(
+      `UPDATE care_schedule_items
+       SET schedule_time = ?, display_time = ?, requires_confirmation = 0,
+           confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`,
+      [scheduleTime, displayTime || `Confirmed reminder at ${scheduleTime}`, itemId, req.auth.userId],
+    );
+    res.json({
+      success: true,
+      message: 'Exact reminder time confirmed.',
+      data: { scheduleTime },
+    });
   } catch (error) {
     next(error);
   }

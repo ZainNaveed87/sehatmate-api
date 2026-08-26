@@ -456,10 +456,10 @@ Safety rules:
 - Create schedule items only for the supplied instruction IDs.
 - If an exact clock time or date is written, copy it and set grounding to explicit.
 - Morning, afternoon, evening, bedtime, before food and after food may be copied as displayTime, but must not be converted into a clock time.
-- If a frequency is written without usable times, you may offer short patient-facing time-slot suggestions, but set time to an empty string, grounding to suggested and requiresConfirmation to true.
+- If a frequency is written without usable clock times, create the supported number of occurrences using neutral labels such as Morning, Afternoon and Evening. Keep time empty, set grounding to suggested and requiresConfirmation to true. The patient must choose an exact clock time for every occurrence before reminders can be activated.
 - Never convert a total daily amount into an amount per dose.
 - Never calculate dose intervals, treatment duration, missed-dose advice, start dates or end dates.
-- A suggestion is only an organisation draft and must not activate a reminder until confirmed.
+- A suggestion is only an organisation draft and must not activate a reminder until the patient confirms an exact clock time.
 - Keep one schedule item per distinct occurrence explicitly supported by the instruction. Maximum 40 items.
 - Use short natural language and no medical advice.
 - Return JSON only.
