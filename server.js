@@ -2529,44 +2529,134 @@ function realityQuestionTemplates(tasks) {
 
   if (/morning|breakfast|before food|after food/.test(text)) {
     add('morning_routine', 'Routine', 'Which option best matches your usual morning routine?', [
-      { label: 'I can follow the stated morning or meal instruction', points: 0 },
-      { label: 'My morning time changes on some days', points: 8 },
-      { label: 'This timing is usually difficult for me', points: 15 },
+      {
+        label: 'I can follow the stated morning or meal instruction',
+        points: 0,
+      },
+      {
+        label: 'My morning time changes on some days',
+        points: 8,
+        reason: 'Your morning routine changes on some days, so a fixed morning reminder may not fit reliably every day.',
+        fix: 'Open the schedule and choose an allowed morning time that fits your routine more consistently. Then return to Reality Check and update this answer if the new timing works for you.',
+        action: 'schedule',
+      },
+      {
+        label: 'This timing is usually difficult for me',
+        points: 15,
+        reason: 'The current morning timing does not fit your usual routine well enough for the plan to be considered ready.',
+        fix: 'Review the scheduled morning time and move it to a more practical time within the allowed morning period. Then return to Reality Check and answer again.',
+        action: 'schedule',
+      },
     ]);
   }
   if (/afternoon|midday|lunch|3 times|three times/.test(text)) {
     add('daytime_access', 'Routine', 'Can you access this medicine or task during the daytime?', [
-      { label: 'Yes, reliably', points: 0 },
-      { label: 'Sometimes', points: 8 },
-      { label: 'Usually not', points: 15 },
+      {
+        label: 'Yes, reliably',
+        points: 0,
+      },
+      {
+        label: 'Sometimes',
+        points: 8,
+        reason: 'Daytime access is not reliable every day, so this task may be missed on some days.',
+        fix: 'Review the daytime reminder and choose an allowed time when the medicine or task is usually available to you. Then update this Reality Check answer.',
+        action: 'schedule',
+      },
+      {
+        label: 'Usually not',
+        points: 15,
+        reason: 'You usually cannot access this medicine or task during the current daytime period.',
+        fix: 'Review the schedule for a more practical allowed time. If the prescribed timing itself cannot be followed, contact the prescribing clinician or pharmacist instead of changing the medical instruction yourself.',
+        action: 'schedule',
+      },
     ]);
   }
   if (/evening|night|bedtime|dinner/.test(text)) {
     add('evening_routine', 'Routine', 'Can you follow the stated evening or bedtime instruction?', [
-      { label: 'Yes, reliably', points: 0 },
-      { label: 'My evening routine changes', points: 8 },
-      { label: 'This timing is usually difficult', points: 15 },
+      {
+        label: 'Yes, reliably',
+        points: 0,
+      },
+      {
+        label: 'My evening routine changes',
+        points: 8,
+        reason: 'Your evening routine changes, so the current reminder may not fit reliably every day.',
+        fix: 'Choose an allowed evening or night reminder time that better matches your usual routine, then update this Reality Check answer.',
+        action: 'schedule',
+      },
+      {
+        label: 'This timing is usually difficult',
+        points: 15,
+        reason: 'The current evening or bedtime timing is usually difficult for you to follow.',
+        fix: 'Review the scheduled time and choose a more practical time within the allowed period. If the prescribed timing itself is the problem, confirm it with the prescribing clinician or pharmacist.',
+        action: 'schedule',
+      },
     ]);
   }
   if (kinds.has('care_task') || /assist|caregiver|dressing/.test(text)) {
     add('caregiver_support', 'Support', 'Is the required help available for this care task?', [
-      { label: 'Yes, when needed', points: 0 },
-      { label: 'Only sometimes', points: 10 },
-      { label: 'No help is currently available', points: 20 },
+      {
+        label: 'Yes, when needed',
+        points: 0,
+      },
+      {
+        label: 'Only sometimes',
+        points: 10,
+        reason: 'Required help is only available sometimes, so this care task may not be completed reliably.',
+        fix: 'Arrange reliable help for the times this task is scheduled, then update this Reality Check answer.',
+        action: 'family_care',
+      },
+      {
+        label: 'No help is currently available',
+        points: 20,
+        reason: 'This care task requires help, but no helper is currently available.',
+        fix: 'Arrange caregiver or family support before activating the plan. If support cannot be arranged, contact the care team for guidance.',
+        action: 'family_care',
+      },
     ]);
   }
   if (kinds.has('follow_up') || kinds.has('lab_test')) {
     add('travel_access', 'Visits and tests', 'Can you reach the clinic or laboratory at the stated time?', [
-      { label: 'Yes, transport is arranged', points: 0 },
-      { label: 'Transport still needs arranging', points: 10 },
-      { label: 'I cannot reach it at that time', points: 20 },
+      {
+        label: 'Yes, transport is arranged',
+        points: 0,
+      },
+      {
+        label: 'Transport still needs arranging',
+        points: 10,
+        reason: 'Transport has not been arranged yet, so the planned visit or test may be missed.',
+        fix: 'Arrange transport for the stated appointment or test time. If that time is not possible, contact the clinic or laboratory before changing anything.',
+        action: 'reality_check',
+      },
+      {
+        label: 'I cannot reach it at that time',
+        points: 20,
+        reason: 'You cannot currently reach the clinic or laboratory at the stated time.',
+        fix: 'Contact the clinic or laboratory to discuss a workable appointment time and update the plan only after the appointment details are confirmed.',
+        action: 'reality_check',
+      },
     ]);
   }
   if (kinds.has('medicine')) {
     add('medicine_access', 'Medicine access', 'Have you obtained the medicines listed in this verified plan?', [
-      { label: 'Yes, all of them', points: 0 },
-      { label: 'Some are still missing', points: 12 },
-      { label: 'None yet', points: 20 },
+      {
+        label: 'Yes, all of them',
+        points: 0,
+      },
+      {
+        label: 'Some are still missing',
+        points: 12,
+        reason: 'One or more medicines in the verified plan are not currently available to you.',
+        fix: 'Obtain the prescribed medicines through your usual pharmacy or care provider, then update this Reality Check answer. Do not substitute or change a medicine without professional confirmation.',
+        action: 'reality_check',
+      },
+      {
+        label: 'None yet',
+        points: 20,
+        reason: 'The medicines in this verified plan have not been obtained yet.',
+        fix: 'Obtain the prescribed medicines through your usual pharmacy or care provider before activating reminders. Do not start substitutes or change the prescription yourself.',
+        action: 'reality_check',
+      },
     ]);
   }
   return questions.slice(0, 6);
@@ -2646,20 +2736,83 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
        FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ? ORDER BY schedule_date, schedule_time, id`,
       [planId, req.auth.userId],
     );
-    const [answers] = await pool.execute('SELECT question_key, category, question_text, selected_answer, risk_points, note FROM care_reality_answers WHERE care_plan_id = ? AND user_id = ?', [planId, req.auth.userId]);
-    const unanswered = Math.max(0, realityQuestionTemplates(tasks).length - answers.length);
+    const [answers] = await pool.execute(
+      'SELECT question_key, category, question_text, selected_answer, risk_points, note FROM care_reality_answers WHERE care_plan_id = ? AND user_id = ?',
+      [planId, req.auth.userId],
+    );
+
+    const templates = realityQuestionTemplates(tasks);
+    const templateByKey = new Map(templates.map((item) => [item.key, item]));
+    const unanswered = Math.max(0, templates.length - answers.length);
     const answerPenalty = answers.reduce((sum, item) => sum + Number(item.risk_points || 0), 0);
     const unclear = tasks.filter((item) => Boolean(item.requires_confirmation)).length;
     const atRisk = answers.filter((item) => Number(item.risk_points || 0) > 0 && Number(item.risk_points || 0) < 20).length;
     const blocked = answers.filter((item) => Number(item.risk_points || 0) >= 20).length;
     const ready = Math.max(0, tasks.length - unclear);
     const readiness = Math.max(0, Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)));
-    await pool.execute('UPDATE care_plans SET readiness_score = ?, status = ? WHERE id = ? AND user_id = ?', [readiness, blocked || atRisk || unclear || unanswered ? 'needs_attention' : 'reality_check', planId, req.auth.userId]);
+
+    const findings = answers
+      .filter((item) => Number(item.risk_points || 0) > 0)
+      .map((item) => {
+        const template = templateByKey.get(item.question_key);
+        const option = template?.options.find((candidate) => candidate.label === item.selected_answer);
+        const severity = Number(item.risk_points) >= 20 ? 'blocked' : 'at_risk';
+        return {
+          key: item.question_key,
+          category: item.category,
+          question: item.question_text,
+          answer: item.selected_answer,
+          severity,
+          reason: option?.reason || 'This saved answer indicates that part of the plan may not fit your current routine reliably.',
+          recommendation: option?.fix || 'Review this Reality Check answer and the related schedule before activation.',
+          action: option?.action || 'reality_check',
+        };
+      });
+
+    const blockers = [
+      ...findings.map((finding) => ({
+        type: 'reality_answer',
+        key: finding.key,
+        title: finding.question,
+        severity: finding.severity,
+        reason: finding.reason,
+        recommendation: finding.recommendation,
+        action: finding.action,
+      })),
+      ...tasks
+        .filter((item) => Boolean(item.requires_confirmation))
+        .map((item) => ({
+          type: 'schedule_item',
+          taskId: String(item.id),
+          title: item.title,
+          severity: 'unclear',
+          reason: cleanText(item.reason, 500) || 'This scheduled task still needs an exact confirmed time.',
+          recommendation: 'Open the care-plan schedule and confirm an exact reminder time within the allowed period.',
+          action: 'schedule',
+        })),
+      ...(unanswered > 0
+        ? [{
+            type: 'unanswered',
+            title: `${unanswered} Reality Check question${unanswered === 1 ? '' : 's'} still need an answer`,
+            severity: 'unanswered',
+            reason: 'The simulation cannot fully verify whether the plan fits your routine until every relevant question is answered.',
+            recommendation: 'Open Reality Check, answer the remaining questions, save them, and refresh the simulation.',
+            action: 'reality_check',
+          }]
+        : []),
+    ];
+
+    await pool.execute(
+      'UPDATE care_plans SET readiness_score = ?, status = ? WHERE id = ? AND user_id = ?',
+      [readiness, blocked || atRisk || unclear || unanswered ? 'needs_attention' : 'reality_check', planId, req.auth.userId],
+    );
+
     res.json({ success: true, data: {
       readiness,
       metrics: { blocked, atRisk, ready, unclear },
       tasks: tasks.map((item) => ({ ...item, id: String(item.id), status: item.requires_confirmation ? 'unclear' : 'ready' })),
-      findings: answers.filter((item) => Number(item.risk_points || 0) > 0).map((item) => ({ category: item.category, question: item.question_text, answer: item.selected_answer, severity: Number(item.risk_points) >= 20 ? 'blocked' : 'at_risk' })),
+      findings,
+      blockers,
       unanswered,
     } });
   } catch (error) { next(error); }
@@ -2842,8 +2995,15 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
         [planId],
       );
       const [scheduleRows] = await pool.execute(
-        `SELECT schedule_time, requires_confirmation
+        `SELECT task_kind, title, display_time, recurrence_text, reason,
+          schedule_time, requires_confirmation
          FROM care_schedule_items
+         WHERE care_plan_id = ? AND user_id = ?`,
+        [planId, req.auth.userId],
+      );
+      const [realityAnswers] = await pool.execute(
+        `SELECT question_key, selected_answer, risk_points
+         FROM care_reality_answers
          WHERE care_plan_id = ? AND user_id = ?`,
         [planId, req.auth.userId],
       );
@@ -2853,6 +3013,9 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       const openGapCount = gapRows.filter((item) => item.status !== 'resolved').length;
       const missingTimeCount = scheduleRows.filter((item) => item.schedule_time == null).length;
       const confirmationCount = scheduleRows.filter((item) => Boolean(item.requires_confirmation)).length;
+      const realityTemplates = realityQuestionTemplates(scheduleRows);
+      const unansweredRealityCount = Math.max(0, realityTemplates.length - realityAnswers.length);
+      const realityRiskCount = realityAnswers.filter((item) => Number(item.risk_points || 0) > 0).length;
 
       if (
         verifiedCount === 0 ||
@@ -2860,11 +3023,28 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
         openGapCount > 0 ||
         scheduleRows.length === 0 ||
         missingTimeCount > 0 ||
-        confirmationCount > 0
+        confirmationCount > 0 ||
+        unansweredRealityCount > 0 ||
+        realityRiskCount > 0
       ) {
+        const activationIssues = [];
+        if (verifiedCount === 0 || pendingCount > 0) activationIssues.push('instruction review');
+        if (openGapCount > 0) activationIssues.push('open care gaps');
+        if (scheduleRows.length === 0 || missingTimeCount > 0 || confirmationCount > 0) activationIssues.push('schedule confirmation');
+        if (unansweredRealityCount > 0 || realityRiskCount > 0) activationIssues.push('Reality Check');
+
         res.status(409).json({
           success: false,
-          message: 'Review every instruction, resolve every care gap, and confirm an exact time for every scheduled task before activation.',
+          message: `Resolve the remaining ${activationIssues.join(', ')} item${activationIssues.length === 1 ? '' : 's'} before activation.`,
+          data: {
+            verifiedCount,
+            pendingCount,
+            openGapCount,
+            missingTimeCount,
+            confirmationCount,
+            unansweredRealityCount,
+            realityRiskCount,
+          },
         });
         return;
       }
