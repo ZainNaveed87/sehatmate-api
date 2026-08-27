@@ -20,6 +20,14 @@ import {
   generateAiText,
 } from './ai_service.js';
 
+import {
+  careGapJson,
+  careGapSummary,
+  readCareGapForUser,
+  readCareGaps,
+  refreshCareGaps,
+} from './care_gap_engine.js';
+
 const requiredEnvironment = [
   'DB_HOST',
   'DB_NAME',
@@ -2170,7 +2178,7 @@ app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
 
   try {
     const [rows] = await pool.execute(
-      `SELECT extracted_instructions.id
+      `SELECT extracted_instructions.id, extracted_instructions.care_plan_id
        FROM extracted_instructions
        JOIN care_plans ON care_plans.id = extracted_instructions.care_plan_id
        WHERE extracted_instructions.id = ? AND care_plans.user_id = ? LIMIT 1`,
@@ -2207,6 +2215,13 @@ app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
       `UPDATE extracted_instructions SET ${updates.join(', ')} WHERE id = ?`,
       values,
     );
+
+    await refreshCareGaps({
+      db: pool,
+      planId: String(rows[0].care_plan_id),
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
 
     res.json({ success: true, message: 'Instruction review saved.', data: {} });
   } catch (error) {
@@ -2439,6 +2454,13 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
       featureName: 'schedule_generation',
     });
 
+    await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
     res.json({
       success: true,
       message: 'A prescription-grounded schedule draft is ready.',
@@ -2483,7 +2505,7 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   }
   try {
     const [rows] = await pool.execute(
-      'SELECT id, display_time FROM care_schedule_items WHERE id = ? AND user_id = ? LIMIT 1',
+      'SELECT id, care_plan_id, display_time FROM care_schedule_items WHERE id = ? AND user_id = ? LIMIT 1',
       [itemId, req.auth.userId],
     );
     if (rows.length === 0) {
@@ -2509,6 +2531,14 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
        WHERE id = ? AND user_id = ?`,
       [scheduleTime, displayTime || `Confirmed reminder at ${scheduleTime}`, itemId, req.auth.userId],
     );
+
+    await refreshCareGaps({
+      db: pool,
+      planId: String(rows[0].care_plan_id),
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
     res.json({
       success: true,
       message: 'Exact reminder time confirmed.',
@@ -2716,6 +2746,14 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
       );
     }
     await connection.commit();
+
+    await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
     res.json({ success: true, message: 'Reality-check answers saved.', data: {} });
   } catch (error) {
     await connection.rollback();
@@ -2802,6 +2840,14 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
         : []),
     ];
 
+    const careGapRows = await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+    const gapSummary = careGapSummary(careGapRows);
+
     await pool.execute(
       'UPDATE care_plans SET readiness_score = ?, status = ? WHERE id = ? AND user_id = ?',
       [readiness, blocked || atRisk || unclear || unanswered ? 'needs_attention' : 'reality_check', planId, req.auth.userId],
@@ -2814,6 +2860,12 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       findings,
       blockers,
       unanswered,
+      careGaps: {
+        summary: gapSummary,
+        items: careGapRows
+          .filter((item) => item.lifecycle_status !== 'resolved')
+          .map(careGapJson),
+      },
     } });
   } catch (error) { next(error); }
 });
@@ -2868,13 +2920,12 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
        ORDER BY schedule_date, schedule_time, id`,
       [planId, req.auth.userId],
     );
-    const [gaps] = await pool.execute(
-      `SELECT id, task_id, category, title, status, when_text, summary,
-        instruction_snapshot, patient_reality, reason, next_step,
-        resolution_note, resolved_at
-       FROM care_gaps WHERE care_plan_id = ? ORDER BY id`,
-      [planId],
-    );
+    const gaps = await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
     const [caregivers] = await pool.execute(
       `SELECT id, name, relationship, phone, availability, helps_with,
         access_permissions
@@ -2926,11 +2977,8 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
           instruction_id: item.instruction_id == null ? null : String(item.instruction_id),
           caregiver_id: item.caregiver_id == null ? null : String(item.caregiver_id),
         })),
-        gaps: gaps.map((item) => ({
-          ...item,
-          id: String(item.id),
-          task_id: item.task_id == null ? null : String(item.task_id),
-        })),
+        gaps: gaps.map(careGapJson),
+        gapSummary: careGapSummary(gaps),
         caregivers: caregivers.map((item) => ({
           ...item,
           id: String(item.id),
@@ -2943,6 +2991,354 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
           care_gap_id: item.care_gap_id == null ? null : String(item.care_gap_id),
         })),
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+app.get('/api/care-plans/:id/care-gaps', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) {
+    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+    return;
+  }
+
+  try {
+    const [plans] = await pool.execute(
+      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    if (!plans.length) {
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+
+    let gaps = await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
+    const lifecycle = cleanText(req.query?.lifecycle, 20).toLowerCase();
+    const severity = cleanText(req.query?.severity, 20).toLowerCase();
+    const gapType = cleanText(req.query?.type, 40).toLowerCase();
+
+    if (['open', 'in_progress', 'resolved'].includes(lifecycle)) {
+      gaps = gaps.filter((item) => item.lifecycle_status === lifecycle);
+    }
+    if (['blocking', 'attention'].includes(severity)) {
+      gaps = gaps.filter((item) => item.severity === severity);
+    }
+    if (gapType) {
+      gaps = gaps.filter((item) => item.gap_type === gapType);
+    }
+
+    const allRows = await readCareGaps(pool, planId);
+
+    res.json({
+      success: true,
+      data: {
+        summary: careGapSummary(allRows),
+        gaps: gaps.map(careGapJson),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/care-plans/:id/care-gaps/refresh', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) {
+    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+    return;
+  }
+
+  try {
+    const [plans] = await pool.execute(
+      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    if (!plans.length) {
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+
+    const rows = await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
+    res.json({
+      success: true,
+      message: 'Care gaps refreshed.',
+      data: {
+        summary: careGapSummary(rows),
+        gaps: rows.map(careGapJson),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/care-gaps/:id', authenticate, async (req, res, next) => {
+  const gapId = req.params.id;
+  if (!idPattern.test(gapId)) {
+    res.status(422).json({ success: false, message: 'Invalid care gap ID.' });
+    return;
+  }
+
+  try {
+    let gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+    if (!gap) {
+      res.status(404).json({ success: false, message: 'Care gap not found.' });
+      return;
+    }
+
+    await refreshCareGaps({
+      db: pool,
+      planId: String(gap.care_plan_id),
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+    gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+
+    const [questions] = await pool.execute(
+      `SELECT id, care_gap_id, group_name, title, question, answer, status, answered_at, created_at, updated_at
+       FROM doctor_questions
+       WHERE care_gap_id = ? AND care_plan_id = ?
+       ORDER BY id`,
+      [gapId, gap.care_plan_id],
+    );
+
+    res.json({
+      success: true,
+      data: {
+        gap: careGapJson(gap),
+        doctorQuestions: questions.map((item) => ({
+          ...item,
+          id: String(item.id),
+          care_gap_id: item.care_gap_id == null ? null : String(item.care_gap_id),
+        })),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
+  const gapId = req.params.id;
+  const lifecycleStatus = cleanText(req.body?.lifecycleStatus, 20).toLowerCase();
+  const resolutionNote = cleanText(req.body?.resolutionNote, 2000);
+
+  if (!idPattern.test(gapId)) {
+    res.status(422).json({ success: false, message: 'Invalid care gap ID.' });
+    return;
+  }
+  if (!['open', 'in_progress', 'resolved'].includes(lifecycleStatus)) {
+    res.status(422).json({
+      success: false,
+      message: 'Choose a valid care-gap status.',
+    });
+    return;
+  }
+
+  try {
+    let gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+    if (!gap) {
+      res.status(404).json({ success: false, message: 'Care gap not found.' });
+      return;
+    }
+
+    if (Boolean(gap.auto_managed) && lifecycleStatus === 'resolved') {
+      await refreshCareGaps({
+        db: pool,
+        planId: String(gap.care_plan_id),
+        userId: req.auth.userId,
+        realityQuestionTemplates,
+      });
+      gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+
+      if (gap.lifecycle_status !== 'resolved') {
+        res.status(409).json({
+          success: false,
+          message: 'This care gap is managed automatically. Fix the underlying item first.',
+          data: {
+            gap: careGapJson(gap),
+            nextStep: gap.next_step,
+          },
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: 'The underlying issue is already resolved.',
+        data: { gap: careGapJson(gap) },
+      });
+      return;
+    }
+
+    if (lifecycleStatus === 'resolved') {
+      await pool.execute(
+        `UPDATE care_gaps
+         SET lifecycle_status = 'resolved', status = 'resolved',
+           resolution_note = ?, resolved_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [resolutionNote || 'Resolved by the user.', gapId],
+      );
+    } else if (lifecycleStatus === 'in_progress') {
+      await pool.execute(
+        `UPDATE care_gaps
+         SET lifecycle_status = 'in_progress',
+           resolution_note = ?, resolved_at = NULL
+         WHERE id = ?`,
+        [resolutionNote || null, gapId],
+      );
+    } else {
+      const reopenedStatus = gap.severity === 'blocking' ? 'blocked' : 'at_risk';
+      await pool.execute(
+        `UPDATE care_gaps
+         SET lifecycle_status = 'open', status = ?,
+           resolution_note = ?, resolved_at = NULL
+         WHERE id = ?`,
+        [reopenedStatus, resolutionNote || null, gapId],
+      );
+    }
+
+    gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+
+    res.json({
+      success: true,
+      message: 'Care gap updated.',
+      data: { gap: careGapJson(gap) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/care-gaps/:id/doctor-question', authenticate, async (req, res, next) => {
+  const gapId = req.params.id;
+  if (!idPattern.test(gapId)) {
+    res.status(422).json({ success: false, message: 'Invalid care gap ID.' });
+    return;
+  }
+
+  const groupName = cleanText(req.body?.groupName, 60) || 'Care Instructions';
+  const title = cleanText(req.body?.title, 160) || 'Care-plan clarification';
+  const question = cleanText(req.body?.question, 2000);
+
+  if (!question) {
+    res.status(422).json({
+      success: false,
+      message: 'Enter the question you want to verify with a healthcare professional.',
+    });
+    return;
+  }
+
+  try {
+    const gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+    if (!gap) {
+      res.status(404).json({ success: false, message: 'Care gap not found.' });
+      return;
+    }
+
+    const [result] = await pool.execute(
+      `INSERT INTO doctor_questions (
+        care_plan_id, care_gap_id, group_name, title, question, status
+      ) VALUES (?, ?, ?, ?, ?, 'pending')`,
+      [gap.care_plan_id, gapId, groupName, title, question],
+    );
+
+    await pool.execute(
+      `UPDATE care_gaps
+       SET lifecycle_status = CASE
+         WHEN lifecycle_status = 'resolved' THEN lifecycle_status
+         ELSE 'in_progress'
+       END
+       WHERE id = ?`,
+      [gapId],
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Question saved for healthcare-professional verification.',
+      data: { questionId: String(result.insertId) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/doctor-questions/:id', authenticate, async (req, res, next) => {
+  const questionId = req.params.id;
+  if (!idPattern.test(questionId)) {
+    res.status(422).json({ success: false, message: 'Invalid question ID.' });
+    return;
+  }
+
+  const answer = cleanText(req.body?.answer, 4000);
+  const status = cleanText(req.body?.status, 20).toLowerCase();
+
+  if (!['pending', 'answered'].includes(status)) {
+    res.status(422).json({ success: false, message: 'Choose a valid question status.' });
+    return;
+  }
+  if (status === 'answered' && !answer) {
+    res.status(422).json({
+      success: false,
+      message: 'Add the healthcare-professional answer before marking this question answered.',
+    });
+    return;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT doctor_questions.id, doctor_questions.care_plan_id, doctor_questions.care_gap_id
+       FROM doctor_questions
+       JOIN care_plans ON care_plans.id = doctor_questions.care_plan_id
+       WHERE doctor_questions.id = ? AND care_plans.user_id = ? LIMIT 1`,
+      [questionId, req.auth.userId],
+    );
+    if (!rows.length) {
+      res.status(404).json({ success: false, message: 'Question not found.' });
+      return;
+    }
+
+    await pool.execute(
+      `UPDATE doctor_questions
+       SET answer = ?, status = ?,
+         answered_at = CASE WHEN ? = 'answered' THEN CURRENT_TIMESTAMP ELSE NULL END
+       WHERE id = ?`,
+      [answer || null, status, status, questionId],
+    );
+
+    if (rows[0].care_gap_id != null) {
+      await pool.execute(
+        `UPDATE care_gaps
+         SET lifecycle_status = CASE
+           WHEN lifecycle_status = 'resolved' THEN lifecycle_status
+           ELSE 'in_progress'
+         END
+         WHERE id = ?`,
+        [rows[0].care_gap_id],
+      );
+    }
+
+    res.json({
+      success: true,
+      message: status === 'answered'
+        ? 'Healthcare-professional answer saved.'
+        : 'Question updated.',
+      data: {},
     });
   } catch (error) {
     next(error);
@@ -2989,11 +3385,12 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
          FROM extracted_instructions WHERE care_plan_id = ?`,
         [planId],
       );
-      const [gapRows] = await pool.execute(
-        `SELECT status FROM care_gaps
-         WHERE care_plan_id = ?`,
-        [planId],
-      );
+      const gapRows = await refreshCareGaps({
+        db: pool,
+        planId,
+        userId: req.auth.userId,
+        realityQuestionTemplates,
+      });
       const [scheduleRows] = await pool.execute(
         `SELECT task_kind, title, display_time, recurrence_text, reason,
           schedule_time, requires_confirmation
@@ -3010,7 +3407,13 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
 
       const verifiedCount = instructionRows.filter((item) => item.review_status === 'verified').length;
       const pendingCount = instructionRows.filter((item) => item.review_status === 'pending').length;
-      const openGapCount = gapRows.filter((item) => item.status !== 'resolved').length;
+      const openGapCount = gapRows.filter((item) => item.lifecycle_status !== 'resolved').length;
+      const blockingGapCount = gapRows.filter(
+        (item) => item.lifecycle_status !== 'resolved' && item.severity === 'blocking',
+      ).length;
+      const attentionGapCount = gapRows.filter(
+        (item) => item.lifecycle_status !== 'resolved' && item.severity !== 'blocking',
+      ).length;
       const missingTimeCount = scheduleRows.filter((item) => item.schedule_time == null).length;
       const confirmationCount = scheduleRows.filter((item) => Boolean(item.requires_confirmation)).length;
       const realityTemplates = realityQuestionTemplates(scheduleRows);
@@ -3020,7 +3423,7 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       if (
         verifiedCount === 0 ||
         pendingCount > 0 ||
-        openGapCount > 0 ||
+        blockingGapCount > 0 ||
         scheduleRows.length === 0 ||
         missingTimeCount > 0 ||
         confirmationCount > 0 ||
@@ -3029,7 +3432,7 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       ) {
         const activationIssues = [];
         if (verifiedCount === 0 || pendingCount > 0) activationIssues.push('instruction review');
-        if (openGapCount > 0) activationIssues.push('open care gaps');
+        if (blockingGapCount > 0) activationIssues.push('blocking care gaps');
         if (scheduleRows.length === 0 || missingTimeCount > 0 || confirmationCount > 0) activationIssues.push('schedule confirmation');
         if (unansweredRealityCount > 0 || realityRiskCount > 0) activationIssues.push('Reality Check');
 
@@ -3040,6 +3443,8 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
             verifiedCount,
             pendingCount,
             openGapCount,
+            blockingGapCount,
+            attentionGapCount,
             missingTimeCount,
             confirmationCount,
             unansweredRealityCount,
