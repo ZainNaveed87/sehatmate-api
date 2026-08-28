@@ -45,35 +45,179 @@ function addGap(list, gap) {
 }
 
 export function careGapAction(gap) {
+  const resolved = gap?.lifecycle_status === 'resolved';
+  const sourceKind = text(gap?.source_kind, 40).toLowerCase();
+
   switch (gap?.gap_type) {
     case 'verification':
-      return { type: 'review_instruction', label: 'Review instruction' };
+      return {
+        type: 'review_instruction',
+        label: resolved ? 'View resolved instruction' : 'Review & Verify Instruction',
+        carePlanTab: 0,
+      };
     case 'schedule_gap':
-      return { type: 'review_schedule', label: 'Review schedule' };
+      if (sourceKind === 'schedule_item') {
+        return {
+          type: 'review_schedule',
+          label: resolved ? 'View resolved schedule item' : 'Set Reminder Time',
+          carePlanTab: 1,
+        };
+      }
+      return {
+        type: 'review_schedule',
+        label: resolved ? 'View resolved schedule' : 'Review Schedule',
+        carePlanTab: 1,
+      };
     case 'missing_information':
-      return { type: 'reality_check', label: 'Answer questions' };
+      return {
+        type: 'reality_check',
+        label: resolved ? 'View Reality Check' : 'Answer Reality Check',
+        carePlanTab: null,
+      };
     case 'document_gap':
-      return { type: 'documents', label: 'Review documents' };
+      return {
+        type: 'documents',
+        label: resolved ? 'View Documents' : 'Upload Care Document',
+        carePlanTab: 4,
+      };
     case 'care_coordination':
-      return { type: 'family_care', label: 'Arrange support' };
+      return {
+        type: 'family_care',
+        label: resolved ? 'View Family Care' : 'Arrange Caregiver',
+        carePlanTab: null,
+      };
     case 'overdue':
-      return { type: 'calendar', label: 'Review calendar' };
+      return {
+        type: 'calendar',
+        label: resolved ? 'View Calendar' : 'Review Overdue Task',
+        carePlanTab: null,
+      };
     default:
-      return { type: 'care_plan', label: 'Review care plan' };
+      return {
+        type: 'care_plan',
+        label: resolved ? 'View Care Plan' : 'Review Care Plan',
+        carePlanTab: null,
+      };
+  }
+}
+
+function careGapResolution(gap) {
+  const sourceKind = text(gap?.source_kind, 40).toLowerCase();
+
+  switch (gap?.gap_type) {
+    case 'verification':
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open the extracted instruction that triggered this gap.',
+          'Compare the instruction with the original uploaded healthcare document.',
+          'If the source itself is unclear, confirm the instruction with a qualified healthcare professional.',
+          'Correct the extracted text if needed and mark the instruction verified only when it matches the source.',
+          'Save the instruction. SehatRoute will automatically re-check this care gap.',
+        ],
+      };
+    case 'schedule_gap':
+      if (sourceKind === 'schedule_item') {
+        return {
+          title: 'How to resolve this gap',
+          steps: [
+            'Open the Schedule tab for this care plan.',
+            'Find the scheduled item linked to this gap.',
+            'Choose an exact reminder time inside the allowed period shown by the app.',
+            'Confirm the time and save it.',
+            'SehatRoute will automatically re-check this care gap.',
+          ],
+        };
+      }
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open the Schedule tab for this care plan.',
+          'Regenerate or review the schedule so the verified instruction appears as a scheduled item.',
+          'Do not change medical timing or treatment instructions yourself.',
+          'Save the schedule changes. SehatRoute will automatically re-check this care gap.',
+        ],
+      };
+    case 'missing_information':
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open Reality Check for this care plan.',
+          'Find and answer the missing practical question.',
+          'Save the Reality Check answers.',
+          'SehatRoute will automatically re-check this care gap using the saved answer.',
+        ],
+      };
+    case 'document_gap':
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open Documents for this care plan.',
+          'Upload the relevant prescription, discharge summary, follow-up slip, or other care document.',
+          'Complete instruction extraction and human verification for the uploaded document.',
+          'SehatRoute will automatically re-check this care gap.',
+        ],
+      };
+    case 'care_coordination':
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open Family Care.',
+          'Add or select a trusted caregiver who can help with the related task.',
+          'Confirm that the helper is available for the task when required.',
+          'Link the caregiver to the relevant care task, then return to Care Gaps and refresh.',
+        ],
+      };
+    case 'overdue':
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open the Calendar and review the overdue care task.',
+          'Check the original care instruction before changing any date or timing.',
+          'Record the completed or newly arranged care step as supported by the existing care plan.',
+          'Return to Care Gaps and refresh the check.',
+        ],
+      };
+    default:
+      return {
+        title: 'How to resolve this gap',
+        steps: [
+          'Open the related care plan item shown below.',
+          'Review the reason and suggested next step for this gap.',
+          'Update the underlying care-plan information rather than manually dismissing an auto-managed gap.',
+          'Return to Care Gaps and refresh the check.',
+        ],
+      };
   }
 }
 
 export function careGapJson(row) {
   const action = careGapAction(row);
+  const resolution = careGapResolution(row);
+  const resolved = row.lifecycle_status === 'resolved';
+  const sourceId = row.source_id == null ? null : String(row.source_id);
+
   return {
     ...row,
     id: String(row.id),
     care_plan_id: String(row.care_plan_id),
     task_id: row.task_id == null ? null : String(row.task_id),
-    source_id: row.source_id == null ? null : String(row.source_id),
-    blocking: row.severity === 'blocking' && row.lifecycle_status !== 'resolved',
+    source_id: sourceId,
+    blocking: row.severity === 'blocking' && !resolved,
+    display_severity: resolved && row.severity === 'blocking'
+      ? 'previously_blocking'
+      : row.severity,
     action_type: action.type,
     action_label: action.label,
+    target: {
+      care_plan_id: String(row.care_plan_id),
+      source_kind: row.source_kind || null,
+      source_id: sourceId,
+      care_plan_tab: action.carePlanTab,
+    },
+    resolution_title: resolution.title,
+    resolution_steps: resolution.steps,
+    auto_recheck: Boolean(row.auto_managed),
     can_mark_resolved: !Boolean(row.auto_managed),
   };
 }

@@ -1697,6 +1697,13 @@ app.post(
         [result.insertId, req.auth.userId],
       );
 
+      await refreshCareGaps({
+        db: pool,
+        planId,
+        userId: req.auth.userId,
+        realityQuestionTemplates,
+      });
+
       res.status(201).json({
         success: true,
         message: 'Document uploaded successfully.',
@@ -1781,6 +1788,13 @@ app.delete('/api/documents/:id', authenticate, async (req, res, next) => {
         [document.care_plan_id, req.auth.userId],
       );
     }
+
+    await refreshCareGaps({
+      db: pool,
+      planId: String(document.care_plan_id),
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
 
     res.json({ success: true, message: 'Document removed successfully.', data: {} });
   } catch (error) {
