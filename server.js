@@ -778,7 +778,7 @@ function suggestionTimeForTask(task, tasks, note) {
 
 function practicalAdaptationForAnswer(answer, option, tasks) {
   const key = String(answer?.question_key || '');
-  const action = option?.action || 'reality_check';
+  const action = option?.action || customRealityAction(key);
 
   if (action === 'schedule') {
     const candidates = tasks.filter((task) => taskMatchesRealityQuestion(task, key));
@@ -803,7 +803,7 @@ function practicalAdaptationForAnswer(answer, option, tasks) {
         taskId: String(target.id),
         canApply: false,
         recommendation:
-          'This reminder time is grounded in an explicit verified instruction. SehatRoute will not move it automatically. Keep the prescribed time, or ask the prescribing clinician or pharmacist if the timing itself is not workable.',
+          'This reminder time is grounded in an explicit verified instruction. SehatMate will not move it automatically. Keep the prescribed time, or ask the prescribing clinician or pharmacist if the timing itself is not workable.',
       };
     }
 
@@ -819,7 +819,7 @@ function practicalAdaptationForAnswer(answer, option, tasks) {
         suggestedPeriod: periodLabel,
         canApply: true,
         recommendation: noteUsed
-          ? `You mentioned that ${display} may work better. SehatRoute can move this reminder to ${display} within the allowed ${periodLabel} period. This changes the reminder only, not the medical instruction.`
+          ? `You mentioned that ${display} may work better. SehatMate can move this reminder to ${display} within the allowed ${periodLabel} period. This changes the reminder only, not the medical instruction.`
           : `A practical starting point is ${display} within the allowed ${periodLabel} period. You can apply it or choose another allowed time. This changes the reminder only, not the medical instruction.`,
       };
     }
@@ -2966,6 +2966,46 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   }
 });
 
+
+function customRealityRiskPoints(note, template) {
+  const value = String(note || '').trim().toLowerCase();
+  const options = Array.isArray(template?.options) ? template.options : [];
+  if (!value || !options.length) return 0;
+
+  const first = Number(options[0]?.points || 0);
+  const middle = Number(options[Math.min(1, options.length - 1)]?.points || 0);
+  const last = Number(options[options.length - 1]?.points || middle);
+
+  // Strong positive/reliable language.
+  if (/\b(yes|always|reliably|reliable|available|arranged|no problem|works well|can do|can follow|can access|have all)\b/.test(value)) {
+    return first;
+  }
+
+  // Variable/conditional language.
+  if (/\b(sometimes|occasionally|depends|change|changes|changing|varies|vary|some days|not always|usually|maybe|partly)\b/.test(value)) {
+    return middle;
+  }
+
+  // Strong difficulty/unavailability language.
+  if (/\b(no|never|cannot|can't|unable|difficult|hard|unavailable|missing|none|not available|not possible)\b/.test(value)) {
+    return last;
+  }
+
+  // Unknown free text is treated as a practical attention signal rather than
+  // as a medical blocker. The user's original wording is still preserved.
+  return middle;
+}
+
+function customRealityAction(questionKey) {
+  if (['morning_routine', 'daytime_access', 'evening_routine'].includes(questionKey)) {
+    return 'schedule';
+  }
+  if (questionKey === 'caregiver_support') return 'family_care';
+  if (questionKey === 'travel_access') return 'calendar';
+  if (questionKey === 'medicine_access') return 'care_plan';
+  return 'reality_check';
+}
+
 function realityQuestionTemplates(tasks) {
   const text = tasks.map((item) => `${item.title} ${item.display_time || ''} ${item.recurrence_text || ''} ${item.reason || ''}`).join(' ').toLowerCase();
   const kinds = new Set(tasks.map((item) => item.task_kind));
@@ -2984,7 +3024,7 @@ function realityQuestionTemplates(tasks) {
         label: 'My morning time changes on some days',
         points: 8,
         reason: 'Your morning routine changes on some days, so one fixed reminder may not fit every day.',
-        fix: 'Keep this honest answer. SehatRoute can suggest a more practical reminder inside the allowed morning period without changing the medical instruction.',
+        fix: 'Keep this honest answer. SehatMate can suggest a more practical reminder inside the allowed morning period without changing the medical instruction.',
         action: 'schedule',
       },
       {
@@ -3007,7 +3047,7 @@ function realityQuestionTemplates(tasks) {
         label: 'Sometimes',
         points: 8,
         reason: 'Daytime access is not reliable every day, so this reminder may need a more practical slot.',
-        fix: 'Keep this answer. SehatRoute can suggest another allowed daytime reminder without changing the care instruction.',
+        fix: 'Keep this answer. SehatMate can suggest another allowed daytime reminder without changing the care instruction.',
         action: 'schedule',
       },
       {
@@ -3030,7 +3070,7 @@ function realityQuestionTemplates(tasks) {
         label: 'My evening routine changes',
         points: 8,
         reason: 'Your evening routine changes, so one fixed reminder may not fit reliably every day.',
-        fix: 'Keep this answer. SehatRoute can suggest another allowed evening or night reminder without changing the medical instruction.',
+        fix: 'Keep this answer. SehatMate can suggest another allowed evening or night reminder without changing the medical instruction.',
         action: 'schedule',
       },
       {
@@ -3137,7 +3177,10 @@ app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next
     res.json({ success: true, data: { questions: templates.map((item) => ({
       ...item,
       options: item.options.map((option) => option.label),
-      selectedAnswer: savedByKey.get(item.key)?.selected_answer || '',
+      selectedAnswer:
+        savedByKey.get(item.key)?.selected_answer === '__custom__'
+          ? ''
+          : savedByKey.get(item.key)?.selected_answer || '',
       note: savedByKey.get(item.key)?.note || '',
     })) } });
   } catch (error) { next(error); }
@@ -3158,14 +3201,44 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
     for (const answer of answers) {
       const key = cleanText(answer?.key, 80);
       const selected = cleanText(answer?.answer, 240);
+      const note = cleanText(answer?.note, 500);
       const template = byKey.get(key);
-      const option = template?.options.find((item) => item.label === selected);
-      if (!template || !option) throw new Error('INVALID_REALITY_ANSWER');
+
+      if (!template) throw new Error('INVALID_REALITY_ANSWER');
+
+      if (selected === '__clear__') {
+        await connection.execute(
+          `DELETE FROM care_reality_answers
+           WHERE care_plan_id = ? AND user_id = ? AND question_key = ?`,
+          [planId, req.auth.userId, key],
+        );
+        continue;
+      }
+
+      const option = template.options.find((item) => item.label === selected);
+      const isCustom = selected === '__custom__' && note.length > 0;
+
+      if (!option && !isCustom) throw new Error('INVALID_REALITY_ANSWER');
+
+      const storedAnswer = isCustom ? '__custom__' : selected;
+      const riskPoints = isCustom
+        ? customRealityRiskPoints(note, template)
+        : option.points;
+
       await connection.execute(
         `INSERT INTO care_reality_answers (care_plan_id, user_id, question_key, category, question_text, selected_answer, risk_points, note)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE selected_answer = VALUES(selected_answer), risk_points = VALUES(risk_points), note = VALUES(note), updated_at = CURRENT_TIMESTAMP`,
-        [planId, req.auth.userId, key, template.category, template.question, selected, option.points, cleanText(answer?.note, 500)],
+        [
+          planId,
+          req.auth.userId,
+          key,
+          template.category,
+          template.question,
+          storedAnswer,
+          riskPoints,
+          note,
+        ],
       );
     }
     await connection.commit();
@@ -3180,7 +3253,7 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
     res.json({ success: true, message: 'Reality-check answers saved.', data: {} });
   } catch (error) {
     await connection.rollback();
-    if (error?.message === 'INVALID_REALITY_ANSWER') return res.status(422).json({ success: false, message: 'Select a valid answer for every question.' });
+    if (error?.message === 'INVALID_REALITY_ANSWER') return res.status(422).json({ success: false, message: 'Choose an option or write your own answer for every question.' });
     next(error);
   } finally { connection.release(); }
 });
@@ -4027,7 +4100,7 @@ async function startServer() {
   await pool.query('SELECT 1');
   await ensureSetupProgressSchema();
   server = app.listen(port, '0.0.0.0', () => {
-    console.log(`SehatRoute API listening on port ${port}`);
+    console.log(`SehatMate API listening on port ${port}`);
   });
 }
 
@@ -4047,7 +4120,7 @@ async function shutdown(signal) {
 }
 
 startServer().catch(async (error) => {
-  console.error('SehatRoute API failed to start.', error);
+  console.error('SehatMate API failed to start.', error);
   await pool.end();
   process.exit(1);
 });
