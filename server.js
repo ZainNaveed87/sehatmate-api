@@ -2940,6 +2940,7 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
       userId: req.auth.userId,
       realityQuestionTemplates,
     });
+    const openGaps = gaps.filter((item) => item.lifecycle_status !== 'resolved');
     const [caregivers] = await pool.execute(
       `SELECT id, name, relationship, phone, availability, helps_with,
         access_permissions
@@ -2991,7 +2992,7 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
           instruction_id: item.instruction_id == null ? null : String(item.instruction_id),
           caregiver_id: item.caregiver_id == null ? null : String(item.caregiver_id),
         })),
-        gaps: gaps.map(careGapJson),
+        gaps: openGaps.map(careGapJson),
         gapSummary: careGapSummary(gaps),
         caregivers: caregivers.map((item) => ({
           ...item,
@@ -3042,6 +3043,11 @@ app.get('/api/care-plans/:id/care-gaps', authenticate, async (req, res, next) =>
 
     if (['open', 'in_progress', 'resolved'].includes(lifecycle)) {
       gaps = gaps.filter((item) => item.lifecycle_status === lifecycle);
+    } else {
+      // Care Gaps is a current-problems view by default.
+      // Resolved rows remain in the database for history, but are only
+      // returned when lifecycle=resolved is requested explicitly.
+      gaps = gaps.filter((item) => item.lifecycle_status !== 'resolved');
     }
     if (['blocking', 'attention'].includes(severity)) {
       gaps = gaps.filter((item) => item.severity === severity);
@@ -3087,13 +3093,14 @@ app.post('/api/care-plans/:id/care-gaps/refresh', authenticate, async (req, res,
       userId: req.auth.userId,
       realityQuestionTemplates,
     });
+    const openRows = rows.filter((item) => item.lifecycle_status !== 'resolved');
 
     res.json({
       success: true,
       message: 'Care gaps refreshed.',
       data: {
         summary: careGapSummary(rows),
-        gaps: rows.map(careGapJson),
+        gaps: openRows.map(careGapJson),
       },
     });
   } catch (error) {
