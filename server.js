@@ -158,6 +158,23 @@ const carePlanStatuses = new Set([
   'active',
   'completed',
 ]);
+const careSetupSteps = new Set([
+  'upload',
+  'review',
+  'schedule',
+  'reality_check',
+  'simulation',
+  'care_gaps',
+  'activate',
+  'complete',
+]);
+
+function inferredSetupStep(status) {
+  if (status === 'active' || status === 'completed') return 'complete';
+  if (status === 'draft' || status === 'processing') return 'upload';
+  if (status === 'needs_review') return 'review';
+  return 'schedule';
+}
 const documentTypes = new Set([
   'prescription',
   'discharge',
@@ -380,6 +397,7 @@ function carePlanJson(row) {
     documentCount: Number(row.document_count || 0),
     taskCount: Number(row.task_count || 0),
     openGapCount: Number(row.open_gap_count || 0),
+    setupStep: row.setup_step || inferredSetupStep(row.status),
   };
 }
 
@@ -1691,7 +1709,10 @@ app.get('/api/care-plans', authenticate, async (req, res, next) => {
       .map((row) => row.id);
     for (const id of expiredIds) {
       await pool.execute(
-        `UPDATE care_plans SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+        `UPDATE care_plans
+         SET status = ?,
+             setup_step = 'complete',
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
          WHERE id = ? AND user_id = ?`,
         ['completed', id, req.auth.userId],
       );
@@ -1794,8 +1815,8 @@ app.post('/api/care-plans', authenticate, async (req, res, next) => {
 
   try {
     const [result] = await pool.execute(
-      `INSERT INTO care_plans (user_id, title, status)
-       VALUES (?, ?, 'draft')`,
+      `INSERT INTO care_plans (user_id, title, status, setup_step)
+       VALUES (?, ?, 'draft', 'upload')`,
       [req.auth.userId, title],
     );
     const [rows] = await pool.execute(
@@ -1808,6 +1829,104 @@ app.post('/api/care-plans', authenticate, async (req, res, next) => {
       message: 'Care plan created successfully.',
       data: { plan: carePlanJson(rows[0]) },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+
+app.get('/api/care-plans/:id/setup-progress', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  if (!idPattern.test(planId)) {
+    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+    return;
+  }
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT status, setup_step
+       FROM care_plans
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`,
+      [planId, req.auth.userId],
+    );
+    if (!rows.length) {
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+
+    let step = rows[0].setup_step;
+    if (!step) {
+      step = inferredSetupStep(rows[0].status);
+
+      if (['reality_check', 'needs_attention'].includes(rows[0].status)) {
+        const [tasks] = await pool.execute(
+          `SELECT task_kind, title, display_time, recurrence_text, reason,
+            requires_confirmation
+           FROM care_schedule_items
+           WHERE care_plan_id = ? AND user_id = ?`,
+          [planId, req.auth.userId],
+        );
+
+        if (!tasks.length || tasks.some((task) => Boolean(task.requires_confirmation))) {
+          step = 'schedule';
+        } else {
+          const templates = realityQuestionTemplates(tasks);
+          const [answers] = await pool.execute(
+            `SELECT question_key
+             FROM care_reality_answers
+             WHERE care_plan_id = ? AND user_id = ?`,
+            [planId, req.auth.userId],
+          );
+          const answeredKeys = new Set(answers.map((item) => item.question_key));
+          step = templates.some((item) => !answeredKeys.has(item.key))
+            ? 'reality_check'
+            : 'simulation';
+        }
+      }
+
+      await pool.execute(
+        `UPDATE care_plans
+         SET setup_step = ?
+         WHERE id = ? AND user_id = ? AND setup_step IS NULL`,
+        [step, planId, req.auth.userId],
+      );
+    }
+
+    res.json({ success: true, data: { step } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/care-plans/:id/setup-progress', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  const step = cleanText(req.body?.step, 40).toLowerCase();
+  if (!idPattern.test(planId) || !careSetupSteps.has(step)) {
+    res.status(422).json({ success: false, message: 'Invalid care-plan setup step.' });
+    return;
+  }
+
+  try {
+    const [plans] = await pool.execute(
+      'SELECT status FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    if (!plans.length) {
+      res.status(404).json({ success: false, message: 'Care plan not found.' });
+      return;
+    }
+
+    const effectiveStep = ['active', 'completed'].includes(plans[0].status)
+      ? 'complete'
+      : step;
+    await pool.execute(
+      `UPDATE care_plans
+       SET setup_step = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`,
+      [effectiveStep, planId, req.auth.userId],
+    );
+    res.json({ success: true, data: { step: effectiveStep } });
   } catch (error) {
     next(error);
   }
@@ -2184,8 +2303,16 @@ app.post(
       );
       const totalInstructions = Number(totals.instruction_count || 0);
       await pool.execute(
-        'UPDATE care_plans SET status = ? WHERE id = ? AND user_id = ?',
-        [totalInstructions > 0 ? 'needs_review' : 'processing', planId, req.auth.userId],
+        `UPDATE care_plans
+         SET status = ?,
+             setup_step = CASE WHEN ? > 0 THEN 'review' ELSE setup_step END
+         WHERE id = ? AND user_id = ?`,
+        [
+          totalInstructions > 0 ? 'needs_review' : 'processing',
+          totalInstructions,
+          planId,
+          req.auth.userId,
+        ],
       );
 
       if (totalInstructions === 0) {
@@ -2522,7 +2649,9 @@ app.post('/api/care-plans/:id/finalize-review', authenticate, async (req, res, n
     if (plan.status === 'needs_review') {
       await connection.execute(
         `UPDATE care_plans
-         SET status = 'reality_check', updated_at = CURRENT_TIMESTAMP
+         SET status = 'reality_check',
+             setup_step = 'schedule',
+             updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND user_id = ?`,
         [planId, req.auth.userId],
       );
@@ -3802,14 +3931,18 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
     if (nextStatus === 'active') {
       await pool.execute(
         `UPDATE care_plans
-         SET status = ?, activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP)
+         SET status = ?,
+             setup_step = 'complete',
+             activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP)
          WHERE id = ? AND user_id = ?`,
         [nextStatus, planId, req.auth.userId],
       );
     } else if (nextStatus === 'completed') {
       await pool.execute(
         `UPDATE care_plans
-         SET status = ?, completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+         SET status = ?,
+             setup_step = 'complete',
+             completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
          WHERE id = ? AND user_id = ?`,
         [nextStatus, planId, req.auth.userId],
       );
@@ -3861,18 +3994,63 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-const server = app.listen(port, '0.0.0.0', () => {
-  console.log(`SehatRoute API listening on port ${port}`);
-});
+async function ensureSetupProgressSchema() {
+  const [columns] = await pool.execute(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'care_plans'
+       AND COLUMN_NAME = 'setup_step'
+     LIMIT 1`,
+  );
+
+  if (!columns.length) {
+    await pool.execute(
+      `ALTER TABLE care_plans
+       ADD COLUMN setup_step ENUM(
+         'upload',
+         'review',
+         'schedule',
+         'reality_check',
+         'simulation',
+         'care_gaps',
+         'activate',
+         'complete'
+       ) NULL DEFAULT NULL AFTER status`,
+    );
+  }
+}
+
+let server;
+
+async function startServer() {
+  await pool.query('SELECT 1');
+  await ensureSetupProgressSchema();
+  server = app.listen(port, '0.0.0.0', () => {
+    console.log(`SehatRoute API listening on port ${port}`);
+  });
+}
 
 async function shutdown(signal) {
   console.log(`${signal} received. Closing server.`);
+
+  if (!server) {
+    await pool.end();
+    process.exit(0);
+    return;
+  }
 
   server.close(async () => {
     await pool.end();
     process.exit(0);
   });
 }
+
+startServer().catch(async (error) => {
+  console.error('SehatRoute API failed to start.', error);
+  await pool.end();
+  process.exit(1);
+});
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
