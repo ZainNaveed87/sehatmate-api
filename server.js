@@ -630,11 +630,28 @@ function parseCareSchedule(text, allowedInstructionIds) {
 
 function scheduleWindow(displayTime) {
   const label = String(displayTime || '').toLowerCase();
-  if (/\bmorning\b/.test(label)) return { start: 4 * 60, end: 11 * 60 + 59, label: 'morning (4:00 AM–11:59 AM)' };
-  if (/\bafternoon\b/.test(label)) return { start: 12 * 60, end: 16 * 60 + 59, label: 'afternoon (12:00 PM–4:59 PM)' };
-  if (/\bevening\b/.test(label)) return { start: 17 * 60, end: 21 * 60 + 59, label: 'evening (5:00 PM–9:59 PM)' };
-  if (/\b(bedtime|night)\b/.test(label)) return { start: 18 * 60, end: 23 * 60 + 59, label: 'night/bedtime (6:00 PM–11:59 PM)' };
+  if (/\bmorning\b/.test(label)) {
+    return { start: 4 * 60, end: 11 * 60 + 59, label: 'morning (4:00 AM–11:59 AM)' };
+  }
+  if (/\bafternoon\b/.test(label)) {
+    return { start: 12 * 60, end: 16 * 60 + 59, label: 'afternoon (12:00 PM–4:59 PM)' };
+  }
+  if (/\b(bedtime|night)\b/.test(label)) {
+    return { start: 21 * 60, end: 3 * 60 + 59, label: 'night (9:00 PM–3:59 AM)' };
+  }
+  if (/\bevening\b/.test(label)) {
+    return { start: 17 * 60, end: 20 * 60 + 59, label: 'evening (5:00 PM–8:59 PM)' };
+  }
   return null;
+}
+
+function timeFitsScheduleWindow(totalMinutes, window) {
+  if (!window) return true;
+  if (window.start <= window.end) {
+    return totalMinutes >= window.start && totalMinutes <= window.end;
+  }
+  // Overnight window, e.g. Night 21:00 -> 03:59.
+  return totalMinutes >= window.start || totalMinutes <= window.end;
 }
 
 function parseIngredientLabel(text) {
@@ -2526,11 +2543,14 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
       res.status(404).json({ success: false, message: 'Schedule item not found.' });
       return;
     }
-    const window = scheduleWindow(rows[0].display_time);
+    // Prefer the period the user is saving now. Falling back to the stored
+    // display_time keeps older clients compatible, but does not let a stale
+    // AI-generated "Evening" label override a user-edited "Night" period.
+    const window = scheduleWindow(displayTime) || scheduleWindow(rows[0].display_time);
     if (window) {
       const [hour, minute] = scheduleTime.split(':').map(Number);
       const selectedMinutes = (hour * 60) + minute;
-      if (selectedMinutes < window.start || selectedMinutes > window.end) {
+      if (!timeFitsScheduleWindow(selectedMinutes, window)) {
         res.status(422).json({
           success: false,
           message: `Select a time within ${window.label} for this schedule item.`,
@@ -2940,7 +2960,6 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
       userId: req.auth.userId,
       realityQuestionTemplates,
     });
-    const openGaps = gaps.filter((item) => item.lifecycle_status !== 'resolved');
     const [caregivers] = await pool.execute(
       `SELECT id, name, relationship, phone, availability, helps_with,
         access_permissions
@@ -2992,7 +3011,7 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
           instruction_id: item.instruction_id == null ? null : String(item.instruction_id),
           caregiver_id: item.caregiver_id == null ? null : String(item.caregiver_id),
         })),
-        gaps: openGaps.map(careGapJson),
+        gaps: gaps.map(careGapJson),
         gapSummary: careGapSummary(gaps),
         caregivers: caregivers.map((item) => ({
           ...item,
@@ -3043,11 +3062,6 @@ app.get('/api/care-plans/:id/care-gaps', authenticate, async (req, res, next) =>
 
     if (['open', 'in_progress', 'resolved'].includes(lifecycle)) {
       gaps = gaps.filter((item) => item.lifecycle_status === lifecycle);
-    } else {
-      // Care Gaps is a current-problems view by default.
-      // Resolved rows remain in the database for history, but are only
-      // returned when lifecycle=resolved is requested explicitly.
-      gaps = gaps.filter((item) => item.lifecycle_status !== 'resolved');
     }
     if (['blocking', 'attention'].includes(severity)) {
       gaps = gaps.filter((item) => item.severity === severity);
@@ -3093,14 +3107,13 @@ app.post('/api/care-plans/:id/care-gaps/refresh', authenticate, async (req, res,
       userId: req.auth.userId,
       realityQuestionTemplates,
     });
-    const openRows = rows.filter((item) => item.lifecycle_status !== 'resolved');
 
     res.json({
       success: true,
       message: 'Care gaps refreshed.',
       data: {
         summary: careGapSummary(rows),
-        gaps: openRows.map(careGapJson),
+        gaps: rows.map(careGapJson),
       },
     });
   } catch (error) {
