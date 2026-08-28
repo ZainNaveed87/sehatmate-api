@@ -654,6 +654,15 @@ function timeFitsScheduleWindow(totalMinutes, window) {
   return totalMinutes >= window.start || totalMinutes <= window.end;
 }
 
+function schedulePeriodKey(displayTime) {
+  const label = String(displayTime || '').toLowerCase();
+  if (/\b(bedtime|night)\b/.test(label)) return 'night';
+  if (/\bmorning\b/.test(label)) return 'morning';
+  if (/\bafternoon\b/.test(label)) return 'afternoon';
+  if (/\bevening\b/.test(label)) return 'evening';
+  return null;
+}
+
 function parseIngredientLabel(text) {
   const value = parseJsonObject(
     text,
@@ -2536,7 +2545,10 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   }
   try {
     const [rows] = await pool.execute(
-      'SELECT id, care_plan_id, display_time FROM care_schedule_items WHERE id = ? AND user_id = ? LIMIT 1',
+      `SELECT id, care_plan_id, instruction_id, schedule_date, display_time
+       FROM care_schedule_items
+       WHERE id = ? AND user_id = ?
+       LIMIT 1`,
       [itemId, req.auth.userId],
     );
     if (rows.length === 0) {
@@ -2558,6 +2570,56 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
         return;
       }
     }
+
+    const selectedPeriod = schedulePeriodKey(displayTime) ||
+      schedulePeriodKey(rows[0].display_time);
+
+    // One instruction occurrence should not contain two reminder cards for
+    // the same period or the same exact time. Keep the check scoped to the
+    // same instruction and schedule date so repeating plans on other dates
+    // are not incorrectly blocked.
+    const [siblings] = await pool.execute(
+      `SELECT id, TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time, display_time
+       FROM care_schedule_items
+       WHERE care_plan_id = ?
+         AND user_id = ?
+         AND instruction_id <=> ?
+         AND schedule_date <=> ?
+         AND id <> ?`,
+      [
+        rows[0].care_plan_id,
+        req.auth.userId,
+        rows[0].instruction_id,
+        rows[0].schedule_date,
+        itemId,
+      ],
+    );
+
+    const sameTime = siblings.find(
+      (item) => String(item.schedule_time || '').slice(0, 5) === scheduleTime,
+    );
+    if (sameTime) {
+      res.status(409).json({
+        success: false,
+        message: 'This exact reminder time is already used for another dose of this instruction. Choose a different time.',
+      });
+      return;
+    }
+
+    if (selectedPeriod) {
+      const samePeriod = siblings.find(
+        (item) => schedulePeriodKey(item.display_time) === selectedPeriod,
+      );
+      if (samePeriod) {
+        const periodLabel = selectedPeriod[0].toUpperCase() + selectedPeriod.slice(1);
+        res.status(409).json({
+          success: false,
+          message: `${periodLabel} is already used for another reminder for this instruction. Choose a different period.`,
+        });
+        return;
+      }
+    }
+
     await pool.execute(
       `UPDATE care_schedule_items
        SET schedule_time = ?, display_time = ?, requires_confirmation = 0,
