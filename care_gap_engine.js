@@ -434,21 +434,41 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
     ? realityQuestionTemplates(tasks)
     : [];
   const answeredKeys = new Set(answers.map((item) => item.question_key));
-  for (const template of templates) {
-    if (answeredKeys.has(template.key)) continue;
+  const missingRealityQuestions = templates.filter(
+    (template) => !answeredKeys.has(template.key),
+  );
+
+  if (missingRealityQuestions.length > 0) {
+    const count = missingRealityQuestions.length;
+    const questionPreview = missingRealityQuestions
+      .slice(0, 3)
+      .map((template) => text(template.question, 300))
+      .filter(Boolean);
+
     addGap(desired, {
       category: 'Missing information',
       gapType: 'missing_information',
-      title: 'A Reality Check answer is still missing',
+      title: count === 1
+        ? '1 Reality Check answer is still missing'
+        : `${count} Reality Check answers are still missing`,
       severity: 'blocking',
       legacyStatus: 'blocked',
-      summary: template.question,
-      patientReality: 'No answer has been saved for this required practical question yet.',
-      reason: 'The plan cannot confirm practical fit without this user-provided information.',
-      nextStep: 'Open Reality Check, answer this question, save the answer, and refresh the care plan.',
-      sourceKey: `reality:${template.key}:unanswered`,
-      sourceKind: 'reality_question',
-      sourceId: template.key,
+      summary: count === 1
+        ? questionPreview[0] || 'One required Reality Check answer is still missing.'
+        : `${count} required Reality Check questions still need answers before the plan can confirm practical fit.`,
+      patientReality: count === 1
+        ? 'No answer has been saved for this required practical question yet.'
+        : `${count} required practical questions do not have saved answers yet.`,
+      reason: 'The plan cannot confirm practical fit until the required Reality Check information is completed.',
+      nextStep: count === 1
+        ? 'Open Reality Check, answer the remaining question, save the answer, and refresh the care plan.'
+        : 'Open Reality Check, complete the remaining unanswered questions, save the answers, and refresh the care plan.',
+      instructionSnapshot: count > 1 && questionPreview.length > 0
+        ? `Examples: ${questionPreview.join(' · ')}${count > questionPreview.length ? ' · …' : ''}`
+        : null,
+      sourceKey: 'reality:missing_answers',
+      sourceKind: 'reality_check',
+      sourceId: planId,
     });
   }
 
