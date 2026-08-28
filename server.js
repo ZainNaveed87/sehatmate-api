@@ -663,6 +663,198 @@ function schedulePeriodKey(displayTime) {
   return null;
 }
 
+function scheduleTimeToMinutes(value) {
+  const match = String(value || '').trim().match(/^([01]?\d|2[0-3]):([0-5]\d)/);
+  if (!match) return null;
+  return (Number(match[1]) * 60) + Number(match[2]);
+}
+
+function minutesToScheduleTime(totalMinutes) {
+  const normalized = ((Number(totalMinutes) % 1440) + 1440) % 1440;
+  const hour = Math.floor(normalized / 60);
+  const minute = normalized % 60;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
+function formatScheduleTime(value) {
+  const minutes = scheduleTimeToMinutes(value);
+  if (minutes == null) return String(value || '');
+  const hour24 = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+  const suffix = hour24 >= 12 ? 'PM' : 'AM';
+  const hour12 = hour24 % 12 || 12;
+  return `${hour12}:${String(minute).padStart(2, '0')} ${suffix}`;
+}
+
+function routineNoteTime(note) {
+  const value = String(note || '').trim();
+  if (!value) return null;
+
+  const twelveHour = value.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
+  if (twelveHour) {
+    let hour = Number(twelveHour[1]) % 12;
+    const minute = Number(twelveHour[2] || 0);
+    if (twelveHour[3].toLowerCase() === 'pm') hour += 12;
+    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+  }
+
+  const twentyFourHour = value.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (twentyFourHour) {
+    return `${String(Number(twentyFourHour[1])).padStart(2, '0')}:${twentyFourHour[2]}`;
+  }
+
+  return null;
+}
+
+function defaultSuggestionTimes(period) {
+  switch (period) {
+    case 'morning':
+      return ['09:30', '10:30', '08:30', '11:00'];
+    case 'afternoon':
+      return ['14:30', '15:30', '13:30', '16:00'];
+    case 'evening':
+      return ['19:30', '20:00', '18:30', '17:30'];
+    case 'night':
+      return ['22:00', '23:00', '21:30', '00:30'];
+    default:
+      return [];
+  }
+}
+
+function taskMatchesRealityQuestion(task, questionKey) {
+  const period = schedulePeriodKey(`${task.display_time || ''} ${task.recurrence_text || ''}`);
+  if (questionKey === 'morning_routine') return period === 'morning';
+  if (questionKey === 'daytime_access') return period === 'afternoon';
+  if (questionKey === 'evening_routine') return period === 'evening' || period === 'night';
+  return false;
+}
+
+function suggestionTimeForTask(task, tasks, note) {
+  const period = schedulePeriodKey(`${task.display_time || ''} ${task.recurrence_text || ''}`);
+  if (!period) return null;
+
+  const window = scheduleWindow(period);
+  const noteTime = routineNoteTime(note);
+  const candidates = [
+    ...(noteTime ? [noteTime] : []),
+    ...defaultSuggestionTimes(period),
+  ];
+
+  const current = String(task.schedule_time || '').slice(0, 5);
+  const siblings = tasks.filter((other) =>
+    String(other.id) !== String(task.id) &&
+    String(other.instruction_id || '') === String(task.instruction_id || '') &&
+    String(other.schedule_date || '') === String(task.schedule_date || ''),
+  );
+  const used = new Set(siblings.map((other) => String(other.schedule_time || '').slice(0, 5)).filter(Boolean));
+
+  for (const candidate of candidates) {
+    const minutes = scheduleTimeToMinutes(candidate);
+    if (minutes == null || !timeFitsScheduleWindow(minutes, window)) continue;
+    if (candidate === current || used.has(candidate)) continue;
+    return { period, time: candidate };
+  }
+
+  return null;
+}
+
+function practicalAdaptationForAnswer(answer, option, tasks) {
+  const key = String(answer?.question_key || '');
+  const action = option?.action || 'reality_check';
+
+  if (action === 'schedule') {
+    const candidates = tasks.filter((task) => taskMatchesRealityQuestion(task, key));
+    const target = candidates.find((task) => String(task.grounding || '') !== 'explicit') || candidates[0] || null;
+
+    if (!target) {
+      return {
+        action: 'schedule',
+        actionLabel: 'Review schedule',
+        recommendation: option?.fix || 'Review the related reminder and choose a practical time that stays within the verified instruction.',
+        canApply: false,
+      };
+    }
+
+    const suggestion = suggestionTimeForTask(target, tasks, answer.note);
+    const explicit = String(target.grounding || '') === 'explicit';
+
+    if (explicit) {
+      return {
+        action: 'schedule',
+        actionLabel: 'Review prescribed time',
+        taskId: String(target.id),
+        canApply: false,
+        recommendation:
+          'This reminder time is grounded in an explicit verified instruction. SehatRoute will not move it automatically. Keep the prescribed time, or ask the prescribing clinician or pharmacist if the timing itself is not workable.',
+      };
+    }
+
+    if (suggestion) {
+      const periodLabel = suggestion.period[0].toUpperCase() + suggestion.period.slice(1);
+      const display = formatScheduleTime(suggestion.time);
+      const noteUsed = routineNoteTime(answer.note) === suggestion.time;
+      return {
+        action: 'apply_schedule_suggestion',
+        actionLabel: `Use ${display}`,
+        taskId: String(target.id),
+        suggestedTime: suggestion.time,
+        suggestedPeriod: periodLabel,
+        canApply: true,
+        recommendation: noteUsed
+          ? `You mentioned that ${display} may work better. SehatRoute can move this reminder to ${display} within the allowed ${periodLabel} period. This changes the reminder only, not the medical instruction.`
+          : `A practical starting point is ${display} within the allowed ${periodLabel} period. You can apply it or choose another allowed time. This changes the reminder only, not the medical instruction.`,
+      };
+    }
+
+    return {
+      action: 'schedule',
+      actionLabel: 'Choose another time',
+      taskId: String(target.id),
+      canApply: false,
+      recommendation:
+        'Keep your Reality Check answer as it is. Open the schedule and choose another allowed reminder time that fits your routine better. The medical instruction itself is not changed.',
+    };
+  }
+
+  if (key === 'medicine_access') {
+    return {
+      action: 'care_plan',
+      actionLabel: 'Review medicines',
+      canApply: false,
+      recommendation:
+        'Keep this answer as it is. This is an availability warning, not a failed Reality Check. Obtain the prescribed medicine through your usual pharmacy or care provider when possible. Do not substitute or change a medicine without professional confirmation.',
+    };
+  }
+
+  if (key === 'caregiver_support') {
+    return {
+      action: 'family_care',
+      actionLabel: 'Arrange support',
+      canApply: false,
+      recommendation:
+        'Keep this answer as it is. Add or arrange a caregiver for the times that need help. This remains a practical attention item and does not require you to give a more positive answer.',
+    };
+  }
+
+  if (key === 'travel_access') {
+    return {
+      action: 'calendar',
+      actionLabel: 'Review visit',
+      canApply: false,
+      recommendation:
+        'Keep this answer as it is. Arrange transport if possible. If the appointment time itself cannot work, confirm a new time with the clinic or laboratory before changing the care plan.',
+    };
+  }
+
+  return {
+    action,
+    actionLabel: 'Review plan',
+    canApply: false,
+    recommendation: option?.fix ||
+      'Keep your honest Reality Check answer. Review the related practical setup instead of changing the answer just to improve the score.',
+  };
+}
+
 function parseIngredientLabel(text) {
   const value = parseJsonObject(
     text,
@@ -2662,19 +2854,20 @@ function realityQuestionTemplates(tasks) {
       {
         label: 'My morning time changes on some days',
         points: 8,
-        reason: 'Your morning routine changes on some days, so a fixed morning reminder may not fit reliably every day.',
-        fix: 'Open the schedule and choose an allowed morning time that fits your routine more consistently. Then return to Reality Check and update this answer if the new timing works for you.',
+        reason: 'Your morning routine changes on some days, so one fixed reminder may not fit every day.',
+        fix: 'Keep this honest answer. SehatRoute can suggest a more practical reminder inside the allowed morning period without changing the medical instruction.',
         action: 'schedule',
       },
       {
         label: 'This timing is usually difficult for me',
         points: 15,
-        reason: 'The current morning timing does not fit your usual routine well enough for the plan to be considered ready.',
-        fix: 'Review the scheduled morning time and move it to a more practical time within the allowed morning period. Then return to Reality Check and answer again.',
+        reason: 'The current morning reminder does not fit your usual routine well.',
+        fix: 'Keep this honest answer. Review or adjust the reminder within the allowed morning period. If the timing came directly from the verified instruction, ask the prescribing clinician or pharmacist before changing it.',
         action: 'schedule',
       },
     ]);
   }
+
   if (/afternoon|midday|lunch|3 times|three times/.test(text)) {
     add('daytime_access', 'Routine', 'Can you access this medicine or task during the daytime?', [
       {
@@ -2684,19 +2877,20 @@ function realityQuestionTemplates(tasks) {
       {
         label: 'Sometimes',
         points: 8,
-        reason: 'Daytime access is not reliable every day, so this task may be missed on some days.',
-        fix: 'Review the daytime reminder and choose an allowed time when the medicine or task is usually available to you. Then update this Reality Check answer.',
+        reason: 'Daytime access is not reliable every day, so this reminder may need a more practical slot.',
+        fix: 'Keep this answer. SehatRoute can suggest another allowed daytime reminder without changing the care instruction.',
         action: 'schedule',
       },
       {
         label: 'Usually not',
         points: 15,
         reason: 'You usually cannot access this medicine or task during the current daytime period.',
-        fix: 'Review the schedule for a more practical allowed time. If the prescribed timing itself cannot be followed, contact the prescribing clinician or pharmacist instead of changing the medical instruction yourself.',
+        fix: 'Keep this answer. Review the allowed schedule for a practical time. If the prescribed timing itself cannot be followed, contact the prescribing clinician or pharmacist instead of changing the medical instruction yourself.',
         action: 'schedule',
       },
     ]);
   }
+
   if (/evening|night|bedtime|dinner/.test(text)) {
     add('evening_routine', 'Routine', 'Can you follow the stated evening or bedtime instruction?', [
       {
@@ -2706,19 +2900,20 @@ function realityQuestionTemplates(tasks) {
       {
         label: 'My evening routine changes',
         points: 8,
-        reason: 'Your evening routine changes, so the current reminder may not fit reliably every day.',
-        fix: 'Choose an allowed evening or night reminder time that better matches your usual routine, then update this Reality Check answer.',
+        reason: 'Your evening routine changes, so one fixed reminder may not fit reliably every day.',
+        fix: 'Keep this answer. SehatRoute can suggest another allowed evening or night reminder without changing the medical instruction.',
         action: 'schedule',
       },
       {
         label: 'This timing is usually difficult',
         points: 15,
-        reason: 'The current evening or bedtime timing is usually difficult for you to follow.',
-        fix: 'Review the scheduled time and choose a more practical time within the allowed period. If the prescribed timing itself is the problem, confirm it with the prescribing clinician or pharmacist.',
+        reason: 'The current evening or bedtime reminder is usually difficult for you to follow.',
+        fix: 'Keep this answer. Review the reminder inside its allowed period. If the timing came directly from the verified instruction, confirm any change with the prescribing clinician or pharmacist.',
         action: 'schedule',
       },
     ]);
   }
+
   if (kinds.has('care_task') || /assist|caregiver|dressing/.test(text)) {
     add('caregiver_support', 'Support', 'Is the required help available for this care task?', [
       {
@@ -2728,19 +2923,20 @@ function realityQuestionTemplates(tasks) {
       {
         label: 'Only sometimes',
         points: 10,
-        reason: 'Required help is only available sometimes, so this care task may not be completed reliably.',
-        fix: 'Arrange reliable help for the times this task is scheduled, then update this Reality Check answer.',
+        reason: 'Required help is only available sometimes, so this care task may be harder to complete reliably.',
+        fix: 'Keep this answer. Arrange support for the times that need assistance where possible.',
         action: 'family_care',
       },
       {
         label: 'No help is currently available',
         points: 20,
-        reason: 'This care task requires help, but no helper is currently available.',
-        fix: 'Arrange caregiver or family support before activating the plan. If support cannot be arranged, contact the care team for guidance.',
+        reason: 'This care task may need support that is not currently available.',
+        fix: 'Keep this answer. Arrange caregiver or family support where possible. If the verified instruction requires assistance and support cannot be arranged, contact the care team for guidance.',
         action: 'family_care',
       },
     ]);
   }
+
   if (kinds.has('follow_up') || kinds.has('lab_test')) {
     add('travel_access', 'Visits and tests', 'Can you reach the clinic or laboratory at the stated time?', [
       {
@@ -2750,19 +2946,20 @@ function realityQuestionTemplates(tasks) {
       {
         label: 'Transport still needs arranging',
         points: 10,
-        reason: 'Transport has not been arranged yet, so the planned visit or test may be missed.',
-        fix: 'Arrange transport for the stated appointment or test time. If that time is not possible, contact the clinic or laboratory before changing anything.',
-        action: 'reality_check',
+        reason: 'Transport has not been arranged yet, so the planned visit or test may be difficult to attend.',
+        fix: 'Keep this answer. Arrange transport where possible. If the appointment time itself needs changing, confirm the new time with the clinic or laboratory.',
+        action: 'calendar',
       },
       {
         label: 'I cannot reach it at that time',
         points: 20,
         reason: 'You cannot currently reach the clinic or laboratory at the stated time.',
-        fix: 'Contact the clinic or laboratory to discuss a workable appointment time and update the plan only after the appointment details are confirmed.',
-        action: 'reality_check',
+        fix: 'Keep this answer. Contact the clinic or laboratory to confirm a workable appointment time before changing the plan.',
+        action: 'calendar',
       },
     ]);
   }
+
   if (kinds.has('medicine')) {
     add('medicine_access', 'Medicine access', 'Have you obtained the medicines listed in this verified plan?', [
       {
@@ -2773,18 +2970,19 @@ function realityQuestionTemplates(tasks) {
         label: 'Some are still missing',
         points: 12,
         reason: 'One or more medicines in the verified plan are not currently available to you.',
-        fix: 'Obtain the prescribed medicines through your usual pharmacy or care provider, then update this Reality Check answer. Do not substitute or change a medicine without professional confirmation.',
-        action: 'reality_check',
+        fix: 'Keep this answer. This is an availability warning, not a failed Reality Check. Obtain the prescribed medicines through your usual pharmacy or care provider when possible. Do not substitute or change a medicine without professional confirmation.',
+        action: 'care_plan',
       },
       {
         label: 'None yet',
         points: 20,
         reason: 'The medicines in this verified plan have not been obtained yet.',
-        fix: 'Obtain the prescribed medicines through your usual pharmacy or care provider before activating reminders. Do not start substitutes or change the prescription yourself.',
-        action: 'reality_check',
+        fix: 'Keep this answer. Obtain the prescribed medicines through your usual pharmacy or care provider when possible. Do not start substitutes or change the prescription yourself.',
+        action: 'care_plan',
       },
     ]);
   }
+
   return questions.slice(0, 6);
 }
 
@@ -2860,81 +3058,80 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
 
 app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) => {
   const planId = req.params.id;
-  if (!idPattern.test(planId)) return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  if (!idPattern.test(planId)) {
+    return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  }
+
   try {
-    const [plans] = await pool.execute('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1', [planId, req.auth.userId]);
-    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
-    const [tasks] = await pool.execute(
-      `SELECT id, title, task_kind, schedule_date, TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
-        display_time, recurrence_text, reason, requires_confirmation
-       FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ? ORDER BY schedule_date, schedule_time, id`,
+    const [plans] = await pool.execute(
+      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
       [planId, req.auth.userId],
     );
+    if (!plans.length) {
+      return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    }
+
+    const [tasks] = await pool.execute(
+      `SELECT id, instruction_id, title, task_kind, schedule_date,
+        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+        display_time, recurrence_text, grounding, reason, requires_confirmation
+       FROM care_schedule_items
+       WHERE care_plan_id = ? AND user_id = ?
+       ORDER BY schedule_date, schedule_time, id`,
+      [planId, req.auth.userId],
+    );
+
     const [answers] = await pool.execute(
-      'SELECT question_key, category, question_text, selected_answer, risk_points, note FROM care_reality_answers WHERE care_plan_id = ? AND user_id = ?',
+      `SELECT question_key, category, question_text, selected_answer,
+        risk_points, note
+       FROM care_reality_answers
+       WHERE care_plan_id = ? AND user_id = ?`,
       [planId, req.auth.userId],
     );
 
     const templates = realityQuestionTemplates(tasks);
     const templateByKey = new Map(templates.map((item) => [item.key, item]));
     const unanswered = Math.max(0, templates.length - answers.length);
-    const answerPenalty = answers.reduce((sum, item) => sum + Number(item.risk_points || 0), 0);
+    const answerPenalty = answers.reduce(
+      (sum, item) => sum + Number(item.risk_points || 0),
+      0,
+    );
     const unclear = tasks.filter((item) => Boolean(item.requires_confirmation)).length;
-    const atRisk = answers.filter((item) => Number(item.risk_points || 0) > 0 && Number(item.risk_points || 0) < 20).length;
-    const blocked = answers.filter((item) => Number(item.risk_points || 0) >= 20).length;
+    const atRisk = answers.filter((item) => Number(item.risk_points || 0) > 0).length;
     const ready = Math.max(0, tasks.length - unclear);
-    const readiness = Math.max(0, Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)));
+    const readiness = Math.max(
+      0,
+      Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)),
+    );
 
     const findings = answers
       .filter((item) => Number(item.risk_points || 0) > 0)
       .map((item) => {
         const template = templateByKey.get(item.question_key);
-        const option = template?.options.find((candidate) => candidate.label === item.selected_answer);
-        const severity = Number(item.risk_points) >= 20 ? 'blocked' : 'at_risk';
+        const option = template?.options.find(
+          (candidate) => candidate.label === item.selected_answer,
+        );
+        const adaptation = practicalAdaptationForAnswer(item, option, tasks);
+
         return {
           key: item.question_key,
           category: item.category,
           question: item.question_text,
           answer: item.selected_answer,
-          severity,
-          reason: option?.reason || 'This saved answer indicates that part of the plan may not fit your current routine reliably.',
-          recommendation: option?.fix || 'Review this Reality Check answer and the related schedule before activation.',
-          action: option?.action || 'reality_check',
+          severity: 'at_risk',
+          reason: option?.reason ||
+            'This saved answer shows that part of the plan may need a practical adjustment.',
+          recommendation: adaptation.recommendation ||
+            option?.fix ||
+            'Keep your honest answer and adjust the practical setup where possible.',
+          action: adaptation.action || option?.action || 'care_plan',
+          actionLabel: adaptation.actionLabel || null,
+          taskId: adaptation.taskId || null,
+          suggestedTime: adaptation.suggestedTime || null,
+          suggestedPeriod: adaptation.suggestedPeriod || null,
+          canApply: Boolean(adaptation.canApply),
         };
       });
-
-    const blockers = [
-      ...findings.map((finding) => ({
-        type: 'reality_answer',
-        key: finding.key,
-        title: finding.question,
-        severity: finding.severity,
-        reason: finding.reason,
-        recommendation: finding.recommendation,
-        action: finding.action,
-      })),
-      ...tasks
-        .filter((item) => Boolean(item.requires_confirmation))
-        .map((item) => ({
-          type: 'schedule_item',
-          taskId: String(item.id),
-          title: item.title,
-          severity: 'unclear',
-          reason: cleanText(item.reason, 500) || 'This scheduled task still needs an exact confirmed time.',
-          recommendation: 'Open the care-plan schedule and confirm an exact reminder time within the allowed period.',
-          action: 'schedule',
-        })),
-      ...(unanswered > 0
-        ? [{
-            type: 'unanswered',
-            title: `${unanswered} Reality Check question${unanswered === 1 ? '' : 's'} still need an answer`,
-            severity: 'unanswered',
-            reason: 'The simulation cannot fully verify whether the plan fits your routine until every relevant question is answered.',
-            recommendation: 'Open Reality Check, answer the remaining questions, save them, and refresh the simulation.',
-            action: 'reality_check',
-          }]
-        : []),
-    ];
 
     const careGapRows = await refreshCareGaps({
       db: pool,
@@ -2943,27 +3140,79 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       realityQuestionTemplates,
     });
     const gapSummary = careGapSummary(careGapRows);
+    const openBlockingGaps = careGapRows.filter(
+      (item) =>
+        item.lifecycle_status !== 'resolved' &&
+        item.severity === 'blocking',
+    );
+
+    const blockers = openBlockingGaps.map((gap) => {
+      const json = careGapJson(gap);
+      return {
+        type: 'care_gap',
+        gapId: String(gap.id),
+        title: gap.title,
+        severity: 'blocked',
+        reason: gap.reason || gap.summary,
+        recommendation: gap.next_step || 'Resolve this required care-plan item before activation.',
+        action: json.action_type || 'care_plan',
+      };
+    });
+
+    if (tasks.length === 0) {
+      blockers.unshift({
+        type: 'schedule',
+        title: 'No scheduled tasks',
+        severity: 'blocked',
+        reason: 'A care plan needs a schedule before reminders can be activated.',
+        recommendation: 'Generate the schedule and confirm the required reminder times.',
+        action: 'schedule',
+      });
+    }
+
+    const activationAllowed = blockers.length === 0;
 
     await pool.execute(
       'UPDATE care_plans SET readiness_score = ?, status = ? WHERE id = ? AND user_id = ?',
-      [readiness, blocked || atRisk || unclear || unanswered ? 'needs_attention' : 'reality_check', planId, req.auth.userId],
+      [
+        readiness,
+        blockers.length > 0 || atRisk > 0 ? 'needs_attention' : 'reality_check',
+        planId,
+        req.auth.userId,
+      ],
     );
 
-    res.json({ success: true, data: {
-      readiness,
-      metrics: { blocked, atRisk, ready, unclear },
-      tasks: tasks.map((item) => ({ ...item, id: String(item.id), status: item.requires_confirmation ? 'unclear' : 'ready' })),
-      findings,
-      blockers,
-      unanswered,
-      careGaps: {
-        summary: gapSummary,
-        items: careGapRows
-          .filter((item) => item.lifecycle_status !== 'resolved')
-          .map(careGapJson),
+    res.json({
+      success: true,
+      data: {
+        readiness,
+        activationAllowed,
+        hardBlockerCount: blockers.length,
+        metrics: {
+          blocked: blockers.length,
+          atRisk,
+          ready,
+          unclear,
+        },
+        tasks: tasks.map((item) => ({
+          ...item,
+          id: String(item.id),
+          status: item.requires_confirmation ? 'unclear' : 'ready',
+        })),
+        findings,
+        blockers,
+        unanswered,
+        careGaps: {
+          summary: gapSummary,
+          items: careGapRows
+            .filter((item) => item.lifecycle_status !== 'resolved')
+            .map(careGapJson),
+        },
       },
-    } });
-  } catch (error) { next(error); }
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
@@ -3523,14 +3772,13 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
         scheduleRows.length === 0 ||
         missingTimeCount > 0 ||
         confirmationCount > 0 ||
-        unansweredRealityCount > 0 ||
-        realityRiskCount > 0
+        unansweredRealityCount > 0
       ) {
         const activationIssues = [];
         if (verifiedCount === 0 || pendingCount > 0) activationIssues.push('instruction review');
         if (blockingGapCount > 0) activationIssues.push('blocking care gaps');
         if (scheduleRows.length === 0 || missingTimeCount > 0 || confirmationCount > 0) activationIssues.push('schedule confirmation');
-        if (unansweredRealityCount > 0 || realityRiskCount > 0) activationIssues.push('Reality Check');
+        if (unansweredRealityCount > 0) activationIssues.push('Reality Check');
 
         res.status(409).json({
           success: false,
