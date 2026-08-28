@@ -23,6 +23,41 @@ function scheduleLabel(task) {
   return [date, time || display].filter(Boolean).join(' · ') || null;
 }
 
+function stableKeyPart(value, max = 60) {
+  return text(value, 200)
+    .toLowerCase()
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ')
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?\b/gi, ' ')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, max);
+}
+
+function scheduleSlotKey(task) {
+  const display = text(task?.display_time, 160).toLowerCase();
+  const recurrence = text(task?.recurrence_text, 160).toLowerCase();
+  const combined = `${display} ${recurrence}`;
+
+  if (/\bmorning\b|\bbreakfast\b/.test(combined)) return 'morning';
+  if (/\bafternoon\b|\blunch\b/.test(combined)) return 'afternoon';
+  if (/\bevening\b|\bdinner\b/.test(combined)) return 'evening';
+  if (/\bbedtime\b|\bnight\b/.test(combined)) return 'night';
+
+  return stableKeyPart(display) ||
+    stableKeyPart(recurrence) ||
+    stableKeyPart(task?.title) ||
+    'general';
+}
+
+function scheduleIssueKey(task, issue) {
+  const instructionId = text(String(task?.instruction_id ?? ''), 40);
+  const instructionPart = instructionId
+    ? `instruction_${instructionId}`
+    : `title_${stableKeyPart(task?.title) || 'task'}`;
+
+  return `schedule:${instructionPart}:${scheduleSlotKey(task)}:${issue}`.slice(0, 160);
+}
+
 function addGap(list, gap) {
   if (!gap?.sourceKey || list.some((item) => item.sourceKey === gap.sourceKey)) return;
   list.push({
@@ -367,7 +402,7 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
         instructionSnapshot: text(task.recurrence_text, 4000) || text(task.display_time, 4000),
         reason: text(task.reason, 4000) || 'The schedule item is still marked as requiring confirmation.',
         nextStep: 'Open Schedule, choose an exact time within the allowed period, and confirm the schedule item.',
-        sourceKey: `schedule:${taskId}:time_confirmation`,
+        sourceKey: scheduleIssueKey(task, 'time_confirmation'),
         sourceKind: 'schedule_item',
         sourceId: taskId,
         dueAt: dueDate(task),
@@ -387,7 +422,7 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
         patientReality: 'No caregiver record is currently available for this care plan.',
         reason: 'A task that explicitly requires help may be harder to complete if support has not been arranged.',
         nextStep: 'Arrange a trusted caregiver or family helper for this task. If the required support cannot be arranged, contact the care team for guidance.',
-        sourceKey: `schedule:${taskId}:caregiver_missing`,
+        sourceKey: scheduleIssueKey(task, 'caregiver_missing'),
         sourceKind: 'schedule_item',
         sourceId: taskId,
         dueAt: dueDate(task),
