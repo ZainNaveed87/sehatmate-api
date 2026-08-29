@@ -420,6 +420,19 @@ function parseStoredJson(value) {
   }
 }
 
+function parseStoredObject(value) {
+  if (value == null || value === '') return {};
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 function safeDocumentName(value) {
   const cleaned = typeof value === 'string'
     ? value.replace(/\\/g, '/').split('/').pop().trim()
@@ -4077,7 +4090,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
     );
     const taskDecisions = new Map();
     for (const row of decisionRows) {
-      const metadata = parseStoredJson(row.metadata_json);
+      const metadata = parseStoredObject(row.metadata_json);
       const taskId = metadata?.taskId == null ? '' : String(metadata.taskId);
       if (!taskId || taskDecisions.has(taskId)) continue;
       taskDecisions.set(taskId, {
