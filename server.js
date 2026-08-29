@@ -5341,10 +5341,16 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
     await connection.execute(
       `UPDATE care_task_occurrences
        SET status = ?,
-           completed_at = CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE NULL END,
+           completed_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END,
            outcome_source = 'user', note = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND user_id = ?`,
-      [outcome, outcome, note || null, occurrenceId, req.auth.userId],
+      [
+        outcome,
+        outcome === 'completed' ? 1 : 0,
+        note || null,
+        occurrenceId,
+        req.auth.userId,
+      ],
     );
 
     await removeOccurrenceLearningSignals(connection, req.auth.userId, occurrenceId);
