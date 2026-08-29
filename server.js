@@ -455,6 +455,21 @@ function serverDateKey(value = new Date()) {
   return value.toISOString().slice(0, 10);
 }
 
+function dbDateKey(value) {
+  if (!value) return '';
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  const text = String(value).trim();
+  const direct = text.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (direct) return direct[1];
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10);
+}
+
 function scheduleItemIsDaily(item) {
   const recurrence = String(item?.recurrence_text || '').toLowerCase();
   return /\b(?:daily|every\s+day|each\s+day|once\s+daily|twice\s+daily|times\s+daily|per\s+day)\b/.test(recurrence);
@@ -462,25 +477,40 @@ function scheduleItemIsDaily(item) {
 
 function scheduleItemAppliesOnDate(item, dateKey, plan) {
   if (!item?.schedule_time) return false;
-  const scheduleDate = String(item.schedule_date || '').slice(0, 10);
-  if (!scheduleDate) return false;
 
-  const activatedDate = String(plan?.activated_at || plan?.start_date || scheduleDate).slice(0, 10);
-  const effectiveStart = activatedDate && activatedDate > scheduleDate
-    ? activatedDate
-    : scheduleDate;
-  if (dateKey < effectiveStart) return false;
+  const daily = scheduleItemIsDaily(item);
+  const scheduleDate = dbDateKey(item.schedule_date);
+  const planStartDate = dbDateKey(plan?.start_date);
+  const activatedDate = dbDateKey(plan?.activated_at);
 
-  const plannedEnd = String(plan?.planned_end_date || '').slice(0, 10);
+  // Recurring reminder slots created from instructions such as "3 times daily"
+  // intentionally may not have a schedule_date. In that case the care-plan
+  // start/activation date is the effective beginning of the recurring series.
+  // A one-off task still requires its own explicit schedule_date.
+  if (!daily && !scheduleDate) return false;
+
+  const startCandidates = [scheduleDate, planStartDate, activatedDate]
+    .filter(Boolean)
+    .sort();
+  const effectiveStart = startCandidates.length
+    ? startCandidates[startCandidates.length - 1]
+    : daily
+      ? dateKey
+      : '';
+
+  if (effectiveStart && dateKey < effectiveStart) return false;
+
+  const plannedEnd = dbDateKey(plan?.planned_end_date);
   if (plan?.duration_mode !== 'ongoing' && plannedEnd && dateKey > plannedEnd) {
     return false;
   }
-  const completedDate = String(plan?.completed_at || '').slice(0, 10);
+
+  const completedDate = dbDateKey(plan?.completed_at);
   if (plan?.status === 'completed' && completedDate && dateKey > completedDate) {
     return false;
   }
 
-  if (scheduleItemIsDaily(item)) return dateKey >= scheduleDate;
+  if (daily) return true;
   return dateKey === scheduleDate;
 }
 
@@ -681,7 +711,7 @@ async function reconcilePlanLifecycle({ db, userId = null, today = serverDateKey
       `DELETE FROM care_task_occurrences
        WHERE care_plan_id = ? AND user_id = ?
          AND status = 'pending' AND occurrence_date > ?`,
-      [plan.id, plan.user_id, String(plan.planned_end_date).slice(0, 10)],
+      [plan.id, plan.user_id, dbDateKey(plan.planned_end_date)],
     );
 
     await recordLifecycleEvent({
@@ -690,7 +720,7 @@ async function reconcilePlanLifecycle({ db, userId = null, today = serverDateKey
       planId: plan.id,
       eventType: 'auto_completed',
       reason: 'The selected care-plan end date was reached.',
-      metadata: { plannedEndDate: String(plan.planned_end_date).slice(0, 10) },
+      metadata: { plannedEndDate: dbDateKey(plan.planned_end_date) },
     });
   }
 
