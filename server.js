@@ -654,6 +654,138 @@ function parseCareSchedule(text, allowedInstructionIds) {
   }).filter(Boolean);
 }
 
+
+function normalizedInstructionScheduleKey(instruction) {
+  const normalize = (value) =>
+    String(value || '')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  return [
+    normalize(instruction?.category),
+    normalize(instruction?.title),
+    normalize(instruction?.instruction),
+    normalize(instruction?.timing),
+  ].join('|');
+}
+
+function explicitDailyFrequencyCount(instruction) {
+  const value = `${instruction?.instruction || ''} ${instruction?.timing || ''}`
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+
+  const numeric = value.match(
+    /\b([1-9])\s*(?:x|times?)\s*(?:a|per)?\s*(?:day|daily)\b/i,
+  );
+  if (numeric) return Number(numeric[1]);
+
+  if (/\bonce\s+(?:a\s+)?(?:day|daily)\b/i.test(value)) return 1;
+  if (/\btwice\s+(?:a\s+)?(?:day|daily)\b/i.test(value)) return 2;
+  if (/\bthrice\s+(?:a\s+)?(?:day|daily)\b/i.test(value)) return 3;
+
+  return null;
+}
+
+function normalizeCareScheduleForInstructions(schedule, instructions) {
+  const instructionById = new Map(
+    instructions.map((instruction) => [String(instruction.id), instruction]),
+  );
+
+  // Exact duplicate verified instructions can otherwise make the AI build the
+  // same reminder set twice. Keep the first verified instruction as canonical
+  // for scheduling only; the review/source records themselves are untouched.
+  const canonicalByInstructionId = new Map();
+  const canonicalByContent = new Map();
+  for (const instruction of instructions) {
+    const id = String(instruction.id);
+    const key = normalizedInstructionScheduleKey(instruction);
+    if (key && canonicalByContent.has(key)) {
+      canonicalByInstructionId.set(id, canonicalByContent.get(key));
+    } else {
+      canonicalByContent.set(key, id);
+      canonicalByInstructionId.set(id, id);
+    }
+  }
+
+  const rewritten = schedule.map((item) => ({
+    ...item,
+    instructionId:
+      canonicalByInstructionId.get(String(item.instructionId)) ||
+      String(item.instructionId),
+  }));
+
+  // First remove literal/logical duplicate reminder slots.
+  const deduped = [];
+  const seen = new Set();
+  for (const item of rewritten) {
+    const period =
+      schedulePeriodKey(`${item.displayTime || ''} ${item.recurrence || ''}`) ||
+      '';
+    const exactTime = String(item.time || '').slice(0, 5);
+    const logicalSlot = period || exactTime || String(item.displayTime || '').toLowerCase();
+    const key = [
+      item.instructionId,
+      item.date || '',
+      logicalSlot,
+      exactTime,
+    ].join('|');
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  // Then enforce an explicit plain-language daily frequency such as
+  // "3 times daily". AI is not allowed to turn that into 6 reminder slots.
+  const grouped = new Map();
+  for (const item of deduped) {
+    if (!grouped.has(item.instructionId)) grouped.set(item.instructionId, []);
+    grouped.get(item.instructionId).push(item);
+  }
+
+  const output = [];
+  for (const [instructionId, items] of grouped.entries()) {
+    const instruction = instructionById.get(instructionId);
+    const expectedCount = explicitDailyFrequencyCount(instruction);
+
+    if (!expectedCount || items.length <= expectedCount) {
+      output.push(...items);
+      continue;
+    }
+
+    // Prefer distinct named periods before any extra/fallback slot. This keeps
+    // Morning + Afternoon + Evening for a clear "3 times daily" instruction
+    // instead of accidentally retaining repeated Morning slots.
+    const selected = [];
+    const selectedPeriods = new Set();
+
+    for (const item of items) {
+      const period = schedulePeriodKey(
+        `${item.displayTime || ''} ${item.recurrence || ''}`,
+      );
+      if (period && !selectedPeriods.has(period)) {
+        selected.push(item);
+        selectedPeriods.add(period);
+        if (selected.length === expectedCount) break;
+      }
+    }
+
+    if (selected.length < expectedCount) {
+      for (const item of items) {
+        if (selected.includes(item)) continue;
+        selected.push(item);
+        if (selected.length === expectedCount) break;
+      }
+    }
+
+    output.push(...selected);
+  }
+
+  return output;
+}
+
 function scheduleWindow(displayTime) {
   const label = String(displayTime || '').toLowerCase();
   if (/\bmorning\b/.test(label)) {
@@ -2927,7 +3059,11 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
       })),
     });
     const allowedIds = new Set(instructions.map((item) => String(item.id)));
-    const schedule = parseCareSchedule(aiResult.text, allowedIds);
+    const parsedSchedule = parseCareSchedule(aiResult.text, allowedIds);
+    const schedule = normalizeCareScheduleForInstructions(
+      parsedSchedule,
+      instructions,
+    );
     if (schedule.length === 0) {
       throw new AiServiceError('No schedulable details were found in the verified instructions.', 422);
     }
