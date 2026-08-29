@@ -28,6 +28,14 @@ import {
   refreshCareGaps,
 } from './care_gap_engine.js';
 
+import {
+  ensureRoutineLearningSchema,
+  readRoutineProfile,
+  recordRoutineLearningEvent,
+  resetRoutineLearning,
+  updateRoutineProfile,
+} from './routine_learning.js';
+
 const requiredEnvironment = [
   'DB_HOST',
   'DB_NAME',
@@ -747,36 +755,166 @@ function taskMatchesRealityQuestion(task, questionKey) {
   return false;
 }
 
-function suggestionTimeForTask(task, tasks, note) {
-  const period = schedulePeriodKey(`${task.display_time || ''} ${task.recurrence_text || ''}`);
+function scheduleKindsCompatibleAtSameTime(first, second) {
+  const firstKind = String(first?.task_kind || '').toLowerCase();
+  const secondKind = String(second?.task_kind || '').toLowerCase();
+
+  if (firstKind === 'medicine' && secondKind === 'medicine') {
+    return true;
+  }
+
+  const appointmentKinds = new Set(['lab_test', 'follow_up']);
+  if (appointmentKinds.has(firstKind) || appointmentKinds.has(secondKind)) {
+    return false;
+  }
+
+  return true;
+}
+
+function hasPracticalScheduleConflict(task, candidateTime, tasks) {
+  return tasks.some((other) => {
+    if (String(other.id) === String(task.id)) return false;
+    if (String(other.schedule_date || '') !== String(task.schedule_date || '')) {
+      return false;
+    }
+    const otherTime = String(other.schedule_time || '').slice(0, 5);
+    if (!otherTime || otherTime !== candidateTime) return false;
+
+    if (
+      String(other.instruction_id || '') === String(task.instruction_id || '')
+    ) {
+      return true;
+    }
+
+    return !scheduleKindsCompatibleAtSameTime(task, other);
+  });
+}
+
+function uniqueSuggestionCandidates(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function suggestionTimeForTask(task, tasks, note, routineProfile = null) {
+  const period = schedulePeriodKey(
+    `${task.display_time || ''} ${task.recurrence_text || ''}`,
+  );
   if (!period) return null;
 
   const window = scheduleWindow(period);
-  const noteTime = routineNoteTime(note);
-  const candidates = [
-    ...(noteTime ? [noteTime] : []),
+  const answerNoteTime = routineNoteTime(note);
+  const profileNote = routineProfile?.notes?.[period] || '';
+  const savedPreferenceTime = routineNoteTime(profileNote);
+  const learnedTime = routineProfile?.learningEnabled
+    ? routineProfile?.learned?.[period]?.preferredTime || null
+    : null;
+
+  const candidates = uniqueSuggestionCandidates([
+    answerNoteTime,
+    savedPreferenceTime,
+    learnedTime,
     ...defaultSuggestionTimes(period),
-  ];
+  ]);
 
   const current = String(task.schedule_time || '').slice(0, 5);
-  const siblings = tasks.filter((other) =>
-    String(other.id) !== String(task.id) &&
-    String(other.instruction_id || '') === String(task.instruction_id || '') &&
-    String(other.schedule_date || '') === String(task.schedule_date || ''),
-  );
-  const used = new Set(siblings.map((other) => String(other.schedule_time || '').slice(0, 5)).filter(Boolean));
 
   for (const candidate of candidates) {
     const minutes = scheduleTimeToMinutes(candidate);
     if (minutes == null || !timeFitsScheduleWindow(minutes, window)) continue;
-    if (candidate === current || used.has(candidate)) continue;
-    return { period, time: candidate };
+    if (candidate === current) continue;
+    if (hasPracticalScheduleConflict(task, candidate, tasks)) continue;
+
+    const why = [];
+    if (candidate === answerNoteTime) {
+      why.push('It matches the time you mentioned in this Reality Check answer.');
+    } else if (candidate === savedPreferenceTime) {
+      why.push(`It matches your saved ${period} routine preference.`);
+    } else if (candidate === learnedTime) {
+      why.push(
+        `SehatMate learned this ${period} time from your previous timing choices.`,
+      );
+    } else {
+      why.push(`It is a practical starting point inside your allowed ${period} period.`);
+    }
+    why.push(`It stays inside the verified ${period} reminder period.`);
+    why.push('It does not create a practical schedule conflict with your current plan.');
+
+    return { period, time: candidate, why };
   }
 
   return null;
 }
 
-function practicalAdaptationForAnswer(answer, option, tasks) {
+function buildScheduleConflictFindings(tasks, routineProfile) {
+  const grouped = new Map();
+
+  for (const task of tasks) {
+    const time = String(task.schedule_time || '').slice(0, 5);
+    if (!time) continue;
+    const key = `${String(task.schedule_date || '')}|${time}`;
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(task);
+  }
+
+  const findings = [];
+  for (const sameTimeTasks of grouped.values()) {
+    if (sameTimeTasks.length < 2) continue;
+
+    let conflictingPair = null;
+    for (let i = 0; i < sameTimeTasks.length && !conflictingPair; i += 1) {
+      for (let j = i + 1; j < sameTimeTasks.length; j += 1) {
+        if (!scheduleKindsCompatibleAtSameTime(sameTimeTasks[i], sameTimeTasks[j])) {
+          conflictingPair = [sameTimeTasks[i], sameTimeTasks[j]];
+          break;
+        }
+      }
+    }
+    if (!conflictingPair) continue;
+
+    const target =
+      conflictingPair.find((task) => String(task.grounding || '') !== 'explicit') ||
+      null;
+    const fixed = target
+      ? conflictingPair.find((task) => String(task.id) !== String(target.id))
+      : conflictingPair[0];
+
+    const currentTime = String(conflictingPair[0].schedule_time || '').slice(0, 5);
+    const suggestion = target
+      ? suggestionTimeForTask(target, tasks, '', routineProfile)
+      : null;
+
+    findings.push({
+      key: `schedule_conflict:${conflictingPair.map((task) => task.id).join(':')}`,
+      category: 'Schedule conflict',
+      question: 'Two tasks may compete for the same time',
+      answer: `${formatScheduleTime(currentTime)} · ${conflictingPair
+        .map((task) => task.title)
+        .join(' + ')}`,
+      severity: 'at_risk',
+      reason:
+        'SehatMate found tasks at the same time that are not automatically treated as compatible. Medicine reminders at the same time are not flagged by themselves.',
+      recommendation: target && suggestion
+        ? `Move the flexible task "${target.title}" while keeping "${fixed.title}" unchanged.`
+        : 'Review these tasks manually. SehatMate will not move an explicit verified time automatically.',
+      action: suggestion ? 'apply_schedule_suggestion' : 'schedule',
+      actionLabel: suggestion
+        ? `Use ${formatScheduleTime(suggestion.time)}`
+        : 'Review schedule',
+      taskId: target ? String(target.id) : null,
+      suggestedTime: suggestion?.time || null,
+      suggestedPeriod: suggestion
+        ? suggestion.period[0].toUpperCase() + suggestion.period.slice(1)
+        : null,
+      canApply: Boolean(target && suggestion),
+      why: suggestion?.why || [
+        'The conflicting task has an explicit verified time, so it is not moved automatically.',
+      ],
+    });
+  }
+
+  return findings;
+}
+
+function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = null) {
   const key = String(answer?.question_key || '');
   const action = option?.action || customRealityAction(key);
 
@@ -793,7 +931,7 @@ function practicalAdaptationForAnswer(answer, option, tasks) {
       };
     }
 
-    const suggestion = suggestionTimeForTask(target, tasks, answer.note);
+    const suggestion = suggestionTimeForTask(target, tasks, answer.note, routineProfile);
     const explicit = String(target.grounding || '') === 'explicit';
 
     if (explicit) {
@@ -818,6 +956,7 @@ function practicalAdaptationForAnswer(answer, option, tasks) {
         suggestedTime: suggestion.time,
         suggestedPeriod: periodLabel,
         canApply: true,
+        why: suggestion.why,
         recommendation: noteUsed
           ? `You mentioned that ${display} may work better. SehatMate can move this reminder to ${display} within the allowed ${periodLabel} period. This changes the reminder only, not the medical instruction.`
           : `A practical starting point is ${display} within the allowed ${periodLabel} period. You can apply it or choose another allowed time. This changes the reminder only, not the medical instruction.`,
@@ -2852,6 +2991,7 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   const itemId = req.params.id;
   const displayTime = cleanText(req.body?.displayTime, 160);
   const scheduleTime = cleanText(req.body?.scheduleTime, 5);
+  const learningSource = cleanText(req.body?.learningSource, 60);
   const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
   if (!idPattern.test(itemId)) {
     res.status(422).json({ success: false, message: 'Invalid schedule item ID.' });
@@ -2866,7 +3006,9 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   }
   try {
     const [rows] = await pool.execute(
-      `SELECT id, care_plan_id, instruction_id, schedule_date, display_time
+      `SELECT id, care_plan_id, instruction_id, schedule_date,
+        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+        display_time, grounding, title
        FROM care_schedule_items
        WHERE id = ? AND user_id = ?
        LIMIT 1`,
@@ -2948,6 +3090,27 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
        WHERE id = ? AND user_id = ?`,
       [scheduleTime, displayTime || `Confirmed reminder at ${scheduleTime}`, itemId, req.auth.userId],
     );
+
+    const oldTime = String(rows[0].schedule_time || '').slice(0, 5);
+    if (oldTime !== scheduleTime) {
+      await recordRoutineLearningEvent({
+        db: pool,
+        userId: req.auth.userId,
+        carePlanId: String(rows[0].care_plan_id),
+        eventType:
+          learningSource === 'ai_suggestion_accept'
+            ? 'suggestion_accepted'
+            : 'manual_schedule_edit',
+        period: selectedPeriod,
+        scheduleTime,
+        signalValue: rows[0].title || displayTime,
+        metadata: {
+          taskId: String(itemId),
+          previousTime: oldTime || null,
+          grounding: rows[0].grounding || null,
+        },
+      });
+    }
 
     await refreshCareGaps({
       db: pool,
@@ -3240,6 +3403,25 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
           note,
         ],
       );
+
+      const realityPeriod = key === 'morning_routine'
+        ? 'morning'
+        : key === 'daytime_access'
+          ? 'afternoon'
+          : key === 'evening_routine'
+            ? 'evening'
+            : null;
+      await recordRoutineLearningEvent({
+        db: connection,
+        userId: req.auth.userId,
+        carePlanId: planId,
+        eventType: 'reality_answer',
+        period: realityPeriod,
+        scheduleTime: routineNoteTime(note),
+        signalValue: isCustom ? note : selected,
+        sourceKey: `reality:${planId}:${key}`,
+        metadata: { questionKey: key, custom: isCustom },
+      });
     }
     await connection.commit();
 
@@ -3293,6 +3475,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
 
     const templates = realityQuestionTemplates(tasks);
     const templateByKey = new Map(templates.map((item) => [item.key, item]));
+    const routineProfile = await readRoutineProfile(pool, req.auth.userId);
     const unanswered = Math.max(0, templates.length - answers.length);
     const answerPenalty = answers.reduce(
       (sum, item) => sum + Number(item.risk_points || 0),
@@ -3313,13 +3496,16 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
         const option = template?.options.find(
           (candidate) => candidate.label === item.selected_answer,
         );
-        const adaptation = practicalAdaptationForAnswer(item, option, tasks);
+        const adaptation = practicalAdaptationForAnswer(item, option, tasks, routineProfile);
 
         return {
           key: item.question_key,
           category: item.category,
           question: item.question_text,
-          answer: item.selected_answer,
+          answer:
+            item.selected_answer === '__custom__'
+              ? item.note
+              : item.selected_answer,
           severity: 'at_risk',
           reason: option?.reason ||
             'This saved answer shows that part of the plan may need a practical adjustment.',
@@ -3332,8 +3518,11 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
           suggestedTime: adaptation.suggestedTime || null,
           suggestedPeriod: adaptation.suggestedPeriod || null,
           canApply: Boolean(adaptation.canApply),
+          why: Array.isArray(adaptation.why) ? adaptation.why : [],
         };
       });
+
+    findings.push(...buildScheduleConflictFindings(tasks, routineProfile));
 
     const careGapRows = await refreshCareGaps({
       db: pool,
@@ -4040,6 +4229,87 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
   }
 });
 
+
+app.get('/api/routine-profile', authenticate, async (req, res, next) => {
+  try {
+    const profile = await readRoutineProfile(pool, req.auth.userId);
+    res.json({ success: true, data: { profile } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/routine-profile', authenticate, async (req, res, next) => {
+  try {
+    const profile = await updateRoutineProfile(
+      pool,
+      req.auth.userId,
+      req.body || {},
+    );
+    res.json({
+      success: true,
+      message: 'Routine preferences saved.',
+      data: { profile },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/routine-profile/reset-learning', authenticate, async (req, res, next) => {
+  try {
+    const profile = await resetRoutineLearning(pool, req.auth.userId);
+    res.json({
+      success: true,
+      message: 'Learned routine history reset.',
+      data: { profile },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/routine-learning/events', authenticate, async (req, res, next) => {
+  const eventType = cleanText(req.body?.eventType, 60);
+  const allowed = new Set([
+    'suggestion_rejected',
+    'task_completed',
+    'task_missed',
+    'caregiver_availability',
+  ]);
+  if (!allowed.has(eventType)) {
+    return res.status(422).json({
+      success: false,
+      message: 'Invalid routine learning event.',
+    });
+  }
+
+  const period = cleanText(req.body?.period, 20).toLowerCase();
+  const scheduleTime = cleanText(req.body?.scheduleTime, 5);
+  const carePlanId = cleanText(req.body?.carePlanId, 30) || null;
+  const taskId = cleanText(req.body?.taskId, 30) || null;
+
+  try {
+    await recordRoutineLearningEvent({
+      db: pool,
+      userId: req.auth.userId,
+      carePlanId,
+      eventType,
+      period,
+      scheduleTime,
+      signalValue: cleanText(req.body?.signalValue, 500),
+      metadata: taskId ? { taskId } : null,
+    });
+    res.json({
+      success: true,
+      message: 'Routine learning signal saved.',
+      data: {},
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.use((_req, res) => {
   res.status(404).json({
     success: false,
@@ -4099,6 +4369,7 @@ let server;
 async function startServer() {
   await pool.query('SELECT 1');
   await ensureSetupProgressSchema();
+  await ensureRoutineLearningSchema(pool);
   server = app.listen(port, '0.0.0.0', () => {
     console.log(`SehatMate API listening on port ${port}`);
   });
