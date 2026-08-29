@@ -24,6 +24,8 @@ function eventWeight(eventType) {
       return 2;
     case 'task_missed':
       return -1;
+    case 'task_skipped':
+      return 0;
     case 'caregiver_availability':
       return 2;
     default:
@@ -52,6 +54,7 @@ function humanSignalReason(counts) {
   push('task_completed', 'successful reminder');
   push('suggestion_rejected', 'rejected suggestion');
   push('task_missed', 'missed reminder');
+  push('task_skipped', 'skipped reminder');
 
   if (!parts.length) {
     return 'Based on your recent routine activity.';
