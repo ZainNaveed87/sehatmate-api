@@ -1208,7 +1208,7 @@ function effectiveRealityRiskPoints(answer, template) {
   return Number(answer?.risk_points || 0);
 }
 
-function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = null) {
+function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = null, taskDecisions = new Map()) {
   const key = String(answer?.question_key || '');
   const action = option?.action || customRealityAction(key);
 
@@ -1223,6 +1223,67 @@ function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = nu
         recommendation: option?.fix || 'Review the related reminder and choose a practical time that stays within the verified instruction.',
         canApply: false,
       };
+    }
+
+    const latestDecision = taskDecisions.get(String(target.id)) || null;
+    const answerUpdatedAt = answer?.updated_at ? new Date(answer.updated_at) : null;
+    const decisionCreatedAt = latestDecision?.created_at
+      ? new Date(latestDecision.created_at)
+      : null;
+    const decisionIsNewer =
+      latestDecision &&
+      answerUpdatedAt &&
+      decisionCreatedAt &&
+      !Number.isNaN(answerUpdatedAt.getTime()) &&
+      !Number.isNaN(decisionCreatedAt.getTime()) &&
+      decisionCreatedAt.getTime() > answerUpdatedAt.getTime();
+
+    if (decisionIsNewer) {
+      const currentTime = String(target.schedule_time || '').slice(0, 5) || null;
+      const displayCurrent = currentTime ? formatScheduleTime(currentTime) : 'the current time';
+
+      if (latestDecision.event_type === 'suggestion_rejected') {
+        return {
+          action: '',
+          actionLabel: null,
+          taskId: String(target.id),
+          currentTime,
+          suggestedTime: null,
+          suggestedPeriod: schedulePeriodKey(
+            `${target.display_time || ''} ${target.recurrence_text || ''}`,
+          ),
+          canApply: false,
+          resolvedBySchedule: false,
+          recommendation:
+            `You chose to keep ${displayCurrent} after this Reality Check answer. SehatMate will not keep offering the older timing suggestion unless you update your Reality Check or schedule again.`,
+          why: [
+            'Your newer Keep current decision takes priority over the older routine suggestion.',
+          ],
+        };
+      }
+
+      if (
+        latestDecision.event_type === 'manual_schedule_edit' ||
+        latestDecision.event_type === 'suggestion_accepted'
+      ) {
+        return {
+          action: '',
+          actionLabel: null,
+          taskId: String(target.id),
+          currentTime,
+          suggestedTime: null,
+          suggestedPeriod: schedulePeriodKey(
+            `${target.display_time || ''} ${target.recurrence_text || ''}`,
+          ),
+          canApply: false,
+          resolvedBySchedule: true,
+          recommendation:
+            `Your current reminder at ${displayCurrent} was chosen after this Reality Check answer, so SehatMate treats it as your newer preference. The older timing note will not override it.`,
+          why: [
+            'Your newer manual or accepted reminder choice takes priority over the older Reality Check timing note.',
+          ],
+        };
+      }
     }
 
     const suggestion = suggestionTimeForTask(
@@ -3994,7 +4055,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
 
     const [answers] = await pool.execute(
       `SELECT question_key, category, question_text, selected_answer,
-        risk_points, note
+        risk_points, note, updated_at
        FROM care_reality_answers
        WHERE care_plan_id = ? AND user_id = ?`,
       [planId, req.auth.userId],
@@ -4003,6 +4064,28 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
     const templates = realityQuestionTemplates(tasks);
     const templateByKey = new Map(templates.map((item) => [item.key, item]));
     const routineProfile = await readRoutineProfile(pool, req.auth.userId);
+
+    const [decisionRows] = await pool.execute(
+      `SELECT event_type, metadata_json, created_at
+       FROM routine_learning_events
+       WHERE user_id = ?
+         AND care_plan_id = ?
+         AND event_type IN ('manual_schedule_edit', 'suggestion_accepted', 'suggestion_rejected')
+       ORDER BY created_at DESC, id DESC
+       LIMIT 200`,
+      [req.auth.userId, planId],
+    );
+    const taskDecisions = new Map();
+    for (const row of decisionRows) {
+      const metadata = parseStoredJson(row.metadata_json);
+      const taskId = metadata?.taskId == null ? '' : String(metadata.taskId);
+      if (!taskId || taskDecisions.has(taskId)) continue;
+      taskDecisions.set(taskId, {
+        event_type: row.event_type,
+        created_at: row.created_at,
+      });
+    }
+
     const unanswered = Math.max(0, templates.length - answers.length);
     const evaluatedAnswers = answers.map((item) => {
       const template = templateByKey.get(item.question_key);
@@ -4015,6 +4098,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
         option,
         tasks,
         routineProfile,
+        taskDecisions,
       );
       return { item, template, option, riskPoints, adaptation };
     });
