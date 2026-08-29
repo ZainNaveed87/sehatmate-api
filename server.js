@@ -1199,6 +1199,23 @@ function buildScheduleConflictFindings(tasks, routineProfile) {
   return findings;
 }
 
+
+function effectiveRealityRiskPoints(answer, template) {
+  if (!template) return Number(answer?.risk_points || 0);
+
+  const selected = String(answer?.selected_answer || '');
+  if (selected === '__custom__') {
+    return customRealityRiskPoints(answer?.note || '', template);
+  }
+
+  const option = template.options.find(
+    (candidate) => candidate.label === selected,
+  );
+  if (option) return Number(option.points || 0);
+
+  return Number(answer?.risk_points || 0);
+}
+
 function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = null) {
   const key = String(answer?.question_key || '');
   const action = option?.action || customRealityAction(key);
@@ -4000,23 +4017,46 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       const option = template?.options.find(
         (candidate) => candidate.label === item.selected_answer,
       );
+      const riskPoints = effectiveRealityRiskPoints(item, template);
       const adaptation = practicalAdaptationForAnswer(
         item,
         option,
         tasks,
         routineProfile,
       );
-      return { item, template, option, adaptation };
+      return { item, template, option, riskPoints, adaptation };
     });
 
+    // Older builds could leave a stale risk_points value in the database even
+    // though the selected answer itself clearly represents a routine mismatch.
+    // Reconcile those rows from the current question template so Simulation,
+    // Care Gaps and Adapt My Plan all agree on the same answer.
+    for (const evaluated of evaluatedAnswers) {
+      if (Number(evaluated.item.risk_points || 0) === evaluated.riskPoints) {
+        continue;
+      }
+      await pool.execute(
+        `UPDATE care_reality_answers
+         SET risk_points = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE care_plan_id = ? AND user_id = ? AND question_key = ?`,
+        [
+          evaluated.riskPoints,
+          planId,
+          req.auth.userId,
+          evaluated.item.question_key,
+        ],
+      );
+      evaluated.item.risk_points = evaluated.riskPoints;
+    }
+
     const unresolvedRiskAnswers = evaluatedAnswers.filter(
-      ({ item, adaptation }) =>
-        Number(item.risk_points || 0) > 0 &&
+      ({ riskPoints, adaptation }) =>
+        riskPoints > 0 &&
         adaptation?.resolvedBySchedule !== true,
     );
 
     const answerPenalty = unresolvedRiskAnswers.reduce(
-      (sum, { item }) => sum + Number(item.risk_points || 0),
+      (sum, { riskPoints }) => sum + riskPoints,
       0,
     );
     const unclear = tasks.filter((item) => Boolean(item.requires_confirmation)).length;
