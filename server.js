@@ -1064,45 +1064,18 @@ function suggestionTimeForTask(task, tasks, note, routineProfile = null) {
 
   const current = String(task.schedule_time || '').slice(0, 5);
 
-  if (current) {
-    const currentWhy = [];
-    if (current === answerNoteTime) {
-      currentWhy.push(
-        'The current reminder already matches the time you mentioned in this Reality Check answer.',
-      );
-    } else if (current === savedPreferenceTime) {
-      currentWhy.push(
-        `The current reminder already matches your saved ${period} routine preference.`,
-      );
-    } else if (current === learnedTime) {
-      currentWhy.push(
-        `The current reminder already matches the ${period} time SehatMate learned from your previous choices.`,
-      );
-    }
-
-    if (
-      currentWhy.length > 0 &&
-      !hasPracticalScheduleConflict(task, current, tasks)
-    ) {
-      currentWhy.push(
-        `It stays inside the verified ${period} reminder period.`,
-      );
-      currentWhy.push(
-        'It does not create a practical schedule conflict with your current plan.',
-      );
-      return {
-        period,
-        time: current,
-        why: currentWhy,
-        alreadyApplied: true,
-      };
-    }
-  }
-
+  // Evaluate candidates strictly in priority order:
+  // 1) exact time written in the current Reality Check answer
+  // 2) manually saved routine preference
+  // 3) learned preference
+  // 4) generic period defaults
+  //
+  // A previous lower-priority preference must NOT make the current schedule
+  // look "already resolved" when the user has just provided a newer,
+  // higher-priority Reality Check time.
   for (const candidate of candidates) {
     const minutes = scheduleTimeToMinutes(candidate);
     if (minutes == null || !timeFitsScheduleWindow(minutes, window)) continue;
-    if (candidate === current) continue;
     if (hasPracticalScheduleConflict(task, candidate, tasks)) continue;
 
     const why = [];
@@ -1119,6 +1092,25 @@ function suggestionTimeForTask(task, tasks, note, routineProfile = null) {
     }
     why.push(`It stays inside the verified ${period} reminder period.`);
     why.push('It does not create a practical schedule conflict with your current plan.');
+
+    if (candidate === current) {
+      const currentWhy = [...why];
+      currentWhy[0] =
+        candidate === answerNoteTime
+          ? 'The current reminder already matches the time you mentioned in this Reality Check answer.'
+          : candidate === savedPreferenceTime
+            ? `The current reminder already matches your saved ${period} routine preference.`
+            : candidate === learnedTime
+              ? `The current reminder already matches the ${period} time SehatMate learned from your previous choices.`
+              : `The current reminder already matches the best available ${period} reminder slot.`;
+
+      return {
+        period,
+        time: current,
+        why: currentWhy,
+        alreadyApplied: true,
+      };
+    }
 
     return { period, time: candidate, why };
   }
