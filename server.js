@@ -1182,6 +1182,9 @@ function buildScheduleConflictFindings(tasks, routineProfile) {
         ? `Use ${formatScheduleTime(suggestion.time)}`
         : 'Review schedule',
       taskId: target ? String(target.id) : null,
+      currentTime: target
+        ? String(target.schedule_time || '').slice(0, 5) || null
+        : currentTime,
       suggestedTime: suggestion?.time || null,
       suggestedPeriod: suggestion
         ? suggestion.period[0].toUpperCase() + suggestion.period.slice(1)
@@ -1229,6 +1232,7 @@ function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = nu
         action: '',
         actionLabel: null,
         taskId: String(target.id),
+        currentTime: String(target.schedule_time || '').slice(0, 5) || null,
         suggestedTime: null,
         suggestedPeriod: periodLabel,
         canApply: false,
@@ -1244,6 +1248,7 @@ function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = nu
         action: 'schedule',
         actionLabel: 'Review prescribed time',
         taskId: String(target.id),
+        currentTime: String(target.schedule_time || '').slice(0, 5) || null,
         canApply: false,
         recommendation:
           'This reminder time is grounded in an explicit verified instruction. SehatMate will not move it automatically. Keep the prescribed time, or ask the prescribing clinician or pharmacist if the timing itself is not workable.',
@@ -1258,6 +1263,7 @@ function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = nu
         action: 'apply_schedule_suggestion',
         actionLabel: `Use ${display}`,
         taskId: String(target.id),
+        currentTime: String(target.schedule_time || '').slice(0, 5) || null,
         suggestedTime: suggestion.time,
         suggestedPeriod: periodLabel,
         canApply: true,
@@ -1272,6 +1278,7 @@ function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = nu
       action: 'schedule',
       actionLabel: 'Choose another time',
       taskId: String(target.id),
+      currentTime: String(target.schedule_time || '').slice(0, 5) || null,
       canApply: false,
       recommendation:
         'Keep your Reality Check answer as it is. Open the schedule and choose another allowed reminder time that fits your routine better. The medical instruction itself is not changed.',
@@ -3749,6 +3756,208 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
   } finally { connection.release(); }
 });
 
+
+app.post('/api/care-plans/:id/adapt-plan', authenticate, async (req, res, next) => {
+  const planId = req.params.id;
+  const rawAdjustments = Array.isArray(req.body?.adjustments)
+    ? req.body.adjustments.slice(0, 20)
+    : [];
+  const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+  const allowedPeriods = new Set(['morning', 'afternoon', 'evening', 'night']);
+
+  if (!idPattern.test(planId)) {
+    return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  }
+  if (rawAdjustments.length === 0) {
+    return res.status(422).json({
+      success: false,
+      message: 'Select at least one routine adjustment before applying the plan.',
+    });
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    const [plans] = await connection.execute(
+      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    if (!plans.length) {
+      return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    }
+
+    const [rows] = await connection.execute(
+      `SELECT id, care_plan_id, instruction_id, schedule_date,
+        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+        display_time, recurrence_text, grounding, title, task_kind
+       FROM care_schedule_items
+       WHERE care_plan_id = ? AND user_id = ?
+       ORDER BY id`,
+      [planId, req.auth.userId],
+    );
+    const taskById = new Map(rows.map((item) => [String(item.id), item]));
+    const projectedTasks = rows.map((item) => ({ ...item }));
+    const projectedById = new Map(
+      projectedTasks.map((item) => [String(item.id), item]),
+    );
+
+    const normalized = [];
+    for (const input of rawAdjustments) {
+      const taskId = cleanText(input?.taskId, 30);
+      const decision = cleanText(input?.decision, 30).toLowerCase();
+      const scheduleTime = cleanText(input?.scheduleTime, 5);
+      const period = cleanText(input?.period, 20).toLowerCase();
+      const task = taskById.get(taskId);
+
+      if (!task) {
+        throw new AiServiceError('One of the selected reminder tasks no longer exists. Refresh the simulation and try again.', 409);
+      }
+      if (!['apply', 'keep_current'].includes(decision)) {
+        throw new AiServiceError('Choose Apply or Keep current for every selected adjustment.', 422);
+      }
+      if (!allowedPeriods.has(period) || !timePattern.test(scheduleTime)) {
+        throw new AiServiceError('One of the selected reminder times is invalid. Review the suggested times and try again.', 422);
+      }
+
+      const originalPeriod = schedulePeriodKey(task.display_time);
+      if (originalPeriod && originalPeriod !== period) {
+        throw new AiServiceError(
+          `The ${task.title || 'reminder'} adjustment must stay inside its verified ${originalPeriod} period.`,
+          422,
+        );
+      }
+
+      const window = scheduleWindow(period);
+      const minutes = scheduleTimeToMinutes(scheduleTime);
+      if (minutes == null || !timeFitsScheduleWindow(minutes, window)) {
+        throw new AiServiceError(
+          `Select a time within ${window?.label || period} for ${task.title || 'this reminder'}.`,
+          422,
+        );
+      }
+
+      if (decision === 'apply') {
+        if (String(task.grounding || '') === 'explicit') {
+          throw new AiServiceError(
+            `SehatMate will not automatically move the explicit verified time for ${task.title || 'this reminder'}.`,
+            409,
+          );
+        }
+
+        const projectedTask = projectedById.get(taskId);
+        if (hasPracticalScheduleConflict(projectedTask, scheduleTime, projectedTasks)) {
+          throw new AiServiceError(
+            `The suggested time for ${task.title || 'a reminder'} now conflicts with another task. Refresh the simulation for a new suggestion.`,
+            409,
+          );
+        }
+
+        // Preserve the same-instruction rules used by the normal Set time flow.
+        const siblingConflict = projectedTasks.find((other) => {
+          if (String(other.id) === taskId) return false;
+          if (String(other.instruction_id || '') !== String(task.instruction_id || '')) return false;
+          if (String(other.schedule_date || '') !== String(task.schedule_date || '')) return false;
+          const otherTime = String(other.schedule_time || '').slice(0, 5);
+          const otherPeriod = schedulePeriodKey(other.display_time);
+          return otherTime === scheduleTime || (period && otherPeriod === period);
+        });
+        if (siblingConflict) {
+          throw new AiServiceError(
+            `Another reminder for ${task.title || 'this instruction'} already uses that period or exact time.`,
+            409,
+          );
+        }
+
+        projectedTask.schedule_time = scheduleTime;
+        projectedTask.display_time = `${periodDisplayLabel(period)} · Confirmed reminder at ${formatScheduleTime(scheduleTime)}`;
+      }
+
+      normalized.push({ taskId, task, decision, scheduleTime, period });
+    }
+
+    await connection.beginTransaction();
+    let appliedCount = 0;
+    let keptCount = 0;
+
+    for (const item of normalized) {
+      if (item.decision === 'keep_current') {
+        keptCount += 1;
+        await recordRoutineLearningEvent({
+          db: connection,
+          userId: req.auth.userId,
+          carePlanId: planId,
+          eventType: 'suggestion_rejected',
+          period: item.period,
+          scheduleTime: item.scheduleTime,
+          signalValue: item.task.title || 'Kept current reminder',
+          metadata: {
+            taskId: item.taskId,
+            source: 'adapt_my_plan',
+          },
+        });
+        continue;
+      }
+
+      const displayTime = `${periodDisplayLabel(item.period)} · Confirmed reminder at ${formatScheduleTime(item.scheduleTime)}`;
+      const previousTime = String(item.task.schedule_time || '').slice(0, 5);
+      await connection.execute(
+        `UPDATE care_schedule_items
+         SET schedule_time = ?, display_time = ?, requires_confirmation = 0,
+             confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND care_plan_id = ? AND user_id = ?`,
+        [item.scheduleTime, displayTime, item.taskId, planId, req.auth.userId],
+      );
+      appliedCount += 1;
+
+      if (previousTime !== item.scheduleTime) {
+        await recordRoutineLearningEvent({
+          db: connection,
+          userId: req.auth.userId,
+          carePlanId: planId,
+          eventType: 'suggestion_accepted',
+          period: item.period,
+          scheduleTime: item.scheduleTime,
+          signalValue: item.task.title || displayTime,
+          metadata: {
+            taskId: item.taskId,
+            previousTime: previousTime || null,
+            source: 'adapt_my_plan',
+          },
+        });
+      }
+    }
+
+    await connection.commit();
+
+    await refreshCareGaps({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
+    return res.json({
+      success: true,
+      message: appliedCount > 0
+        ? `${appliedCount} routine adjustment${appliedCount === 1 ? '' : 's'} applied. Simulation and Care Gaps are ready to refresh.`
+        : 'Current reminders kept. SehatMate saved your choices as routine learning signals.',
+      data: { appliedCount, keptCount },
+    });
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (_) {
+      // No active transaction is also safe here.
+    }
+    next(error);
+  } finally {
+    try {
+      connection.release();
+    } catch (_) {
+      // Ignore a connection that was already released after an early 404.
+    }
+  }
+});
+
 app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   if (!idPattern.test(planId)) {
@@ -3837,6 +4046,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
           action: adaptation.action || option?.action || 'care_plan',
           actionLabel: adaptation.actionLabel || null,
           taskId: adaptation.taskId || null,
+          currentTime: adaptation.currentTime || null,
           suggestedTime: adaptation.suggestedTime || null,
           suggestedPeriod: adaptation.suggestedPeriod || null,
           canApply: Boolean(adaptation.canApply),
