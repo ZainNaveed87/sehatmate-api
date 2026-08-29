@@ -817,6 +817,41 @@ function suggestionTimeForTask(task, tasks, note, routineProfile = null) {
 
   const current = String(task.schedule_time || '').slice(0, 5);
 
+  if (current) {
+    const currentWhy = [];
+    if (current === answerNoteTime) {
+      currentWhy.push(
+        'The current reminder already matches the time you mentioned in this Reality Check answer.',
+      );
+    } else if (current === savedPreferenceTime) {
+      currentWhy.push(
+        `The current reminder already matches your saved ${period} routine preference.`,
+      );
+    } else if (current === learnedTime) {
+      currentWhy.push(
+        `The current reminder already matches the ${period} time SehatMate learned from your previous choices.`,
+      );
+    }
+
+    if (
+      currentWhy.length > 0 &&
+      !hasPracticalScheduleConflict(task, current, tasks)
+    ) {
+      currentWhy.push(
+        `It stays inside the verified ${period} reminder period.`,
+      );
+      currentWhy.push(
+        'It does not create a practical schedule conflict with your current plan.',
+      );
+      return {
+        period,
+        time: current,
+        why: currentWhy,
+        alreadyApplied: true,
+      };
+    }
+  }
+
   for (const candidate of candidates) {
     const minutes = scheduleTimeToMinutes(candidate);
     if (minutes == null || !timeFitsScheduleWindow(minutes, window)) continue;
@@ -931,8 +966,31 @@ function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = nu
       };
     }
 
-    const suggestion = suggestionTimeForTask(target, tasks, answer.note, routineProfile);
+    const suggestion = suggestionTimeForTask(
+      target,
+      tasks,
+      answer.note,
+      routineProfile,
+    );
     const explicit = String(target.grounding || '') === 'explicit';
+
+    if (suggestion?.alreadyApplied) {
+      const periodLabel =
+          suggestion.period[0].toUpperCase() + suggestion.period.slice(1);
+      const display = formatScheduleTime(suggestion.time);
+      return {
+        action: '',
+        actionLabel: null,
+        taskId: String(target.id),
+        suggestedTime: null,
+        suggestedPeriod: periodLabel,
+        canApply: false,
+        resolvedBySchedule: true,
+        why: suggestion.why,
+        recommendation:
+          `Your current reminder at ${display} already matches your saved routine for this ${periodLabel} task. No further timing change is needed.`,
+      };
+    }
 
     if (explicit) {
       return {
@@ -3477,27 +3535,40 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
     const templateByKey = new Map(templates.map((item) => [item.key, item]));
     const routineProfile = await readRoutineProfile(pool, req.auth.userId);
     const unanswered = Math.max(0, templates.length - answers.length);
-    const answerPenalty = answers.reduce(
-      (sum, item) => sum + Number(item.risk_points || 0),
+    const evaluatedAnswers = answers.map((item) => {
+      const template = templateByKey.get(item.question_key);
+      const option = template?.options.find(
+        (candidate) => candidate.label === item.selected_answer,
+      );
+      const adaptation = practicalAdaptationForAnswer(
+        item,
+        option,
+        tasks,
+        routineProfile,
+      );
+      return { item, template, option, adaptation };
+    });
+
+    const unresolvedRiskAnswers = evaluatedAnswers.filter(
+      ({ item, adaptation }) =>
+        Number(item.risk_points || 0) > 0 &&
+        adaptation?.resolvedBySchedule !== true,
+    );
+
+    const answerPenalty = unresolvedRiskAnswers.reduce(
+      (sum, { item }) => sum + Number(item.risk_points || 0),
       0,
     );
     const unclear = tasks.filter((item) => Boolean(item.requires_confirmation)).length;
-    const atRisk = answers.filter((item) => Number(item.risk_points || 0) > 0).length;
+    const atRisk = unresolvedRiskAnswers.length;
     const ready = Math.max(0, tasks.length - unclear);
     const readiness = Math.max(
       0,
       Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)),
     );
 
-    const findings = answers
-      .filter((item) => Number(item.risk_points || 0) > 0)
-      .map((item) => {
-        const template = templateByKey.get(item.question_key);
-        const option = template?.options.find(
-          (candidate) => candidate.label === item.selected_answer,
-        );
-        const adaptation = practicalAdaptationForAnswer(item, option, tasks, routineProfile);
-
+    const findings = unresolvedRiskAnswers.map(
+      ({ item, option, adaptation }) => {
         return {
           key: item.question_key,
           category: item.category,
