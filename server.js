@@ -688,6 +688,50 @@ function explicitDailyFrequencyCount(instruction) {
   return null;
 }
 
+
+function defaultFrequencyPeriods(count) {
+  switch (Number(count)) {
+    case 1:
+      return ['morning'];
+    case 2:
+      return ['morning', 'evening'];
+    case 3:
+      return ['morning', 'afternoon', 'evening'];
+    case 4:
+      return ['morning', 'afternoon', 'evening', 'night'];
+    default:
+      return [];
+  }
+}
+
+function periodDisplayLabel(period) {
+  switch (period) {
+    case 'morning':
+      return 'Morning';
+    case 'afternoon':
+      return 'Afternoon';
+    case 'evening':
+      return 'Evening';
+    case 'night':
+      return 'Night';
+    default:
+      return '';
+  }
+}
+
+function explicitPeriodsFromInstruction(instruction) {
+  const value = `${instruction?.instruction || ''} ${instruction?.timing || ''}`
+    .toLowerCase();
+
+  const periods = [];
+  for (const period of ['morning', 'afternoon', 'evening', 'night']) {
+    if (new RegExp(`\\b${period}\\b`, 'i').test(value)) {
+      periods.push(period);
+    }
+  }
+  return periods;
+}
+
 function normalizeCareScheduleForInstructions(schedule, instructions) {
   const instructionById = new Map(
     instructions.map((instruction) => [String(instruction.id), instruction]),
@@ -750,37 +794,108 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
     const instruction = instructionById.get(instructionId);
     const expectedCount = explicitDailyFrequencyCount(instruction);
 
-    if (!expectedCount || items.length <= expectedCount) {
+    if (!expectedCount) {
       output.push(...items);
       continue;
     }
 
-    // Prefer distinct named periods before any extra/fallback slot. This keeps
-    // Morning + Afternoon + Evening for a clear "3 times daily" instruction
-    // instead of accidentally retaining repeated Morning slots.
-    const selected = [];
-    const selectedPeriods = new Set();
+    const currentPeriods = items
+      .map((item) =>
+        schedulePeriodKey(`${item.displayTime || ''} ${item.recurrence || ''}`),
+      )
+      .filter(Boolean);
+    const distinctCurrentPeriods = [...new Set(currentPeriods)];
+    const explicitPeriods = explicitPeriodsFromInstruction(instruction);
+    const defaultPeriods = defaultFrequencyPeriods(expectedCount);
 
-    for (const item of items) {
-      const period = schedulePeriodKey(
-        `${item.displayTime || ''} ${item.recurrence || ''}`,
-      );
-      if (period && !selectedPeriods.has(period)) {
-        selected.push(item);
-        selectedPeriods.add(period);
-        if (selected.length === expectedCount) break;
+    // When the verified instruction clearly gives only a frequency such as
+    // "3 times daily", period labels returned by AI are organizational
+    // suggestions, not medical facts. If AI repeats one period (e.g. three
+    // Afternoons), normalize the reminder slots to distinct periods so the
+    // user can confirm one exact time for each slot.
+    const shouldNormalizePeriods =
+      defaultPeriods.length === expectedCount &&
+      distinctCurrentPeriods.length < expectedCount;
+
+    if (shouldNormalizePeriods) {
+      const desiredPeriods = [];
+      for (const period of explicitPeriods) {
+        if (!desiredPeriods.includes(period)) desiredPeriods.push(period);
+        if (desiredPeriods.length === expectedCount) break;
       }
+      for (const period of defaultPeriods) {
+        if (!desiredPeriods.includes(period)) desiredPeriods.push(period);
+        if (desiredPeriods.length === expectedCount) break;
+      }
+
+      const base = items[0];
+      if (!base) continue;
+
+      for (let index = 0; index < expectedCount; index += 1) {
+        const source = items[index] || base;
+        const period = desiredPeriods[index] || defaultPeriods[index];
+        const label = periodDisplayLabel(period);
+
+        output.push({
+          ...source,
+          instructionId,
+          date: base.date || source.date || null,
+          time: null,
+          displayTime: label,
+          recurrence:
+            source.recurrence ||
+            base.recurrence ||
+            `${expectedCount} times daily`,
+          grounding: 'suggested',
+          requiresConfirmation: true,
+          reason:
+            `Reminder slot ${index + 1} of ${expectedCount} was organized from the verified "${expectedCount} times daily" frequency. ${label} is a reminder period for confirmation, not a change to the medical instruction.`,
+        });
+      }
+      continue;
     }
 
-    if (selected.length < expectedCount) {
-      for (const item of items) {
-        if (selected.includes(item)) continue;
-        selected.push(item);
-        if (selected.length === expectedCount) break;
-      }
+    // If AI returned too many rows but the periods are already sensible, keep
+    // only the number required by the verified daily frequency.
+    if (items.length > expectedCount) {
+      output.push(...items.slice(0, expectedCount));
+      continue;
     }
 
-    output.push(...selected);
+    // If AI returned too few rows for a plain verified frequency, create the
+    // missing reminder slots as confirmable organizational periods.
+    if (
+      items.length < expectedCount &&
+      defaultPeriods.length === expectedCount
+    ) {
+      const base = items[0];
+      if (!base) continue;
+
+      for (let index = 0; index < expectedCount; index += 1) {
+        const source = items[index] || base;
+        const period = defaultPeriods[index];
+        const label = periodDisplayLabel(period);
+
+        output.push({
+          ...source,
+          instructionId,
+          date: base.date || source.date || null,
+          time: null,
+          displayTime: label,
+          recurrence:
+            source.recurrence ||
+            base.recurrence ||
+            `${expectedCount} times daily`,
+          grounding: 'suggested',
+          requiresConfirmation: true,
+          reason:
+            `Reminder slot ${index + 1} of ${expectedCount} was organized from the verified "${expectedCount} times daily" frequency. ${label} is a reminder period for confirmation, not a change to the medical instruction.`,
+        });
+      }
+      continue;
+    }
+
+    output.push(...items);
   }
 
   return output;
