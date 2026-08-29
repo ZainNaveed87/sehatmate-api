@@ -4096,6 +4096,18 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
 
     findings.push(...buildScheduleConflictFindings(tasks, routineProfile));
 
+    const adaptations = findings
+      .filter((finding) =>
+        finding?.canApply === true &&
+        finding?.taskId &&
+        finding?.suggestedTime &&
+        finding?.suggestedPeriod,
+      )
+      .map((finding) => ({
+        ...finding,
+        taskId: String(finding.taskId),
+      }));
+
     const careGapRows = await refreshCareGaps({
       db: pool,
       planId,
@@ -4163,6 +4175,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
           status: item.requires_confirmation ? 'unclear' : 'ready',
         })),
         findings,
+        adaptations,
         blockers,
         unanswered,
         careGaps: {
