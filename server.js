@@ -5336,9 +5336,10 @@ app.get('/api/task-occurrences', authenticate, async (req, res, next) => {
 
     const [gapRows] = await pool.execute(
       `SELECT COUNT(*) AS open_count
-       FROM care_gaps
-       WHERE user_id = ?
-         AND lifecycle_status <> 'resolved'`,
+       FROM care_gaps g
+       JOIN care_plans p ON p.id = g.care_plan_id
+       WHERE p.user_id = ?
+         AND g.lifecycle_status <> 'resolved'`,
       [req.auth.userId],
     );
 
