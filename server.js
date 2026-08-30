@@ -550,15 +550,18 @@ function verifiedTimingConstraint(row) {
 }
 
 function scheduleItemEffectiveStart(item, dateKey, plan) {
-  const scheduleDate = dbDateKey(item?.schedule_date);
   const activatedDate = dbDateKey(plan?.activated_at);
+  const scheduleDate = dbDateKey(item?.schedule_date);
   const planStartDate = dbDateKey(plan?.start_date);
 
-  // A medicine-specific explicit schedule/start date is authoritative.
-  // Otherwise, a fixed-duration medicine starts when the care plan is
-  // actually activated. plan.start_date is only a fallback for older data.
-  if (scheduleDate) return scheduleDate;
+  // Fixed medicine duration begins when the plan is actually activated.
+  // schedule_date is an operational reminder date and must not silently
+  // restart a "for N days" course on a later date.
+  //
+  // If a future version stores a clinician-specified medicine start date in
+  // its own dedicated field, that explicit medical date should outrank this.
   if (activatedDate) return activatedDate;
+  if (scheduleDate) return scheduleDate;
   if (planStartDate) return planStartDate;
   return dateKey;
 }
@@ -2294,6 +2297,7 @@ app.get('/health', async (_req, res, next) => {
       success: true,
       service: 'sehatroute-auth-api',
       database: 'connected',
+      build: 'medical-safety-fixed-duration-v7',
       ai: aiConfiguration(),
     });
   } catch (error) {
