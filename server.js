@@ -547,7 +547,7 @@ async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) {
     [planId, userId],
   );
   const plan = plans[0];
-  if (!plan || !['active', 'completed'].includes(plan.status)) return;
+  if (!plan || plan.status !== 'active') return;
 
   const [items] = await db.execute(
     `SELECT id, care_plan_id, user_id, schedule_date, schedule_time,
@@ -5266,6 +5266,222 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
   }
 });
 
+
+
+// App-wide task outcome source used by Dashboard and Calendar.
+// Every surface reads/writes the same care_task_occurrences rows.
+app.get('/api/task-occurrences', authenticate, async (req, res, next) => {
+  const dateKey = taskOutcomeDate(req.query?.date) || serverDateKey();
+  const clientToday = taskOutcomeDate(req.query?.today) || serverDateKey();
+
+  try {
+    await reconcilePlanLifecycle({
+      db: pool,
+      userId: req.auth.userId,
+      today: clientToday,
+    });
+    await reconcileMissedOccurrences({
+      db: pool,
+      userId: req.auth.userId,
+      beforeDate: clientToday,
+    });
+
+    const [activePlans] = await pool.execute(
+      `SELECT id, title, readiness_score
+       FROM care_plans
+       WHERE user_id = ? AND status = 'active'
+       ORDER BY activated_at DESC, id DESC`,
+      [req.auth.userId],
+    );
+
+    for (const plan of activePlans) {
+      await ensureOccurrencesForDate({
+        db: pool,
+        userId: req.auth.userId,
+        planId: plan.id,
+        dateKey,
+      });
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT o.id, o.care_plan_id, o.schedule_item_id, o.occurrence_date,
+        TIME_FORMAT(o.scheduled_at, '%H:%i') AS scheduled_time,
+        o.status, o.completed_at,
+        TIME_FORMAT(o.completed_at, '%H:%i') AS completed_time,
+        o.outcome_source, o.note,
+        s.title, s.task_kind, s.display_time, s.recurrence_text, s.grounding,
+        p.title AS plan_title
+       FROM care_task_occurrences o
+       JOIN care_schedule_items s ON s.id = o.schedule_item_id
+       JOIN care_plans p ON p.id = o.care_plan_id
+       WHERE o.user_id = ? AND o.occurrence_date = ?
+       ORDER BY o.scheduled_at, o.id`,
+      [req.auth.userId, dateKey],
+    );
+
+    const summary = rows.reduce((value, row) => {
+      value.total += 1;
+      if (row.status === 'completed') value.completed += 1;
+      else if (row.status === 'skipped') value.skipped += 1;
+      else if (row.status === 'missed') value.missed += 1;
+      else value.pending += 1;
+      return value;
+    }, {
+      total: 0,
+      completed: 0,
+      skipped: 0,
+      missed: 0,
+      pending: 0,
+    });
+
+    const [gapRows] = await pool.execute(
+      `SELECT COUNT(*) AS open_count
+       FROM care_gaps
+       WHERE user_id = ?
+         AND lifecycle_status <> 'resolved'`,
+      [req.auth.userId],
+    );
+
+    const readinessValues = activePlans
+      .map((plan) => Number(plan.readiness_score))
+      .filter((value) => Number.isFinite(value));
+    const careReadiness = readinessValues.length
+      ? Math.round(readinessValues.reduce((sum, value) => sum + value, 0) / readinessValues.length)
+      : 0;
+
+    res.json({
+      success: true,
+      data: {
+        date: dateKey,
+        occurrences: rows.map((row) => ({
+          ...taskOccurrenceJson(row),
+          planTitle: row.plan_title || 'Care plan',
+        })),
+        summary: {
+          ...summary,
+          activePlans: activePlans.length,
+          openCareGaps: Number(gapRows[0]?.open_count || 0),
+          careReadiness,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/task-outcomes/summary', authenticate, async (req, res, next) => {
+  const endDate = taskOutcomeDate(req.query?.endDate) || serverDateKey();
+  const clientToday = taskOutcomeDate(req.query?.today) || serverDateKey();
+  const days = Math.max(1, Math.min(31, Number.parseInt(req.query?.days, 10) || 7));
+  const end = new Date(`${endDate}T00:00:00Z`);
+  const start = new Date(end.getTime() - ((days - 1) * 86400000));
+  const startDate = start.toISOString().slice(0, 10);
+
+  try {
+    await reconcilePlanLifecycle({
+      db: pool,
+      userId: req.auth.userId,
+      today: clientToday,
+    });
+    await reconcileMissedOccurrences({
+      db: pool,
+      userId: req.auth.userId,
+      beforeDate: clientToday,
+    });
+
+    const [activePlans] = await pool.execute(
+      `SELECT id
+       FROM care_plans
+       WHERE user_id = ? AND status = 'active'
+       ORDER BY id`,
+      [req.auth.userId],
+    );
+
+    for (const plan of activePlans) {
+      await ensureOccurrencesForRange({
+        db: pool,
+        userId: req.auth.userId,
+        planId: plan.id,
+        startDate,
+        endDate,
+      });
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT occurrence_date, status, scheduled_at, completed_at
+       FROM care_task_occurrences
+       WHERE user_id = ?
+         AND occurrence_date BETWEEN ? AND ?
+       ORDER BY occurrence_date, scheduled_at`,
+      [req.auth.userId, startDate, endDate],
+    );
+
+    const summary = rows.reduce((value, row) => {
+      value.scheduled += 1;
+      if (row.status === 'completed') {
+        value.completed += 1;
+        const scheduled = new Date(row.scheduled_at);
+        const completed = new Date(row.completed_at);
+        if (!Number.isNaN(scheduled.getTime()) && !Number.isNaN(completed.getTime())) {
+          const deltaMinutes = Math.round((completed.getTime() - scheduled.getTime()) / 60000);
+          if (deltaMinutes <= 30) value.onTime += 1;
+          else value.late += 1;
+        }
+      } else if (row.status === 'skipped') value.skipped += 1;
+      else if (row.status === 'missed') value.missed += 1;
+      else value.pending += 1;
+      return value;
+    }, {
+      scheduled: 0,
+      completed: 0,
+      onTime: 0,
+      late: 0,
+      skipped: 0,
+      missed: 0,
+      pending: 0,
+    });
+
+    const byDate = new Map();
+    for (let offset = 0; offset < days; offset += 1) {
+      const day = new Date(start.getTime() + (offset * 86400000))
+        .toISOString()
+        .slice(0, 10);
+      byDate.set(day, {
+        date: day,
+        scheduled: 0,
+        completed: 0,
+        skipped: 0,
+        missed: 0,
+        pending: 0,
+      });
+    }
+
+    for (const row of rows) {
+      const key = dbDateKey(row.occurrence_date);
+      const day = byDate.get(key);
+      if (!day) continue;
+      day.scheduled += 1;
+      if (row.status === 'completed') day.completed += 1;
+      else if (row.status === 'skipped') day.skipped += 1;
+      else if (row.status === 'missed') day.missed += 1;
+      else day.pending += 1;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        startDate,
+        endDate,
+        days,
+        summary,
+        daily: [...byDate.values()],
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get('/api/care-plans/:id/task-occurrences', authenticate, async (req, res, next) => {
   const planId = req.params.id;
