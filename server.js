@@ -5579,7 +5579,10 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
       return res.status(404).json({ success: false, message: 'Task occurrence not found.' });
     }
 
-    if (outcome === 'pending' && String(row.occurrence_date).slice(0, 10) < serverDateKey()) {
+    // Use the device-local date supplied by the Flutter client when available.
+    // This avoids UTC/server-midnight allowing an invalid Undo for a past local day.
+    const clientToday = taskOutcomeDate(req.body?.today) || serverDateKey();
+    if (outcome === 'pending' && String(row.occurrence_date).slice(0, 10) < clientToday) {
       await connection.rollback();
       return res.status(409).json({
         success: false,
@@ -5647,6 +5650,7 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
 app.get('/api/care-plans/:id/task-outcomes/summary', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   const endDate = taskOutcomeDate(req.query?.endDate) || serverDateKey();
+  const clientToday = taskOutcomeDate(req.query?.today) || endDate;
   const days = Math.max(1, Math.min(31, Number.parseInt(req.query?.days, 10) || 7));
   const end = new Date(`${endDate}T00:00:00Z`);
   const start = new Date(end.getTime() - ((days - 1) * 86400000));
@@ -5664,7 +5668,7 @@ app.get('/api/care-plans/:id/task-outcomes/summary', authenticate, async (req, r
       return res.status(404).json({ success: false, message: 'Care plan not found.' });
     }
 
-    await reconcileMissedOccurrences({ db: pool, userId: req.auth.userId, beforeDate: endDate });
+    await reconcileMissedOccurrences({ db: pool, userId: req.auth.userId, beforeDate: clientToday });
     await ensureOccurrencesForRange({
       db: pool,
       userId: req.auth.userId,
