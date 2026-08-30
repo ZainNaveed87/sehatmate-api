@@ -551,14 +551,16 @@ function verifiedTimingConstraint(row) {
 
 function scheduleItemEffectiveStart(item, dateKey, plan) {
   const scheduleDate = dbDateKey(item?.schedule_date);
-  const planStartDate = dbDateKey(plan?.start_date);
   const activatedDate = dbDateKey(plan?.activated_at);
-  const startCandidates = [scheduleDate, planStartDate, activatedDate]
-    .filter(Boolean)
-    .sort();
-  return startCandidates.length
-    ? startCandidates[startCandidates.length - 1]
-    : dateKey;
+  const planStartDate = dbDateKey(plan?.start_date);
+
+  // A medicine-specific explicit schedule/start date is authoritative.
+  // Otherwise, a fixed-duration medicine starts when the care plan is
+  // actually activated. plan.start_date is only a fallback for older data.
+  if (scheduleDate) return scheduleDate;
+  if (activatedDate) return activatedDate;
+  if (planStartDate) return planStartDate;
+  return dateKey;
 }
 
 function scheduleItemDurationEndDate(item, dateKey, plan) {
@@ -644,6 +646,46 @@ function taskOccurrenceJson(row) {
   };
 }
 
+async function reconcileExpiredFixedDurationOccurrences({
+  db,
+  userId,
+  planId,
+  dateKey,
+}) {
+  const [plans] = await db.execute(
+    `SELECT id, status, start_date, activated_at
+     FROM care_plans
+     WHERE id = ? AND user_id = ?
+     LIMIT 1`,
+    [planId, userId],
+  );
+  const plan = plans[0];
+  if (!plan || plan.status !== 'active') return;
+
+  const [items] = await db.execute(
+    `SELECT id, schedule_date, instruction_duration_days
+     FROM care_schedule_items
+     WHERE care_plan_id = ? AND user_id = ?
+       AND instruction_duration_days IS NOT NULL`,
+    [planId, userId],
+  );
+
+  for (const item of items) {
+    const instructionEnd = scheduleItemDurationEndDate(item, dateKey, plan);
+    if (!instructionEnd || dateKey <= instructionEnd) continue;
+
+    await db.execute(
+      `DELETE FROM care_task_occurrences
+       WHERE user_id = ?
+         AND care_plan_id = ?
+         AND schedule_item_id = ?
+         AND occurrence_date > ?
+         AND status = 'pending'`,
+      [userId, planId, item.id, instructionEnd],
+    );
+  }
+}
+
 async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) {
   const [plans] = await db.execute(
     `SELECT id, status, start_date, activated_at, completed_at,
@@ -667,6 +709,25 @@ async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) {
   );
 
   for (const item of items) {
+    const instructionEnd = scheduleItemDurationEndDate(item, dateKey, plan);
+
+    // A fixed-duration medicine can already have pending occurrence rows that
+    // were generated while its course was still active. Once the verified
+    // medicine-specific end date has passed, remove only those future/pending
+    // rows. Completed/skipped/missed history is intentionally preserved.
+    if (instructionEnd && dateKey > instructionEnd) {
+      await db.execute(
+        `DELETE FROM care_task_occurrences
+         WHERE user_id = ?
+           AND care_plan_id = ?
+           AND schedule_item_id = ?
+           AND occurrence_date > ?
+           AND status = 'pending'`,
+        [userId, planId, item.id, instructionEnd],
+      );
+      continue;
+    }
+
     if (!scheduleItemAppliesOnDate(item, dateKey, plan)) continue;
     const scheduledTime = String(item.schedule_time || '').slice(0, 5);
     if (!scheduledTime) continue;
@@ -5611,6 +5672,12 @@ app.get('/api/task-occurrences', authenticate, async (req, res, next) => {
     );
 
     for (const plan of activePlans) {
+      await reconcileExpiredFixedDurationOccurrences({
+        db: pool,
+        userId: req.auth.userId,
+        planId: plan.id,
+        dateKey,
+      });
       await ensureOccurrencesForDate({
         db: pool,
         userId: req.auth.userId,
@@ -5822,6 +5889,12 @@ app.get('/api/care-plans/:id/task-occurrences', authenticate, async (req, res, n
       db: pool,
       userId: req.auth.userId,
       beforeDate: clientToday,
+    });
+    await reconcileExpiredFixedDurationOccurrences({
+      db: pool,
+      userId: req.auth.userId,
+      planId,
+      dateKey,
     });
     await ensureOccurrencesForDate({
       db: pool,
