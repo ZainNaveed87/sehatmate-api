@@ -470,6 +470,117 @@ function dbDateKey(value) {
   return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10);
 }
 
+
+function addDaysToDateKey(dateKey, days) {
+  const parsed = taskOutcomeDate(dateKey);
+  if (!parsed || !Number.isFinite(Number(days))) return '';
+  const date = new Date(`${parsed}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + Number(days));
+  return date.toISOString().slice(0, 10);
+}
+
+function instructionDurationDays(value) {
+  const text = String(value || '');
+  const candidates = [];
+  for (const match of text.matchAll(/\b(\d{1,3})\s*days?\b/gi)) {
+    candidates.push(Number(match[1]));
+  }
+  for (const match of text.matchAll(/\b(\d{1,2})\s*weeks?\b/gi)) {
+    candidates.push(Number(match[1]) * 7);
+  }
+  const valid = candidates.filter((days) => Number.isInteger(days) && days > 0 && days <= 3650);
+  return valid.length ? Math.max(...valid) : null;
+}
+
+function medicineFingerprint(title, instruction, timing) {
+  const normalize = (value) => String(value || '')
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return [normalize(title), normalize(instruction), normalize(timing)].join('|');
+}
+
+function verifiedTimingConstraint(row) {
+  const currentText = [row?.instruction, row?.timing]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  const fallbackText = [row?.original_instruction, row?.original_timing]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  const text = (currentText || fallbackText).toLowerCase();
+
+  const rules = [
+    {
+      regex: /\b(?:after|before|with)\s+breakfast\b|\bbreakfast\b/,
+      period: 'morning',
+      phrase: 'breakfast',
+    },
+    {
+      regex: /\b(?:after|before|with)\s+lunch\b|\blunch\b/,
+      period: 'afternoon',
+      phrase: 'lunch',
+    },
+    {
+      regex: /\b(?:after|before|with)\s+(?:dinner|supper)\b|\b(?:dinner|supper)\b/,
+      period: 'evening',
+      phrase: 'dinner',
+    },
+    {
+      regex: /\b(?:at\s+)?bedtime\b/,
+      period: 'night',
+      phrase: 'bedtime',
+    },
+  ];
+
+  for (const rule of rules) {
+    if (rule.regex.test(text)) return rule;
+  }
+
+  const timingText = String(row?.original_timing || row?.timing || '').toLowerCase();
+  for (const period of ['morning', 'afternoon', 'evening', 'night']) {
+    if (new RegExp(`\\b${period}\\b`, 'i').test(timingText)) {
+      return { period, phrase: period };
+    }
+  }
+  return null;
+}
+
+function scheduleItemEffectiveStart(item, dateKey, plan) {
+  const scheduleDate = dbDateKey(item?.schedule_date);
+  const planStartDate = dbDateKey(plan?.start_date);
+  const activatedDate = dbDateKey(plan?.activated_at);
+  const startCandidates = [scheduleDate, planStartDate, activatedDate]
+    .filter(Boolean)
+    .sort();
+  return startCandidates.length
+    ? startCandidates[startCandidates.length - 1]
+    : dateKey;
+}
+
+function scheduleItemDurationEndDate(item, dateKey, plan) {
+  const durationDays = Number(item?.instruction_duration_days || 0);
+  if (!Number.isInteger(durationDays) || durationDays <= 0) return '';
+  const effectiveStart = scheduleItemEffectiveStart(item, dateKey, plan);
+  return effectiveStart ? addDaysToDateKey(effectiveStart, durationDays - 1) : '';
+}
+
+function scheduleItemDurationExpired(item, dateKey, plan) {
+  const durationDays = Number(item?.instruction_duration_days || 0);
+  if (!Number.isInteger(durationDays) || durationDays <= 0) return false;
+
+  // Before activation, do not silently age a fixed medicine course just because
+  // the user spent time reviewing/setup. Once active, the course has a stable
+  // effective start and can be hard-stopped.
+  if (!['active', 'completed'].includes(String(plan?.status || ''))) return false;
+
+  const endDate = scheduleItemDurationEndDate(item, dateKey, plan);
+  return Boolean(endDate && dateKey > endDate);
+}
+
 function scheduleItemIsDaily(item) {
   const recurrence = String(item?.recurrence_text || '').toLowerCase();
   return /\b(?:daily|every\s+day|each\s+day|once\s+daily|twice\s+daily|times\s+daily|per\s+day)\b/.test(recurrence);
@@ -489,16 +600,12 @@ function scheduleItemAppliesOnDate(item, dateKey, plan) {
   // A one-off task still requires its own explicit schedule_date.
   if (!daily && !scheduleDate) return false;
 
-  const startCandidates = [scheduleDate, planStartDate, activatedDate]
-    .filter(Boolean)
-    .sort();
-  const effectiveStart = startCandidates.length
-    ? startCandidates[startCandidates.length - 1]
-    : daily
-      ? dateKey
-      : '';
+  const effectiveStart = scheduleItemEffectiveStart(item, dateKey, plan);
 
   if (effectiveStart && dateKey < effectiveStart) return false;
+
+  const instructionEnd = scheduleItemDurationEndDate(item, dateKey, plan);
+  if (instructionEnd && dateKey > instructionEnd) return false;
 
   const plannedEnd = dbDateKey(plan?.planned_end_date);
   if (plan?.duration_mode !== 'ongoing' && plannedEnd && dateKey > plannedEnd) {
@@ -515,7 +622,7 @@ function scheduleItemAppliesOnDate(item, dateKey, plan) {
 }
 
 function taskOccurrenceJson(row) {
-  const occurrenceDate = dbDateKey(row.occurrence_date);
+  const occurrenceDate = String(row.occurrence_date || '').slice(0, 10);
   const scheduledTime = String(row.scheduled_time || '').slice(0, 5);
   const completedTime = String(row.completed_time || '').slice(0, 5);
   return {
@@ -551,7 +658,8 @@ async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) {
 
   const [items] = await db.execute(
     `SELECT id, care_plan_id, user_id, schedule_date, schedule_time,
-      display_time, recurrence_text, grounding, title, task_kind
+      display_time, recurrence_text, grounding, title, task_kind,
+      instruction_duration_days
      FROM care_schedule_items
      WHERE care_plan_id = ? AND user_id = ? AND schedule_time IS NOT NULL
      ORDER BY id`,
@@ -628,7 +736,7 @@ async function recordOccurrenceLearning({ db, row, userId, outcome }) {
       occurrenceId: String(row.id),
       taskId: String(row.schedule_item_id),
       outcome,
-      occurrenceDate: dbDateKey(row.occurrence_date),
+      occurrenceDate: String(row.occurrence_date || '').slice(0, 10),
     },
   });
 }
@@ -3037,18 +3145,59 @@ app.post(
                WHERE document_id = ? AND review_status IN ('pending', 'unclear')`,
               [document.id],
             );
+
+            const [existingMedicineRows] = await connection.execute(
+              `SELECT id, title, instruction, timing
+               FROM extracted_instructions
+               WHERE care_plan_id = ? AND category = 'medicine'
+               ORDER BY id`,
+              [planId],
+            );
+            const medicineFingerprints = new Map(
+              existingMedicineRows.map((item) => [
+                medicineFingerprint(item.title, item.instruction, item.timing),
+                String(item.id),
+              ]),
+            );
+
             for (const instruction of instructions) {
-              await connection.execute(
+              let duplicateOfInstructionId = null;
+              let duplicateReason = null;
+              if (instruction.category === 'medicine') {
+                const fingerprint = medicineFingerprint(
+                  instruction.title,
+                  instruction.instruction,
+                  instruction.timing,
+                );
+                duplicateOfInstructionId = medicineFingerprints.get(fingerprint) || null;
+                if (duplicateOfInstructionId) {
+                  duplicateReason =
+                    'Possible duplicate medicine instruction detected. Compare both source entries before confirming either as a separate medicine instruction.';
+                  instruction.reviewStatus = 'unclear';
+                  instruction.requiresProfessionalConfirmation = true;
+                  instruction.ambiguityReason = [
+                    duplicateReason,
+                    instruction.ambiguityReason,
+                  ].filter(Boolean).join(' ').slice(0, 2000);
+                }
+              }
+
+              const [inserted] = await connection.execute(
                 `INSERT INTO extracted_instructions (
                   care_plan_id, document_id, category, title, instruction,
-                  timing, source_page, confidence_score, review_status,
+                  timing, original_title, original_instruction, original_timing,
+                  source_page, confidence_score, review_status,
                   requires_professional_confirmation, ambiguity_reason,
-                  possible_interpretation, safety_note
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  possible_interpretation, safety_note,
+                  duplicate_of_instruction_id, duplicate_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                   planId,
                   document.id,
                   instruction.category,
+                  instruction.title,
+                  instruction.instruction,
+                  instruction.timing,
                   instruction.title,
                   instruction.instruction,
                   instruction.timing,
@@ -3059,8 +3208,21 @@ app.post(
                   instruction.ambiguityReason,
                   instruction.possibleInterpretation,
                   instruction.safetyNote,
+                  duplicateOfInstructionId,
+                  duplicateReason,
                 ],
               );
+
+              if (instruction.category === 'medicine') {
+                const fingerprint = medicineFingerprint(
+                  instruction.title,
+                  instruction.instruction,
+                  instruction.timing,
+                );
+                if (!medicineFingerprints.has(fingerprint)) {
+                  medicineFingerprints.set(fingerprint, String(inserted.insertId));
+                }
+              }
             }
             await connection.execute(
               `UPDATE care_documents
@@ -3333,6 +3495,94 @@ app.post('/api/instructions/:id/ingredient-evidence', authenticate, aiLimiter, a
   }
 });
 
+app.delete('/api/instructions/:id', authenticate, async (req, res, next) => {
+  const instructionId = req.params.id;
+  if (!idPattern.test(instructionId)) {
+    res.status(422).json({ success: false, message: 'Invalid instruction ID.' });
+    return;
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      `SELECT i.id, i.care_plan_id, i.category, i.title
+       FROM extracted_instructions i
+       JOIN care_plans p ON p.id = i.care_plan_id
+       WHERE i.id = ? AND p.user_id = ?
+       LIMIT 1 FOR UPDATE`,
+      [instructionId, req.auth.userId],
+    );
+    const instruction = rows[0];
+    if (!instruction) {
+      await connection.rollback();
+      res.status(404).json({ success: false, message: 'Instruction not found.' });
+      return;
+    }
+
+    const [scheduleRows] = await connection.execute(
+      `SELECT COUNT(*) AS total
+       FROM care_schedule_items
+       WHERE instruction_id = ? AND care_plan_id = ? AND user_id = ?`,
+      [instructionId, instruction.care_plan_id, req.auth.userId],
+    );
+    const deletedScheduleCount = Number(scheduleRows[0]?.total || 0);
+
+    // Occurrences are removed by their schedule-item FK cascade. Local Android
+    // notifications are reconciled by the client by cancelling the plan and
+    // rebuilding only the remaining authoritative tasks.
+    await connection.execute(
+      `DELETE FROM care_schedule_items
+       WHERE instruction_id = ? AND care_plan_id = ? AND user_id = ?`,
+      [instructionId, instruction.care_plan_id, req.auth.userId],
+    );
+    await connection.execute(
+      `DELETE FROM extracted_instructions
+       WHERE id = ? AND care_plan_id = ?`,
+      [instructionId, instruction.care_plan_id],
+    );
+
+    // Any rows that previously pointed to this instruction as a duplicate now
+    // remain visible, but are no longer linked to a deleted row.
+    await connection.execute(
+      `UPDATE extracted_instructions
+       SET duplicate_reason = CASE
+             WHEN duplicate_of_instruction_id = ? THEN NULL
+             ELSE duplicate_reason
+           END,
+           duplicate_of_instruction_id = NULL
+       WHERE care_plan_id = ? AND duplicate_of_instruction_id = ?`,
+      [instructionId, instruction.care_plan_id, instructionId],
+    );
+
+    await connection.commit();
+
+    await refreshCareGaps({
+      db: pool,
+      planId: String(instruction.care_plan_id),
+      userId: req.auth.userId,
+      realityQuestionTemplates,
+    });
+
+    res.json({
+      success: true,
+      message: 'Instruction and its SehatMate reminders were removed.',
+      data: {
+        planId: String(instruction.care_plan_id),
+        instructionId: String(instructionId),
+        category: instruction.category,
+        title: instruction.title,
+        deletedScheduleCount,
+      },
+    });
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    next(error);
+  } finally {
+    connection.release();
+  }
+});
+
 app.patch('/api/instructions/:id', authenticate, async (req, res, next) => {
   const instructionId = req.params.id;
   const title = cleanText(req.body?.title, 160);
@@ -3513,7 +3763,7 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
 
   try {
     const [plans] = await pool.execute(
-      'SELECT id, status FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      'SELECT id, status, duration_mode FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
       [planId, req.auth.userId],
     );
     if (plans.length === 0) {
@@ -3526,7 +3776,8 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
     }
 
     const [instructions] = await pool.execute(
-      `SELECT id, category, title, instruction, timing
+      `SELECT id, category, title, instruction, timing,
+        original_title, original_instruction, original_timing
        FROM extracted_instructions
        WHERE care_plan_id = ? AND review_status = 'verified'
        ORDER BY id`,
@@ -3557,13 +3808,19 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
       throw new AiServiceError('No schedulable details were found in the verified instructions.', 422);
     }
 
-    const durationCandidates = [];
-    for (const instruction of instructions) {
-      const text = `${instruction.instruction || ''} ${instruction.timing || ''}`;
-      for (const match of text.matchAll(/\b(\d{1,3})\s*days?\b/gi)) durationCandidates.push(Number(match[1]));
-      for (const match of text.matchAll(/\b(\d{1,2})\s*weeks?\b/gi)) durationCandidates.push(Number(match[1]) * 7);
-    }
-    const explicitDays = durationCandidates.filter((value) => value > 0 && value <= 3650);
+    const durationDaysByInstruction = new Map(
+      instructions.map((instruction) => [
+        String(instruction.id),
+        instruction.category === 'medicine'
+          ? instructionDurationDays(
+              `${instruction.instruction || instruction.original_instruction || ''} ` +
+              `${instruction.timing || instruction.original_timing || ''}`,
+            )
+          : null,
+      ]),
+    );
+    const explicitDays = [...durationDaysByInstruction.values()]
+      .filter((value) => Number.isInteger(value) && value > 0 && value <= 3650);
     const scheduleDates = schedule.map((item) => item.date).filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value || ''));
     const today = new Date();
     let suggestedEndDate;
@@ -3590,8 +3847,9 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
           `INSERT INTO care_schedule_items (
             care_plan_id, user_id, instruction_id, title, task_kind,
             schedule_date, schedule_time, display_time, recurrence_text,
-            grounding, requires_confirmation, confirmation_status, reason
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            grounding, requires_confirmation, confirmation_status, reason,
+            instruction_duration_days
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             planId,
             req.auth.userId,
@@ -3606,6 +3864,7 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
             item.requiresConfirmation ? 1 : 0,
             item.requiresConfirmation ? 'needs_confirmation' : 'ready',
             item.reason,
+            durationDaysByInstruction.get(String(item.instructionId)) || null,
           ],
         );
       }
@@ -3689,11 +3948,13 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
   }
   try {
     const [rows] = await pool.execute(
-      `SELECT id, care_plan_id, instruction_id, schedule_date,
-        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
-        display_time, grounding, title
-       FROM care_schedule_items
-       WHERE id = ? AND user_id = ?
+      `SELECT s.id, s.care_plan_id, s.instruction_id, s.schedule_date,
+        TIME_FORMAT(s.schedule_time, '%H:%i') AS schedule_time,
+        s.display_time, s.grounding, s.title,
+        i.instruction, i.timing, i.original_instruction, i.original_timing
+       FROM care_schedule_items s
+       LEFT JOIN extracted_instructions i ON i.id = s.instruction_id
+       WHERE s.id = ? AND s.user_id = ?
        LIMIT 1`,
       [itemId, req.auth.userId],
     );
@@ -3719,6 +3980,36 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
 
     const selectedPeriod = schedulePeriodKey(displayTime) ||
       schedulePeriodKey(rows[0].display_time);
+
+    const medicalConstraint = verifiedTimingConstraint(rows[0]);
+    if (
+      selectedPeriod &&
+      medicalConstraint &&
+      selectedPeriod !== medicalConstraint.period
+    ) {
+      const requiredLabel =
+        medicalConstraint.period[0].toUpperCase() + medicalConstraint.period.slice(1);
+      const selectedLabel = selectedPeriod[0].toUpperCase() + selectedPeriod.slice(1);
+      res.status(409).json({
+        success: false,
+        message:
+          `Medical timing conflict: ${selectedLabel} conflicts with the verified ` +
+          `${medicalConstraint.phrase} instruction. SehatMate did not save this reminder.`,
+        data: {
+          medicalTimingConflict: true,
+          requiredPeriod: medicalConstraint.period,
+          selectedPeriod,
+          selectedTime: scheduleTime,
+          originalInstruction:
+            cleanText(rows[0].original_instruction || rows[0].instruction, 4000),
+          originalTiming:
+            cleanText(rows[0].original_timing || rows[0].timing, 160),
+          recommendation:
+            `Keep this reminder in ${requiredLabel}, or confirm a different medical timing with the prescribing clinician or pharmacist before changing it.`,
+        },
+      });
+      return;
+    }
 
     // One instruction occurrence should not contain two reminder cards for
     // the same period or the same exact time. Keep the check scoped to the
@@ -4619,6 +4910,8 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
     );
     const [instructions] = await pool.execute(
       `SELECT id, document_id, category, title, instruction, timing,
+        original_title, original_instruction, original_timing,
+        duplicate_of_instruction_id, duplicate_reason,
         source_page, confidence_score, review_status,
         requires_professional_confirmation, ambiguity_reason,
         possible_interpretation, safety_note, safety_check_status,
@@ -4631,11 +4924,22 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
     );
     const [tasks] = await pool.execute(
       `SELECT id, instruction_id, NULL AS caregiver_id,
-        schedule_date AS task_date,
+        schedule_date AS task_date, schedule_date, schedule_time,
         COALESCE(TIME_FORMAT(schedule_time, '%H:%i'), NULLIF(display_time, ''), 'Review timing') AS task_time,
         title,
-        CONCAT_WS(' · ', NULLIF(recurrence_text, ''), NULLIF(display_time, ''), NULLIF(reason, '')) AS note,
-        task_kind,
+        CONCAT_WS(
+          ' · ',
+          NULLIF(recurrence_text, ''),
+          NULLIF(display_time, ''),
+          NULLIF(reason, ''),
+          CASE
+            WHEN instruction_duration_days IS NOT NULL
+            THEN CONCAT('Fixed medicine course: ', instruction_duration_days, ' day', IF(instruction_duration_days = 1, '', 's'), '; stops automatically')
+            ELSE NULL
+          END
+        ) AS note,
+        task_kind, display_time, recurrence_text, grounding,
+        instruction_duration_days,
         CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
         NULL AS completed_at
        FROM care_schedule_items
@@ -4643,6 +4947,10 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
        ORDER BY schedule_date, schedule_time, id`,
       [planId, req.auth.userId],
     );
+    const visibleTasks = tasks.filter(
+      (item) => !scheduleItemDurationExpired(item, serverDateKey(), plans[0]),
+    );
+
     const gaps = await refreshCareGaps({
       db: pool,
       planId,
@@ -4678,6 +4986,10 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
             instruction: cleanText(item.instruction, 4000),
             timing: cleanText(item.timing, 160) || null,
             document_id: item.document_id == null ? null : String(item.document_id),
+            duplicate_of_instruction_id:
+              item.duplicate_of_instruction_id == null
+                ? null
+                : String(item.duplicate_of_instruction_id),
             safety_sources: parseStoredJson(item.safety_sources),
           })),
         verifiedInstructions: instructions
@@ -4692,9 +5004,13 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
             instruction: cleanText(item.instruction, 4000),
             timing: cleanText(item.timing, 160) || null,
             document_id: item.document_id == null ? null : String(item.document_id),
+            duplicate_of_instruction_id:
+              item.duplicate_of_instruction_id == null
+                ? null
+                : String(item.duplicate_of_instruction_id),
             safety_sources: parseStoredJson(item.safety_sources),
           })),
-        tasks: tasks.map((item) => ({
+        tasks: visibleTasks.map((item) => ({
           ...item,
           id: String(item.id),
           instruction_id: item.instruction_id == null ? null : String(item.instruction_id),
@@ -5607,7 +5923,7 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
     }
 
     const clientToday = taskOutcomeDate(req.body?.today) || serverDateKey();
-    if (outcome === 'pending' && dbDateKey(row.occurrence_date) < clientToday) {
+    if (outcome === 'pending' && String(row.occurrence_date).slice(0, 10) < clientToday) {
       await connection.rollback();
       return res.status(409).json({
         success: false,
@@ -5908,6 +6224,95 @@ app.use((error, _req, res, _next) => {
 });
 
 
+async function ensureMedicalSafetySchema() {
+  const [instructionColumns] = await pool.execute(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'extracted_instructions'
+       AND COLUMN_NAME IN (
+         'original_title',
+         'original_instruction',
+         'original_timing',
+         'duplicate_of_instruction_id',
+         'duplicate_reason'
+       )`,
+  );
+  const instructionNames = new Set(
+    instructionColumns.map((item) => item.COLUMN_NAME),
+  );
+
+  const instructionAlters = [];
+  if (!instructionNames.has('original_title')) {
+    instructionAlters.push('ADD COLUMN original_title VARCHAR(160) NULL AFTER title');
+  }
+  if (!instructionNames.has('original_instruction')) {
+    instructionAlters.push('ADD COLUMN original_instruction TEXT NULL AFTER instruction');
+  }
+  if (!instructionNames.has('original_timing')) {
+    instructionAlters.push('ADD COLUMN original_timing VARCHAR(160) NULL AFTER timing');
+  }
+  if (!instructionNames.has('duplicate_of_instruction_id')) {
+    instructionAlters.push('ADD COLUMN duplicate_of_instruction_id BIGINT UNSIGNED NULL AFTER safety_note');
+  }
+  if (!instructionNames.has('duplicate_reason')) {
+    instructionAlters.push('ADD COLUMN duplicate_reason VARCHAR(500) NULL AFTER duplicate_of_instruction_id');
+  }
+  if (instructionAlters.length) {
+    await pool.execute(
+      `ALTER TABLE extracted_instructions ${instructionAlters.join(', ')}`,
+    );
+  }
+
+  // Existing rows become their own immutable baseline. Pre-migration edits
+  // cannot be reconstructed, but every edit after this migration is traceable.
+  await pool.execute(
+    `UPDATE extracted_instructions
+     SET original_title = COALESCE(NULLIF(original_title, ''), title),
+         original_instruction = COALESCE(NULLIF(original_instruction, ''), instruction),
+         original_timing = COALESCE(original_timing, timing)
+     WHERE original_title IS NULL
+        OR original_instruction IS NULL
+        OR original_timing IS NULL`,
+  );
+
+  const [scheduleColumns] = await pool.execute(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'care_schedule_items'
+       AND COLUMN_NAME = 'instruction_duration_days'
+     LIMIT 1`,
+  );
+  if (!scheduleColumns.length) {
+    await pool.execute(
+      `ALTER TABLE care_schedule_items
+       ADD COLUMN instruction_duration_days INT UNSIGNED NULL AFTER reason`,
+    );
+  }
+
+  const [existingMedicineSchedules] = await pool.execute(
+    `SELECT s.id, i.instruction, i.timing
+     FROM care_schedule_items s
+     JOIN extracted_instructions i ON i.id = s.instruction_id
+     WHERE s.instruction_duration_days IS NULL
+       AND i.category = 'medicine'`,
+  );
+  for (const row of existingMedicineSchedules) {
+    const days = instructionDurationDays(
+      `${row.instruction || ''} ${row.timing || ''}`,
+    );
+    if (days) {
+      await pool.execute(
+        `UPDATE care_schedule_items
+         SET instruction_duration_days = ?
+         WHERE id = ?`,
+        [days, row.id],
+      );
+    }
+  }
+}
+
 async function ensureAdvancedTaskLifecycleSchema() {
   await pool.execute(
     `CREATE TABLE IF NOT EXISTS care_task_occurrences (
@@ -6031,6 +6436,7 @@ async function startServer() {
   await pool.query('SELECT 1');
   await ensureSetupProgressSchema();
   await ensureRoutineLearningSchema(pool);
+  await ensureMedicalSafetySchema();
   await ensureAdvancedTaskLifecycleSchema();
   await reconcilePlanLifecycle({ db: pool });
   lifecycleInterval = setInterval(() => {
