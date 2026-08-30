@@ -5103,6 +5103,25 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
         res.status(409).json({ success: false, message: 'Choose the plan duration before activation.' });
         return;
       }
+
+      // A completed finite plan can only be reactivated while its selected
+      // plan end date is still valid. This prevents an expired plan from being
+      // silently restarted by an accidental Reactivate tap.
+      if (
+        plan.status === 'completed' &&
+        plan.duration_mode !== 'ongoing'
+      ) {
+        const plannedEnd = dbDateKey(plan.planned_end_date);
+        const today = serverDateKey();
+        if (plannedEnd && plannedEnd < today) {
+          res.status(409).json({
+            success: false,
+            message:
+              'This care plan has already reached its selected end date. Review the plan duration before reactivating it.',
+          });
+          return;
+        }
+      }
       const [instructionRows] = await pool.execute(
         `SELECT review_status
          FROM extracted_instructions WHERE care_plan_id = ?`,
