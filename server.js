@@ -515,7 +515,7 @@ function scheduleItemAppliesOnDate(item, dateKey, plan) {
 }
 
 function taskOccurrenceJson(row) {
-  const occurrenceDate = String(row.occurrence_date || '').slice(0, 10);
+  const occurrenceDate = dbDateKey(row.occurrence_date);
   const scheduledTime = String(row.scheduled_time || '').slice(0, 5);
   const completedTime = String(row.completed_time || '').slice(0, 5);
   return {
@@ -628,7 +628,7 @@ async function recordOccurrenceLearning({ db, row, userId, outcome }) {
       occurrenceId: String(row.id),
       taskId: String(row.schedule_item_id),
       outcome,
-      occurrenceDate: String(row.occurrence_date || '').slice(0, 10),
+      occurrenceDate: dbDateKey(row.occurrence_date),
     },
   });
 }
@@ -5607,7 +5607,7 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
     }
 
     const clientToday = taskOutcomeDate(req.body?.today) || serverDateKey();
-    if (outcome === 'pending' && String(row.occurrence_date).slice(0, 10) < clientToday) {
+    if (outcome === 'pending' && dbDateKey(row.occurrence_date) < clientToday) {
       await connection.rollback();
       return res.status(409).json({
         success: false,
