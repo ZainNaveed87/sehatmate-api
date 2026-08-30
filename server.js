@@ -5555,17 +5555,26 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
   const occurrenceId = req.params.id;
   const outcome = cleanText(req.body?.status, 20).toLowerCase();
   const note = cleanText(req.body?.note, 500);
+  const operationKey = cleanText(req.body?.operationKey, 120);
+  const baseStatus = cleanText(req.body?.baseStatus, 20).toLowerCase();
+
   if (!idPattern.test(occurrenceId) || !['pending', 'completed', 'skipped'].includes(outcome)) {
     return res.status(422).json({ success: false, message: 'Select a valid task outcome.' });
+  }
+  if (baseStatus && !['pending', 'completed', 'skipped', 'missed'].includes(baseStatus)) {
+    return res.status(422).json({ success: false, message: 'Invalid task base status.' });
   }
 
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+
     const [rows] = await connection.execute(
       `SELECT o.id, o.care_plan_id, o.schedule_item_id, o.occurrence_date,
         TIME_FORMAT(o.scheduled_at, '%H:%i') AS scheduled_time,
         o.status, o.completed_at,
+        TIME_FORMAT(o.completed_at, '%H:%i') AS completed_time,
+        o.outcome_source, o.note,
         s.title, s.task_kind, s.display_time, s.recurrence_text, s.grounding
        FROM care_task_occurrences o
        JOIN care_schedule_items s ON s.id = o.schedule_item_id
@@ -5579,40 +5588,82 @@ app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, ne
       return res.status(404).json({ success: false, message: 'Task occurrence not found.' });
     }
 
-    // Use the device-local date supplied by the Flutter client when available.
-    // This avoids UTC/server-midnight allowing an invalid Undo for a past local day.
+    if (operationKey) {
+      const [operations] = await connection.execute(
+        `SELECT id
+         FROM care_task_outcome_operations
+         WHERE user_id = ? AND operation_key = ?
+         LIMIT 1`,
+        [req.auth.userId, operationKey],
+      );
+      if (operations.length) {
+        await connection.commit();
+        return res.json({
+          success: true,
+          message: 'Task outcome was already synchronized.',
+          data: { occurrence: taskOccurrenceJson(row), idempotentReplay: true },
+        });
+      }
+    }
+
     const clientToday = taskOutcomeDate(req.body?.today) || serverDateKey();
     if (outcome === 'pending' && String(row.occurrence_date).slice(0, 10) < clientToday) {
       await connection.rollback();
       return res.status(409).json({
         success: false,
         message: 'A past occurrence cannot be returned to pending. Record what actually happened instead.',
+        data: { occurrence: taskOccurrenceJson(row), conflict: true },
       });
     }
 
-    await connection.execute(
-      `UPDATE care_task_occurrences
-       SET status = ?,
-           completed_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END,
-           outcome_source = 'user', note = ?, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND user_id = ?`,
-      [
-        outcome,
-        outcome === 'completed' ? 1 : 0,
-        note || null,
-        occurrenceId,
-        req.auth.userId,
-      ],
-    );
-
-    await removeOccurrenceLearningSignals(connection, req.auth.userId, occurrenceId);
-    if (outcome === 'completed' || outcome === 'skipped') {
-      await recordOccurrenceLearning({
-        db: connection,
-        row,
-        userId: req.auth.userId,
-        outcome,
+    if (baseStatus && row.status !== baseStatus && row.status !== outcome) {
+      await connection.rollback();
+      return res.status(409).json({
+        success: false,
+        message: 'This task changed on another device. The latest server outcome was kept.',
+        data: { occurrence: taskOccurrenceJson(row), conflict: true },
       });
+    }
+
+    if (row.status !== outcome || (note || '') !== (row.note || '')) {
+      await connection.execute(
+        `UPDATE care_task_occurrences
+         SET status = ?,
+             completed_at = CASE
+               WHEN ? = 1 AND status <> 'completed' THEN CURRENT_TIMESTAMP
+               WHEN ? = 1 THEN completed_at
+               ELSE NULL
+             END,
+             outcome_source = 'user', note = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`,
+        [
+          outcome,
+          outcome === 'completed' ? 1 : 0,
+          outcome === 'completed' ? 1 : 0,
+          note || null,
+          occurrenceId,
+          req.auth.userId,
+        ],
+      );
+
+      await removeOccurrenceLearningSignals(connection, req.auth.userId, occurrenceId);
+      if (outcome === 'completed' || outcome === 'skipped') {
+        await recordOccurrenceLearning({
+          db: connection,
+          row,
+          userId: req.auth.userId,
+          outcome,
+        });
+      }
+    }
+
+    if (operationKey) {
+      await connection.execute(
+        `INSERT IGNORE INTO care_task_outcome_operations
+          (user_id, occurrence_id, operation_key, outcome)
+         VALUES (?, ?, ?, ?)`,
+        [req.auth.userId, occurrenceId, operationKey, outcome],
+      );
     }
 
     await connection.commit();
@@ -5883,6 +5934,29 @@ async function ensureAdvancedTaskLifecycleSchema() {
       CONSTRAINT care_task_occurrence_schedule_fk
         FOREIGN KEY (schedule_item_id) REFERENCES care_schedule_items (id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  );
+
+  await pool.execute(
+    `CREATE TABLE IF NOT EXISTS care_task_outcome_operations (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id BIGINT UNSIGNED NOT NULL,
+      occurrence_id BIGINT UNSIGNED NOT NULL,
+      operation_key VARCHAR(120) NOT NULL,
+      outcome VARCHAR(20) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY care_task_outcome_operation_key_unique (user_id, operation_key),
+      KEY care_task_outcome_operation_occurrence_idx (occurrence_id, created_at),
+      CONSTRAINT care_task_outcome_operation_user_fk
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+      CONSTRAINT care_task_outcome_operation_occurrence_fk
+        FOREIGN KEY (occurrence_id) REFERENCES care_task_occurrences (id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  );
+
+  await pool.execute(
+    `DELETE FROM care_task_outcome_operations
+     WHERE created_at < DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 90 DAY)`,
   );
 
   await pool.execute(
