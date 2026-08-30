@@ -4535,11 +4535,24 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
 
     const activationAllowed = blockers.length === 0;
 
+    const simulationStatus =
+      blockers.length > 0 || atRisk > 0 ? 'needs_attention' : 'reality_check';
+
+    // Simulation is allowed to update setup-state plans, but it must never
+    // silently deactivate an already active plan (or reopen a completed one).
+    // Active-plan edits can change readiness/Care Gaps while the lifecycle
+    // status remains active until the user explicitly completes the plan.
     await pool.execute(
-      'UPDATE care_plans SET readiness_score = ?, status = ? WHERE id = ? AND user_id = ?',
+      `UPDATE care_plans
+       SET readiness_score = ?,
+           status = CASE
+             WHEN status IN ('active', 'completed') THEN status
+             ELSE ?
+           END
+       WHERE id = ? AND user_id = ?`,
       [
         readiness,
-        blockers.length > 0 || atRisk > 0 ? 'needs_attention' : 'reality_check',
+        simulationStatus,
         planId,
         req.auth.userId,
       ],
