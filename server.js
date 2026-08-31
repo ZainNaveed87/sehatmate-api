@@ -50,6 +50,11 @@ import {
   targetTasksForRealityQuestion,
 } from './reality_check_decision.js';
 
+import {
+  applyVerifiedExactTimesToScheduleItems,
+  extractVerifiedExactClockTimes,
+} from './schedule_time_guard.js';
+
 const requiredEnvironment = [
   'DB_HOST',
   'DB_NAME',
@@ -1286,13 +1291,22 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
   for (const [instructionId, items] of grouped.entries()) {
     const instruction = instructionById.get(instructionId);
     const expectedCount = explicitDailyFrequencyCount(instruction);
+    const guardedItems = applyVerifiedExactTimesToScheduleItems(
+      items,
+      instruction,
+      expectedCount,
+    );
 
     if (!expectedCount) {
-      output.push(...items);
+      output.push(...guardedItems);
       continue;
     }
 
-    const currentPeriods = items
+    const hasVerifiedExactTime = guardedItems.some(
+      (item) => item.grounding === 'explicit' && Boolean(item.time),
+    );
+
+    const currentPeriods = guardedItems
       .map((item) =>
         schedulePeriodKey(`${item.displayTime || ''} ${item.recurrence || ''}`),
       )
@@ -1307,6 +1321,7 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
     // Afternoons), normalize the reminder slots to distinct periods so the
     // user can confirm one exact time for each slot.
     const shouldNormalizePeriods =
+      !hasVerifiedExactTime &&
       defaultPeriods.length === expectedCount &&
       distinctCurrentPeriods.length < expectedCount;
 
@@ -1321,11 +1336,11 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
         if (desiredPeriods.length === expectedCount) break;
       }
 
-      const base = items[0];
+      const base = guardedItems[0];
       if (!base) continue;
 
       for (let index = 0; index < expectedCount; index += 1) {
-        const source = items[index] || base;
+        const source = guardedItems[index] || base;
         const period = desiredPeriods[index] || defaultPeriods[index];
         const label = periodDisplayLabel(period);
 
@@ -1350,22 +1365,22 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
 
     // If AI returned too many rows but the periods are already sensible, keep
     // only the number required by the verified daily frequency.
-    if (items.length > expectedCount) {
-      output.push(...items.slice(0, expectedCount));
+    if (guardedItems.length > expectedCount) {
+      output.push(...guardedItems.slice(0, expectedCount));
       continue;
     }
 
     // If AI returned too few rows for a plain verified frequency, create the
     // missing reminder slots as confirmable organizational periods.
     if (
-      items.length < expectedCount &&
+      guardedItems.length < expectedCount &&
       defaultPeriods.length === expectedCount
     ) {
-      const base = items[0];
+      const base = guardedItems[0];
       if (!base) continue;
 
       for (let index = 0; index < expectedCount; index += 1) {
-        const source = items[index] || base;
+        const source = guardedItems[index] || base;
         const period = defaultPeriods[index];
         const label = periodDisplayLabel(period);
 
@@ -1388,7 +1403,7 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
       continue;
     }
 
-    output.push(...items);
+    output.push(...guardedItems);
   }
 
   return output;
@@ -4041,6 +4056,35 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
       res.status(404).json({ success: false, message: 'Schedule item not found.' });
       return;
     }
+
+    const verifiedExactTimes = extractVerifiedExactClockTimes(rows[0]);
+    if (rows[0].grounding === 'explicit' && verifiedExactTimes.length > 0) {
+      const storedTime = String(rows[0].schedule_time || '').slice(0, 5);
+      const allowedTimes = verifiedExactTimes.map((item) => item.time.slice(0, 5));
+      const lockedTime = allowedTimes.includes(storedTime)
+        ? storedTime
+        : (allowedTimes.length === 1 ? allowedTimes[0] : null);
+
+      if ((lockedTime && scheduleTime !== lockedTime) || (!lockedTime && !allowedTimes.includes(scheduleTime))) {
+        const writtenTime = verifiedExactTimes
+          .map((item) => item.displayTime)
+          .join(' / ');
+        res.status(409).json({
+          success: false,
+          message:
+            `This reminder time is fixed by the verified instruction (${writtenTime}). ` +
+            'SehatMate did not change it.',
+          data: {
+            medicalTimingConflict: true,
+            exactTimeLocked: true,
+            allowedTimes,
+            selectedTime: scheduleTime,
+          },
+        });
+        return;
+      }
+    }
+
     // Prefer the period the user is saving now. Falling back to the stored
     // display_time keeps older clients compatible, but does not let a stale
     // AI-generated "Evening" label override a user-edited "Night" period.
