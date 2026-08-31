@@ -9,7 +9,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "migrate:care-gaps": "node migrate_care_gaps.js",
-    "test:reality-layer1": "node reality_check_layer1_test.js"
+    "test:reality-layer1": "node reality_check_layer1_test.js",
+    "test:reality-layer2": "node reality_check_layer2_test.js"
   },
   "engines": {
     "node": ">=20"

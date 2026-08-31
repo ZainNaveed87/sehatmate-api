@@ -36,6 +36,10 @@ import {
   updateRoutineProfile,
 } from './routine_learning.js';
 
+import {
+  ensureRealityCheckPersistenceSchema,
+} from './reality_check_store.js';
+
 const requiredEnvironment = [
   'DB_HOST',
   'DB_NAME',
@@ -6513,6 +6517,7 @@ async function startServer() {
   await pool.query('SELECT 1');
   await ensureSetupProgressSchema();
   await ensureRoutineLearningSchema(pool);
+  await ensureRealityCheckPersistenceSchema(pool);
   await ensureMedicalSafetySchema();
   await ensureAdvancedTaskLifecycleSchema();
   await reconcilePlanLifecycle({ db: pool });
