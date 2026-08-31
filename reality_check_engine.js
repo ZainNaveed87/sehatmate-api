@@ -135,12 +135,28 @@ function parseClockMinutes(value) {
   return results;
 }
 
-function targetContextForQuestion({ targetTaskIds, tasks, instructions }) {
+function normalizedTitle(value) {
+  return normalizedClinicalText(value)
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function targetDetailsForQuestion({ targetTaskIds, tasks, instructions }) {
   const targetSet = new Set(targetTaskIds.map(String));
   const targetTasks = tasks.filter((task) => targetSet.has(taskIdOf(task)));
   const instructionIds = new Set(targetTasks.map(instructionIdOf).filter(Boolean));
-  const targetInstructions = instructions.filter((item) =>
-    instructionIds.has(instructionIdOfInstruction(item)));
+  const taskTitles = targetTasks.map((task) => normalizedTitle(task?.title)).filter(Boolean);
+
+  const targetInstructions = instructions.filter((item) => {
+    if (instructionIds.has(instructionIdOfInstruction(item))) return true;
+    const instructionTitle = normalizedTitle(item?.title);
+    if (!instructionTitle) return false;
+    return taskTitles.some((taskTitle) =>
+      taskTitle === instructionTitle ||
+      taskTitle.includes(instructionTitle) ||
+      instructionTitle.includes(taskTitle));
+  });
 
   const verifiedText = targetInstructions
     .map((item) => `${item?.title || ''} ${item?.instruction || ''} ${item?.timing || ''}`)
@@ -150,8 +166,137 @@ function targetContextForQuestion({ targetTaskIds, tasks, instructions }) {
     .join(' ');
 
   return {
+    targetTasks,
+    targetInstructions,
     verifiedText: normalizedClinicalText(verifiedText),
     taskText: normalizedClinicalText(taskText),
+  };
+}
+
+function displayClockTime(task) {
+  const visible = cleanText(task?.displayTime ?? task?.display_time, 80);
+  const visibleMatch = visible.match(/\b(1[0-2]|0?[1-9]):([0-5]\d)\s*(AM|PM)\b/i);
+  if (visibleMatch) return `${Number(visibleMatch[1])}:${visibleMatch[2]} ${visibleMatch[3].toUpperCase()}`;
+
+  const raw = cleanText(task?.scheduleTime ?? task?.schedule_time, 20);
+  const match = raw.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+  if (!match) return '';
+  let hour = Number(match[1]);
+  const minute = match[2];
+  const suffix = hour >= 12 ? 'PM' : 'AM';
+  hour %= 12;
+  if (hour === 0) hour = 12;
+  return `${hour}:${minute} ${suffix}`;
+}
+
+function readableScheduleDate(task) {
+  const raw = cleanText(task?.scheduleDate ?? task?.schedule_date, 20);
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return '';
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    timeZone: 'UTC',
+  }).format(date);
+}
+
+function verifiedMealRelation(verifiedText) {
+  const relations = [
+    'before breakfast', 'after breakfast',
+    'before lunch', 'after lunch',
+    'before dinner', 'after dinner',
+    'before food', 'after food', 'with food', 'without food',
+  ];
+  return relations.find((value) => verifiedText.includes(value)) || '';
+}
+
+function hasTemporalIntensifier(question) {
+  return /\b(?:right|immediately|directly|straight|just)\s+(?:before|after)\b/i.test(question);
+}
+
+function isOpenEndedTimeQuestion(question) {
+  return /^\s*(?:what\s+time|when)\b/i.test(question) ||
+    /\bwhat\s+time\s+do\s+you\b/i.test(question);
+}
+
+function hasCompoundPracticalQuestion(question) {
+  return /[,;]?\s+and\s+(?:can|could|do|does|are|is|will|would|have|has)\s+you\b/i.test(question);
+}
+
+function replaceGenericSingleTargetLabel(question, targetTasks) {
+  if (targetTasks.length !== 1) return question;
+  const title = cleanText(targetTasks[0]?.title, 180);
+  if (!title) return question;
+  return question.replace(
+    /\bthe\s+(?:first|second|third|fourth|fifth|sixth)\s+(?:medication|medicine|task)\b/gi,
+    title,
+  );
+}
+
+function canonicalizeQuestionCandidate({
+  intent,
+  question,
+  reasonForAsking,
+  targetTaskIds,
+  tasks,
+  instructions,
+}) {
+  const details = targetDetailsForQuestion({ targetTaskIds, tasks, instructions });
+  const singleTask = details.targetTasks.length === 1 ? details.targetTasks[0] : null;
+  const title = cleanText(singleTask?.title, 180);
+  const time = displayClockTime(singleTask);
+  const date = readableScheduleDate(singleTask);
+  const mealRelation = verifiedMealRelation(details.verifiedText);
+
+  let safeQuestion = replaceGenericSingleTargetLabel(question, details.targetTasks);
+  let safeReason = reasonForAsking;
+
+  if (
+    intent === 'meal_routine' &&
+    singleTask &&
+    mealRelation &&
+    time &&
+    (
+      hasTemporalIntensifier(safeQuestion) ||
+      asksForAlternativeTimingChoice(safeQuestion) ||
+      isOpenEndedTimeQuestion(safeQuestion) ||
+      /\b(?:a|any)\s+meal\b/i.test(safeQuestion)
+    )
+  ) {
+    const meal = mealRelation.split(' ').at(-1);
+    if (mealRelation.startsWith('after ')) {
+      safeQuestion = `Is your ${meal} usually finished by ${time} so ${title} can be taken ${mealRelation}?`;
+    } else if (mealRelation.startsWith('before ')) {
+      safeQuestion = `Is ${time} usually before your ${meal} so ${title} can be taken ${mealRelation}?`;
+    } else {
+      safeQuestion = `Does your usual routine around ${time} allow ${title} to be taken ${mealRelation}?`;
+    }
+    safeReason = `The verified instruction says ${title} should be taken ${mealRelation}, and the reminder is set for ${time}; this checks whether the routine aligns with that instruction.`;
+  }
+
+  if (intent === 'sleep_routine' && singleTask && time && isOpenEndedTimeQuestion(safeQuestion)) {
+    safeQuestion = `Is ${time} usually close to your bedtime?`;
+    safeReason = `The verified instruction uses bedtime, and the reminder is set for ${time}; this checks whether that reminder matches your usual bedtime routine.`;
+  }
+
+  if (
+    intent === 'appointment_availability' &&
+    singleTask &&
+    (hasCompoundPracticalQuestion(safeQuestion) || /\b(?:transport|transportation|travel|ride)\b/i.test(safeQuestion))
+  ) {
+    const when = [date, time].filter(Boolean).join(' at ');
+    safeQuestion = when
+      ? `Are you available for ${title} on ${when}?`
+      : `Are you available for ${title} at its scheduled time?`;
+    safeReason = `The follow-up has a stated schedule, so your availability for that appointment needs to be confirmed separately from transport or other access needs.`;
+  }
+
+  return {
+    question: cleanText(safeQuestion, 240),
+    reasonForAsking: cleanText(safeReason, 320),
   };
 }
 
@@ -166,13 +311,17 @@ function hasVerifiedMeaningDrift({
   // The explanation may repeat the correct source phrase and must never be
   // allowed to mask broader wording inside the question.
   const candidate = normalizedClinicalText(question);
-  const { verifiedText, taskText } = targetContextForQuestion({
+  const { verifiedText, taskText } = targetDetailsForQuestion({
     targetTaskIds,
     tasks,
     instructions,
   });
 
   if (!verifiedText) return false;
+
+  // Do not let the model narrow a simple before/after instruction into an
+  // "immediately/right/directly" requirement that was never verified.
+  if (hasTemporalIntensifier(candidate)) return true;
 
   // Food / routine anchors are safety-critical. A model may omit the anchor,
   // but if it refers to it using a broader substitute, reject the question.
@@ -336,17 +485,12 @@ export function normalizeRealityCheckQuestionCandidates({
     if (questions.length >= safeLimit) break;
 
     const intent = cleanText(candidate?.intent, 60).toLowerCase();
-    const question = cleanText(candidate?.question, 240);
+    let question = cleanText(candidate?.question, 240);
     const period = cleanText(candidate?.period, 20).toLowerCase();
-    const reasonForAsking = cleanText(candidate?.reasonForAsking, 320);
+    let reasonForAsking = cleanText(candidate?.reasonForAsking, 320);
 
     if (!allowedIntents.has(intent)) continue;
     if (!allowedPeriods.has(period)) continue;
-    if (question.length < 8 || !question.endsWith('?')) continue;
-    if (!reasonForAsking) continue;
-    if (hasUnsafeClinicalLanguage(`${question} ${reasonForAsking}`)) continue;
-    if (hasUnnecessarySensitiveRequest(question)) continue;
-    if (asksForAlternativeTimingChoice(question)) continue;
 
     const rawTargets = Array.isArray(candidate?.targetTaskIds)
       ? candidate.targetTaskIds
@@ -359,6 +503,25 @@ export function normalizeRealityCheckQuestionCandidates({
     // Grounding is mandatory. The model cannot create a general lifestyle
     // interview question that is unrelated to this verified care plan.
     if (targetTaskIds.length === 0) continue;
+
+    const canonical = canonicalizeQuestionCandidate({
+      intent,
+      question,
+      reasonForAsking,
+      targetTaskIds,
+      tasks,
+      instructions,
+    });
+    question = canonical.question;
+    reasonForAsking = canonical.reasonForAsking;
+
+    if (question.length < 8 || !question.endsWith('?')) continue;
+    if (!reasonForAsking) continue;
+    if (hasUnsafeClinicalLanguage(`${question} ${reasonForAsking}`)) continue;
+    if (hasUnnecessarySensitiveRequest(question)) continue;
+    if (asksForAlternativeTimingChoice(question)) continue;
+    if (isOpenEndedTimeQuestion(question)) continue;
+    if (hasCompoundPracticalQuestion(question)) continue;
 
     if (hasVerifiedMeaningDrift({
       question,

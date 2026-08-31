@@ -5,7 +5,7 @@ import {
   REALITY_CHECK_MAX_QUESTIONS,
 } from './reality_check_engine.js';
 
-export const REALITY_CHECK_GENERATOR_VERSION = 'reality-ai-v2-wording-safety';
+export const REALITY_CHECK_GENERATOR_VERSION = 'reality-ai-v3-question-contract';
 
 function cleanText(value, maxLength = 500) {
   return typeof value === 'string'

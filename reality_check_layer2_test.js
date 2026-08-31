@@ -60,4 +60,4 @@ assert.notEqual(
 console.log('Reality Check Layer 2 persistence/versioning tests passed.');
 
 const storeModule = await import('./reality_check_store.js');
-assert.equal(storeModule.REALITY_CHECK_GENERATOR_VERSION, 'reality-ai-v2-wording-safety');
+assert.equal(storeModule.REALITY_CHECK_GENERATOR_VERSION, 'reality-ai-v3-question-contract');
