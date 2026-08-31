@@ -4513,6 +4513,7 @@ app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next
 app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
+  const requestedQuestionSetVersion = Number(req.body?.questionSetVersion || 0);
   if (!idPattern.test(planId) || !answers.length) {
     return res.status(422).json({
       success: false,
@@ -4549,6 +4550,18 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
       createIfMissing: false,
     });
     const byKey = new Map(reality.templates.map((item) => [item.key, item]));
+
+    if (
+      requestedQuestionSetVersion > 0 &&
+      reality.questionSet?.version &&
+      requestedQuestionSetVersion !== Number(reality.questionSet.version)
+    ) {
+      return res.status(409).json({
+        success: false,
+        message:
+          'Your Reality Check was refreshed after this screen was opened. Reopen the Reality Check before saving these answers.',
+      });
+    }
 
     await connection.beginTransaction();
     transactionStarted = true;
