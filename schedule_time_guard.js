@@ -117,6 +117,16 @@ export function extractVerifiedExactClockTimes(instruction = {}) {
   return candidates;
 }
 
+
+export function isVerifiedExactScheduleItemLocked(scheduleItem = {}) {
+  const grounding = normalizeSpace(scheduleItem.grounding).toLowerCase();
+  const storedTime = normalizeSpace(
+    scheduleItem.schedule_time || scheduleItem.scheduleTime || scheduleItem.time,
+  );
+  if (grounding !== 'explicit' || !storedTime) return false;
+  return extractVerifiedExactClockTimes(scheduleItem).length > 0;
+}
+
 /**
  * Reconcile AI schedule rows with exact times copied from a verified source.
  * Exact source facts always win over an organisational Morning/Afternoon label.

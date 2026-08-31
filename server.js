@@ -53,6 +53,7 @@ import {
 import {
   applyVerifiedExactTimesToScheduleItems,
   extractVerifiedExactClockTimes,
+  isVerifiedExactScheduleItemLocked,
 } from './schedule_time_guard.js';
 
 const requiredEnvironment = [
@@ -4058,31 +4059,24 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
     }
 
     const verifiedExactTimes = extractVerifiedExactClockTimes(rows[0]);
-    if (rows[0].grounding === 'explicit' && verifiedExactTimes.length > 0) {
-      const storedTime = String(rows[0].schedule_time || '').slice(0, 5);
+    if (isVerifiedExactScheduleItemLocked(rows[0]) && verifiedExactTimes.length > 0) {
       const allowedTimes = verifiedExactTimes.map((item) => item.time.slice(0, 5));
-      const lockedTime = allowedTimes.includes(storedTime)
-        ? storedTime
-        : (allowedTimes.length === 1 ? allowedTimes[0] : null);
-
-      if ((lockedTime && scheduleTime !== lockedTime) || (!lockedTime && !allowedTimes.includes(scheduleTime))) {
-        const writtenTime = verifiedExactTimes
-          .map((item) => item.displayTime)
-          .join(' / ');
-        res.status(409).json({
-          success: false,
-          message:
-            `This reminder time is fixed by the verified instruction (${writtenTime}). ` +
-            'SehatMate did not change it.',
-          data: {
-            medicalTimingConflict: true,
-            exactTimeLocked: true,
-            allowedTimes,
-            selectedTime: scheduleTime,
-          },
-        });
-        return;
-      }
+      const writtenTime = verifiedExactTimes
+        .map((item) => item.displayTime)
+        .join(' / ');
+      res.status(409).json({
+        success: false,
+        message:
+          `This reminder time is fixed by the verified instruction (${writtenTime}). ` +
+          'It cannot be edited from the schedule screen.',
+        data: {
+          medicalTimingConflict: true,
+          exactTimeLocked: true,
+          allowedTimes,
+          selectedTime: scheduleTime,
+        },
+      });
+      return;
     }
 
     // Prefer the period the user is saving now. Falling back to the stored
@@ -5254,6 +5248,10 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
           END
         ) AS note,
         task_kind, display_time, recurrence_text, grounding,
+        CASE
+          WHEN grounding = 'explicit' AND schedule_time IS NOT NULL THEN 1
+          ELSE 0
+        END AS time_locked,
         instruction_duration_days,
         CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
         NULL AS completed_at

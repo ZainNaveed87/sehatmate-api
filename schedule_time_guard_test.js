@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   applyVerifiedExactTimesToScheduleItems,
   extractVerifiedExactClockTimes,
+  isVerifiedExactScheduleItemLocked,
 } from './schedule_time_guard.js';
 
 const betaInstruction = {
@@ -54,5 +55,27 @@ const appointment = extractVerifiedExactClockTimes({
 assert.deepEqual(appointment, [
   { time: '10:00:00', displayTime: '10:00 AM' },
 ]);
+
+
+assert.equal(isVerifiedExactScheduleItemLocked({
+  grounding: 'explicit',
+  schedule_time: '14:00',
+  instruction: betaInstruction.instruction,
+  timing: betaInstruction.timing,
+}), true);
+
+assert.equal(isVerifiedExactScheduleItemLocked({
+  grounding: 'suggested',
+  schedule_time: '14:00',
+  instruction: betaInstruction.instruction,
+  timing: betaInstruction.timing,
+}), false);
+
+assert.equal(isVerifiedExactScheduleItemLocked({
+  grounding: 'explicit',
+  schedule_time: '22:30',
+  instruction: 'Take 1 tablet once daily at bedtime.',
+  timing: 'bedtime',
+}), false);
 
 console.log('Explicit schedule time guard tests passed.');
