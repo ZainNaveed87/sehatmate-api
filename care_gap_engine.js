@@ -1,3 +1,5 @@
+import { matchRealityAnswersToTemplates } from './reality_check_decision.js';
+
 const CARE_GAP_COLUMNS = `id, care_plan_id, task_id, category, gap_type, title, status,
   severity, lifecycle_status, when_text, summary, instruction_snapshot,
   patient_reality, reason, next_step, resolution_note, resolved_at,
@@ -127,6 +129,12 @@ export function careGapAction(gap) {
         label: resolved ? 'View Calendar' : 'Review Overdue Task',
         carePlanTab: null,
       };
+    case 'practical_fit':
+      return {
+        type: 'reality_check',
+        label: resolved ? 'View Reality Check' : 'Review Reality Check',
+        carePlanTab: null,
+      };
     default:
       return {
         type: 'care_plan',
@@ -213,6 +221,16 @@ function careGapResolution(gap) {
           'Return to Care Gaps and refresh the check.',
         ],
       };
+    case 'practical_fit':
+      return {
+        title: 'How to review this practical gap',
+        steps: [
+          'Open Reality Check and review the saved practical answer.',
+          'Review access, reminders, routine, transport, or support that could make the task more reliable.',
+          'Do not change an explicit verified medical timing, dose, frequency, or treatment instruction yourself.',
+          'If the verified instruction cannot be followed in practice, contact the relevant healthcare professional for guidance.',
+        ],
+      };
     default:
       return {
         title: 'How to resolve this gap',
@@ -278,7 +296,8 @@ async function realityRequirementTemplates({
 }) {
   try {
     const [rows] = await db.execute(
-      `SELECT q.question_key, q.question_text
+      `SELECT q.question_key, q.question_text, q.intent, q.category,
+              q.response_profile, q.target_task_ids_json, q.period
        FROM care_reality_questions q
        WHERE q.question_set_id = (
          SELECT s.id
@@ -294,10 +313,24 @@ async function realityRequirementTemplates({
       [planId, userId],
     );
     if (rows.length > 0) {
-      return rows.map((row) => ({
-        key: row.question_key,
-        question: row.question_text,
-      }));
+      return rows.map((row) => {
+        let targetTaskIds = [];
+        try {
+          const parsed = JSON.parse(row.target_task_ids_json || '[]');
+          if (Array.isArray(parsed)) targetTaskIds = parsed.map(String);
+        } catch (_) {
+          targetTaskIds = [];
+        }
+        return {
+          key: row.question_key,
+          question: row.question_text,
+          intent: row.intent || '',
+          category: row.category || 'Practical fit',
+          responseProfile: row.response_profile || 'feasibility',
+          targetTaskIds,
+          period: row.period || 'any',
+        };
+      });
     }
   } catch (error) {
     if (error?.code !== 'ER_NO_SUCH_TABLE') throw error;
@@ -330,7 +363,7 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
     [planId, userId],
   );
   const [answers] = await db.execute(
-    `SELECT question_key, selected_answer, risk_points, note
+    `SELECT question_key, category, question_text, selected_answer, risk_points, note
      FROM care_reality_answers WHERE care_plan_id = ? AND user_id = ?`,
     [planId, userId],
   );
@@ -476,10 +509,8 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
     tasks,
     realityQuestionTemplates,
   });
-  const answeredKeys = new Set(answers.map((item) => item.question_key));
-  const missingRealityQuestions = templates.filter(
-    (template) => !answeredKeys.has(template.key),
-  );
+  const realityResolution = matchRealityAnswersToTemplates(answers, templates);
+  const missingRealityQuestions = realityResolution.unansweredTemplates;
 
   if (missingRealityQuestions.length > 0) {
     const count = missingRealityQuestions.length;
@@ -512,6 +543,51 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
       sourceKey: 'reality:missing_answers',
       sourceKind: 'reality_check',
       sourceId: planId,
+    });
+  }
+
+  for (const { template, answer } of realityResolution.matches) {
+    const riskPoints = Number(answer?.risk_points || 0);
+    if (!(riskPoints > 0)) continue;
+
+    const targetIds = new Set(
+      Array.isArray(template?.targetTaskIds)
+        ? template.targetTaskIds.map(String)
+        : [],
+    );
+    const targetTasks = tasks.filter((task) => targetIds.has(String(task.id)));
+    const targetTitle = targetTasks.length === 1
+      ? text(targetTasks[0].title, 160)
+      : targetTasks.length > 1
+          ? targetTasks.map((task) => text(task.title, 80)).filter(Boolean).join(', ')
+          : '';
+    const answerText = answer.selected_answer === '__custom__'
+      ? text(answer.note, 500)
+      : text(answer.selected_answer, 500);
+    const hasExplicitTiming = targetTasks.some(
+      (task) => text(task.reason, 400).toLowerCase().includes('verified') &&
+        /exact clock time|exact time|explicit/i.test(text(task.reason, 400)),
+    );
+
+    addGap(desired, {
+      category: 'Practical fit',
+      gapType: 'practical_fit',
+      title: targetTitle
+        ? `${targetTitle} has a practical routine conflict`
+        : 'A Reality Check answer shows a practical routine conflict',
+      severity: 'attention',
+      legacyStatus: 'at_risk',
+      whenText: targetTasks.length === 1 ? scheduleLabel(targetTasks[0]) : null,
+      summary: 'A saved Reality Check answer shows that this part of the care plan may be difficult to follow reliably in the current routine.',
+      patientReality: answerText || 'The saved Reality Check answer indicates a practical mismatch.',
+      reason: text(template.question, 500) || 'The current routine does not fully fit this care-plan step.',
+      nextStep: hasExplicitTiming
+        ? 'Review practical access, reminders, or support while keeping the verified exact medical timing unchanged. If the verified timing cannot be followed, contact the relevant healthcare professional rather than changing it yourself.'
+        : 'Review the practical setup and reminder timing within the verified instruction. Keep the medical instruction unchanged.',
+      sourceKey: `reality:${text(template.key, 80)}:practical_fit`,
+      sourceKind: 'reality_check',
+      sourceId: text(template.key, 80) || planId,
+      dueAt: targetTasks.length === 1 ? dueDate(targetTasks[0]) : null,
     });
   }
 

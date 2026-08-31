@@ -47,6 +47,7 @@ import {
   actionForRealityIntent,
   dynamicQuestionToDecisionTemplate,
   legacyTemplateToDecisionTemplate,
+  matchRealityAnswersToTemplates,
   riskPointsForRealityAnswer,
   targetTasksForRealityQuestion,
 } from './reality_check_decision.js';
@@ -4986,7 +4987,6 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       createIfMissing: false,
     });
     const templates = reality.templates;
-    const templateByKey = new Map(templates.map((item) => [item.key, item]));
     const routineProfile = await readRoutineProfile(pool, req.auth.userId);
 
     const [decisionRows] = await pool.execute(
@@ -5010,12 +5010,9 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       });
     }
 
-    const answeredKeys = new Set(answers.map((item) => item.question_key));
-    const unanswered = templates.filter((template) => !answeredKeys.has(template.key)).length;
-    const evaluatedAnswers = answers
-      .filter((item) => templateByKey.has(item.question_key))
-      .map((item) => {
-      const template = templateByKey.get(item.question_key);
+    const answerResolution = matchRealityAnswersToTemplates(answers, templates);
+    const unanswered = answerResolution.unansweredTemplates.length;
+    const evaluatedAnswers = answerResolution.matches.map(({ answer: item, template, matchedBy }) => {
       const option = template?.options.find(
         (candidate) => candidate.label === item.selected_answer,
       );
@@ -5028,7 +5025,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
         routineProfile,
         taskDecisions,
       );
-      return { item, template, option, riskPoints, adaptation };
+      return { item, template, option, riskPoints, adaptation, matchedBy };
     });
 
     // Older builds could leave a stale risk_points value in the database even
@@ -5063,9 +5060,27 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       (sum, { riskPoints }) => sum + riskPoints,
       0,
     );
-    const unclear = tasks.filter((item) => Boolean(item.requires_confirmation)).length;
-    const atRisk = unresolvedRiskAnswers.length;
-    const ready = Math.max(0, tasks.length - unclear);
+    const unclearTaskIds = new Set(
+      tasks
+        .filter((item) => Boolean(item.requires_confirmation))
+        .map((item) => String(item.id)),
+    );
+    const atRiskTaskIds = new Set();
+    let nonTaskRiskCount = 0;
+    for (const evaluated of unresolvedRiskAnswers) {
+      const targets = targetTasksForRealityQuestion(evaluated.template, tasks);
+      if (targets.length === 0) {
+        nonTaskRiskCount += 1;
+        continue;
+      }
+      for (const task of targets) atRiskTaskIds.add(String(task.id));
+    }
+    const unclear = unclearTaskIds.size;
+    const atRisk = atRiskTaskIds.size + nonTaskRiskCount;
+    const ready = tasks.filter((item) => {
+      const id = String(item.id);
+      return !unclearTaskIds.has(id) && !atRiskTaskIds.has(id);
+    }).length;
     const readiness = Math.max(
       0,
       Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)),
@@ -5186,15 +5201,31 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
           ready,
           unclear,
         },
-        tasks: tasks.map((item) => ({
-          ...item,
-          id: String(item.id),
-          status: item.requires_confirmation ? 'unclear' : 'ready',
-        })),
+        tasks: tasks.map((item) => {
+          const id = String(item.id);
+          const status = unclearTaskIds.has(id)
+            ? 'unclear'
+            : atRiskTaskIds.has(id)
+                ? 'at_risk'
+                : 'ready';
+          return {
+            ...item,
+            id,
+            status,
+          };
+        }),
         findings,
         adaptations,
         blockers,
         unanswered,
+        realityDiagnostics: {
+          currentQuestionCount: templates.length,
+          storedAnswerCount: answers.length,
+          matchedAnswerCount: answerResolution.matches.length,
+          recoveredByQuestionText: answerResolution.matches.filter(
+            (item) => item.matchedBy === 'question_text',
+          ).length,
+        },
         careGaps: {
           summary: gapSummary,
           items: careGapRows

@@ -191,3 +191,77 @@ export function targetTasksForRealityQuestion(template, tasks = []) {
   if (ids.size > 0) return tasks.filter((task) => ids.has(taskId(task)));
   return tasks.filter((task) => legacyTargetIds(clean(template?.key, 80), [task]).length > 0);
 }
+
+
+function comparableQuestionText(value) {
+  return clean(value, 500)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Match saved answers to the current Reality Check templates.
+ * Exact question_key is authoritative. As a safe recovery path for rows written
+ * by an older generator build, an answer may be matched by exact normalized
+ * question text when that text uniquely identifies one current template.
+ */
+export function matchRealityAnswersToTemplates(answers = [], templates = []) {
+  const answerRows = Array.isArray(answers) ? answers : [];
+  const templateRows = Array.isArray(templates) ? templates : [];
+
+  const byKey = new Map();
+  for (const answer of answerRows) {
+    const key = clean(answer?.question_key ?? answer?.key, 80);
+    if (key && !byKey.has(key)) byKey.set(key, answer);
+  }
+
+  const textBuckets = new Map();
+  for (const answer of answerRows) {
+    const normalized = comparableQuestionText(
+      answer?.question_text ?? answer?.question ?? '',
+    );
+    if (!normalized) continue;
+    const bucket = textBuckets.get(normalized) || [];
+    bucket.push(answer);
+    textBuckets.set(normalized, bucket);
+  }
+
+  const usedAnswers = new Set();
+  const matches = [];
+  const unansweredTemplates = [];
+
+  for (const template of templateRows) {
+    const key = clean(template?.key ?? template?.question_key, 80);
+    let answer = key ? byKey.get(key) : null;
+    let matchedBy = answer ? 'key' : '';
+
+    if (!answer) {
+      const normalized = comparableQuestionText(
+        template?.question ?? template?.question_text ?? '',
+      );
+      const candidates = (textBuckets.get(normalized) || []).filter(
+        (candidate) => !usedAnswers.has(candidate),
+      );
+      if (candidates.length === 1) {
+        answer = candidates[0];
+        matchedBy = 'question_text';
+      }
+    }
+
+    if (!answer) {
+      unansweredTemplates.push(template);
+      continue;
+    }
+
+    usedAnswers.add(answer);
+    matches.push({ template, answer, matchedBy });
+  }
+
+  return {
+    matches,
+    unansweredTemplates,
+    unmatchedAnswers: answerRows.filter((answer) => !usedAnswers.has(answer)),
+  };
+}
