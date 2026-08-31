@@ -80,6 +80,166 @@ function hasUnnecessarySensitiveRequest(question) {
     /\b(?:password|passcode|pin number|national id|cnic|passport number|bank account|credit card)\b/.test(value);
 }
 
+function asksForAlternativeTimingChoice(question) {
+  const value = normalizedClinicalText(question);
+  const patterns = [
+    /\b(?:would|do)\s+you\s+prefer\b[^?]{0,80}\b(?:different|another|other)\s+time\b/,
+    /\bwhat\s+time\s+would\s+you\s+prefer\b/,
+    /\bchoose\b[^?]{0,50}\b(?:different|another|other)\s+time\b/,
+    /\bmove\b[^?]{0,80}\b(?:reminder|task|medicine|medication|dose|appointment)\b[^?]{0,80}\bto\b/,
+    /\b(?:different|another|other)\s+time\b[^?]{0,60}\b(?:better|prefer|work)\b/,
+  ];
+  return patterns.some((pattern) => pattern.test(value));
+}
+
+function normalizedClinicalText(value) {
+  return cleanText(value, 1200).toLowerCase();
+}
+
+function instructionIdOf(task) {
+  const raw = task?.instructionId ?? task?.instruction_id;
+  return raw == null ? '' : String(raw).trim();
+}
+
+function instructionIdOfInstruction(item) {
+  const raw = item?.id ?? item?.instructionId ?? item?.instruction_id;
+  return raw == null ? '' : String(raw).trim();
+}
+
+function parseClockMinutes(value) {
+  if (typeof value !== 'string') return [];
+  const results = [];
+  const seen = new Set();
+  const pattern = /\b(1[0-2]|0?[1-9]):([0-5]\d)\s*(AM|PM)\b/gi;
+  for (const match of value.matchAll(pattern)) {
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    const meridiem = match[3].toUpperCase();
+    if (meridiem === 'AM' && hour === 12) hour = 0;
+    if (meridiem === 'PM' && hour !== 12) hour += 12;
+    const total = hour * 60 + minute;
+    if (!seen.has(total)) {
+      seen.add(total);
+      results.push(total);
+    }
+  }
+
+  const twentyFourHour = /\b([01]\d|2[0-3]):([0-5]\d)\b/g;
+  for (const match of value.matchAll(twentyFourHour)) {
+    const total = Number(match[1]) * 60 + Number(match[2]);
+    if (!seen.has(total)) {
+      seen.add(total);
+      results.push(total);
+    }
+  }
+  return results;
+}
+
+function targetContextForQuestion({ targetTaskIds, tasks, instructions }) {
+  const targetSet = new Set(targetTaskIds.map(String));
+  const targetTasks = tasks.filter((task) => targetSet.has(taskIdOf(task)));
+  const instructionIds = new Set(targetTasks.map(instructionIdOf).filter(Boolean));
+  const targetInstructions = instructions.filter((item) =>
+    instructionIds.has(instructionIdOfInstruction(item)));
+
+  const verifiedText = targetInstructions
+    .map((item) => `${item?.title || ''} ${item?.instruction || ''} ${item?.timing || ''}`)
+    .join(' ');
+  const taskText = targetTasks
+    .map((item) => `${item?.title || ''} ${item?.scheduleTime || item?.schedule_time || ''} ${item?.displayTime || item?.display_time || ''}`)
+    .join(' ');
+
+  return {
+    verifiedText: normalizedClinicalText(verifiedText),
+    taskText: normalizedClinicalText(taskText),
+  };
+}
+
+function hasVerifiedMeaningDrift({
+  question,
+  reasonForAsking,
+  targetTaskIds,
+  tasks,
+  instructions,
+}) {
+  // Validate the patient-facing question itself against the verified wording.
+  // The explanation may repeat the correct source phrase and must never be
+  // allowed to mask broader wording inside the question.
+  const candidate = normalizedClinicalText(question);
+  const { verifiedText, taskText } = targetContextForQuestion({
+    targetTaskIds,
+    tasks,
+    instructions,
+  });
+
+  if (!verifiedText) return false;
+
+  // Food / routine anchors are safety-critical. A model may omit the anchor,
+  // but if it refers to it using a broader substitute, reject the question.
+  const mealAnchors = ['breakfast', 'lunch', 'dinner'];
+  for (const anchor of mealAnchors) {
+    if (!verifiedText.includes(anchor)) continue;
+    const mentionsGenericMeal = /\b(?:a|the|your|any)?\s*meal\b/.test(candidate);
+    if (mentionsGenericMeal && !candidate.includes(anchor)) return true;
+  }
+
+  if (verifiedText.includes('bedtime')) {
+    const usesBroaderNight = /\b(?:at|in|during)\s+(?:the\s+)?night\b/.test(candidate);
+    if (usesBroaderNight && !candidate.includes('bedtime')) return true;
+  }
+
+  if (verifiedText.includes('fasting')) {
+    const referencesFoodWithoutFasting = /\b(?:food|meal|eat|eating)\b/.test(candidate) &&
+      !candidate.includes('fasting');
+    if (referencesFoodWithoutFasting) return true;
+  }
+
+  const relationAnchors = [
+    ['before', 'breakfast'],
+    ['after', 'breakfast'],
+    ['before', 'lunch'],
+    ['after', 'lunch'],
+    ['before', 'dinner'],
+    ['after', 'dinner'],
+    ['before', 'food'],
+    ['after', 'food'],
+    ['with', 'food'],
+    ['without', 'food'],
+  ];
+  for (const [relation, anchor] of relationAnchors) {
+    const verifiedPattern = new RegExp(`\\b${relation}\\s+(?:your\\s+|the\\s+)?${anchor}\\b`);
+    if (!verifiedPattern.test(verifiedText)) continue;
+
+    const candidateMentionsRelation = new RegExp(`\\b${relation}\\b`).test(candidate);
+    if (!candidateMentionsRelation) continue;
+
+    const candidatePreservesAnchor = new RegExp(
+      `\\b${relation}\\s+(?:your\\s+|the\\s+)?${anchor}\\b`,
+    ).test(candidate);
+    if (!candidatePreservesAnchor) return true;
+  }
+
+  if (/\bempty\s+stomach\b/.test(verifiedText)) {
+    const mentionsEmpty = /\bempty\b/.test(candidate);
+    if (mentionsEmpty && !/\bempty\s+(?:your\s+|the\s+)?stomach\b/.test(candidate)) {
+      return true;
+    }
+  }
+
+  // A Reality Check may mention the user-selected reminder time or the exact
+  // verified clock time, but it must not introduce a third medication time.
+  const allowedTimes = new Set([
+    ...parseClockMinutes(verifiedText),
+    ...parseClockMinutes(taskText),
+  ]);
+  const candidateTimes = parseClockMinutes(candidate);
+  if (allowedTimes.size > 0 && candidateTimes.some((time) => !allowedTimes.has(time))) {
+    return true;
+  }
+
+  return false;
+}
+
 function parsePayload(rawText) {
   if (typeof rawText !== 'string' || !rawText.trim()) return null;
   try {
@@ -160,6 +320,7 @@ function sanitizeRoutineProfile(profile) {
 export function normalizeRealityCheckQuestionCandidates({
   rawText,
   tasks = [],
+  instructions = [],
   maxQuestions = REALITY_CHECK_MAX_QUESTIONS,
 }) {
   const payload = parsePayload(rawText);
@@ -185,6 +346,7 @@ export function normalizeRealityCheckQuestionCandidates({
     if (!reasonForAsking) continue;
     if (hasUnsafeClinicalLanguage(`${question} ${reasonForAsking}`)) continue;
     if (hasUnnecessarySensitiveRequest(question)) continue;
+    if (asksForAlternativeTimingChoice(question)) continue;
 
     const rawTargets = Array.isArray(candidate?.targetTaskIds)
       ? candidate.targetTaskIds
@@ -197,6 +359,14 @@ export function normalizeRealityCheckQuestionCandidates({
     // Grounding is mandatory. The model cannot create a general lifestyle
     // interview question that is unrelated to this verified care plan.
     if (targetTaskIds.length === 0) continue;
+
+    if (hasVerifiedMeaningDrift({
+      question,
+      reasonForAsking,
+      targetTaskIds,
+      tasks,
+      instructions,
+    })) continue;
 
     const semanticKey = normalizedQuestionKey(question);
     if (!semanticKey || seenSemanticQuestions.has(semanticKey)) continue;
@@ -241,8 +411,9 @@ export async function generatePersonalizedRealityCheckQuestions({
   if (!Array.isArray(tasks) || tasks.length === 0) return [];
 
   const safeTasks = sanitizeTasksForRealityCheck(tasks);
+  const safeInstructions = sanitizeInstructionsForRealityCheck(instructions);
   const result = await generateRealityCheckQuestionCandidates({
-    instructions: sanitizeInstructionsForRealityCheck(instructions),
+    instructions: safeInstructions,
     tasks: safeTasks,
     routineProfile: sanitizeRoutineProfile(routineProfile),
     knownRealityFacts: sanitizeKnownRealityFacts(knownRealityFacts),
@@ -252,6 +423,7 @@ export async function generatePersonalizedRealityCheckQuestions({
   return normalizeRealityCheckQuestionCandidates({
     rawText: result.text,
     tasks: safeTasks,
+    instructions: safeInstructions,
     maxQuestions,
   });
 }
