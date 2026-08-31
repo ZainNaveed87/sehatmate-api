@@ -38,7 +38,17 @@ import {
 
 import {
   ensureRealityCheckPersistenceSchema,
+  getOrCreateRealityQuestionSet,
+  readActiveRealityQuestionSet,
 } from './reality_check_store.js';
+
+import {
+  actionForRealityIntent,
+  dynamicQuestionToDecisionTemplate,
+  legacyTemplateToDecisionTemplate,
+  riskPointsForRealityAnswer,
+  targetTasksForRealityQuestion,
+} from './reality_check_decision.js';
 
 const requiredEnvironment = [
   'DB_HOST',
@@ -1676,27 +1686,20 @@ function buildScheduleConflictFindings(tasks, routineProfile) {
 
 
 function effectiveRealityRiskPoints(answer, template) {
-  if (!template) return Number(answer?.risk_points || 0);
-
-  const selected = String(answer?.selected_answer || '');
-  if (selected === '__custom__') {
-    return customRealityRiskPoints(answer?.note || '', template);
-  }
-
-  const option = template.options.find(
-    (candidate) => candidate.label === selected,
-  );
-  if (option) return Number(option.points || 0);
-
-  return Number(answer?.risk_points || 0);
+  return riskPointsForRealityAnswer({
+    selectedAnswer: answer?.selected_answer,
+    note: answer?.note,
+    template,
+    storedRiskPoints: answer?.risk_points,
+  });
 }
 
-function practicalAdaptationForAnswer(answer, option, tasks, routineProfile = null, taskDecisions = new Map()) {
+function practicalAdaptationForAnswer(answer, template, option, tasks, routineProfile = null, taskDecisions = new Map()) {
   const key = String(answer?.question_key || '');
-  const action = option?.action || customRealityAction(key);
+  const action = option?.action || actionForRealityIntent(template?.intent) || customRealityAction(key);
 
   if (action === 'schedule') {
-    const candidates = tasks.filter((task) => taskMatchesRealityQuestion(task, key));
+    const candidates = targetTasksForRealityQuestion(template, tasks);
     const target = candidates.find((task) => String(task.grounding || '') !== 'explicit') || candidates[0] || null;
 
     if (!target) {
@@ -2856,7 +2859,7 @@ app.get('/api/care-plans/:id/setup-progress', authenticate, async (req, res, nex
 
       if (['reality_check', 'needs_attention'].includes(rows[0].status)) {
         const [tasks] = await pool.execute(
-          `SELECT task_kind, title, display_time, recurrence_text, reason,
+          `SELECT id, task_kind, title, display_time, recurrence_text, reason,
             requires_confirmation
            FROM care_schedule_items
            WHERE care_plan_id = ? AND user_id = ?`,
@@ -2866,7 +2869,14 @@ app.get('/api/care-plans/:id/setup-progress', authenticate, async (req, res, nex
         if (!tasks.length || tasks.some((task) => Boolean(task.requires_confirmation))) {
           step = 'schedule';
         } else {
-          const templates = realityQuestionTemplates(tasks);
+          const reality = await realityDecisionTemplatesForPlan({
+            db: pool,
+            planId,
+            userId: req.auth.userId,
+            tasks,
+            createIfMissing: false,
+          });
+          const templates = reality.templates;
           const [answers] = await pool.execute(
             `SELECT question_key
              FROM care_reality_answers
@@ -4369,49 +4379,180 @@ function realityQuestionTemplates(tasks) {
   return questions.slice(0, 6);
 }
 
+async function realityDecisionTemplatesForPlan({
+  db,
+  planId,
+  userId,
+  tasks = [],
+  createIfMissing = false,
+}) {
+  let activeSet = await readActiveRealityQuestionSet({ db, planId, userId });
+
+  if (!activeSet && createIfMissing && tasks.length > 0) {
+    const [instructions] = await db.execute(
+      `SELECT id, category, title, instruction, timing, review_status,
+        requires_professional_confirmation
+       FROM extracted_instructions
+       WHERE care_plan_id = ?
+       ORDER BY id`,
+      [planId],
+    );
+    const routineProfile = await readRoutineProfile(db, userId);
+
+    try {
+      activeSet = await getOrCreateRealityQuestionSet({
+        db,
+        planId,
+        userId,
+        instructions,
+        tasks,
+        routineProfile,
+        knownRealityFacts: [],
+        refreshIfContextChanged: false,
+      });
+    } catch (error) {
+      console.warn(
+        `Reality Check AI generation failed for plan ${planId}; using the deterministic compatibility fallback.`,
+        error?.message || error,
+      );
+    }
+  }
+
+  if (activeSet?.questions?.length) {
+    return {
+      source: 'ai_persisted',
+      questionSet: activeSet,
+      templates: activeSet.questions.map(dynamicQuestionToDecisionTemplate),
+    };
+  }
+
+  return {
+    source: 'legacy_fallback',
+    questionSet: null,
+    templates: realityQuestionTemplates(tasks).map((template) =>
+      legacyTemplateToDecisionTemplate(template, tasks)),
+  };
+}
+
 app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
   const planId = req.params.id;
-  if (!idPattern.test(planId)) return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  if (!idPattern.test(planId)) {
+    return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
+  }
+
   try {
-    const [plans] = await pool.execute('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1', [planId, req.auth.userId]);
-    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
-    const [tasks] = await pool.execute(
-      `SELECT task_kind, title, display_time, recurrence_text, reason
-       FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ? ORDER BY id`,
+    const [plans] = await pool.execute(
+      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
       [planId, req.auth.userId],
     );
-    if (!tasks.length) return res.status(409).json({ success: false, message: 'Generate the schedule before starting the reality check.' });
-    const templates = realityQuestionTemplates(tasks);
+    if (!plans.length) {
+      return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    }
+
+    const [tasks] = await pool.execute(
+      `SELECT id, instruction_id, task_kind, schedule_date,
+        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+        title, display_time, recurrence_text, grounding, reason,
+        requires_confirmation
+       FROM care_schedule_items
+       WHERE care_plan_id = ? AND user_id = ?
+       ORDER BY id`,
+      [planId, req.auth.userId],
+    );
+    if (!tasks.length) {
+      return res.status(409).json({
+        success: false,
+        message: 'Generate the schedule before starting the reality check.',
+      });
+    }
+
+    const reality = await realityDecisionTemplatesForPlan({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      tasks,
+      createIfMissing: true,
+    });
     const [saved] = await pool.execute(
-      `SELECT question_key, selected_answer, note FROM care_reality_answers
+      `SELECT question_key, selected_answer, note
+       FROM care_reality_answers
        WHERE care_plan_id = ? AND user_id = ?`,
       [planId, req.auth.userId],
     );
     const savedByKey = new Map(saved.map((item) => [item.question_key, item]));
-    res.json({ success: true, data: { questions: templates.map((item) => ({
-      ...item,
-      options: item.options.map((option) => option.label),
-      selectedAnswer:
-        savedByKey.get(item.key)?.selected_answer === '__custom__'
-          ? ''
-          : savedByKey.get(item.key)?.selected_answer || '',
-      note: savedByKey.get(item.key)?.note || '',
-    })) } });
-  } catch (error) { next(error); }
+
+    res.json({
+      success: true,
+      data: {
+        source: reality.source,
+        questionSetVersion: reality.questionSet?.version || null,
+        questions: reality.templates.map((item) => ({
+          key: item.key,
+          category: item.category,
+          question: item.question,
+          options: item.options.map((option) => option.label),
+          intent: item.intent,
+          responseProfile: item.responseProfile,
+          targetTaskIds: item.targetTaskIds,
+          period: item.period,
+          reasonForAsking: item.reasonForAsking,
+          source: item.source,
+          selectedAnswer:
+            savedByKey.get(item.key)?.selected_answer === '__custom__'
+              ? ''
+              : savedByKey.get(item.key)?.selected_answer || '',
+          note: savedByKey.get(item.key)?.note || '',
+        })),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
-  if (!idPattern.test(planId) || !answers.length) return res.status(422).json({ success: false, message: 'Complete the relevant reality-check questions.' });
+  if (!idPattern.test(planId) || !answers.length) {
+    return res.status(422).json({
+      success: false,
+      message: 'Complete the relevant reality-check questions.',
+    });
+  }
+
   const connection = await pool.getConnection();
+  let transactionStarted = false;
   try {
-    const [plans] = await connection.execute('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1', [planId, req.auth.userId]);
-    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
-    const [tasks] = await connection.execute('SELECT task_kind, title, display_time, recurrence_text, reason FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ?', [planId, req.auth.userId]);
-    const templates = realityQuestionTemplates(tasks);
-    const byKey = new Map(templates.map((item) => [item.key, item]));
+    const [plans] = await connection.execute(
+      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+      [planId, req.auth.userId],
+    );
+    if (!plans.length) {
+      return res.status(404).json({ success: false, message: 'Care plan not found.' });
+    }
+
+    const [tasks] = await connection.execute(
+      `SELECT id, instruction_id, task_kind, schedule_date,
+        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+        title, display_time, recurrence_text, grounding, reason,
+        requires_confirmation
+       FROM care_schedule_items
+       WHERE care_plan_id = ? AND user_id = ?
+       ORDER BY id`,
+      [planId, req.auth.userId],
+    );
+    const reality = await realityDecisionTemplatesForPlan({
+      db: connection,
+      planId,
+      userId: req.auth.userId,
+      tasks,
+      createIfMissing: false,
+    });
+    const byKey = new Map(reality.templates.map((item) => [item.key, item]));
+
     await connection.beginTransaction();
+    transactionStarted = true;
+
     for (const answer of answers) {
       const key = cleanText(answer?.key, 80);
       const selected = cleanText(answer?.answer, 240);
@@ -4431,18 +4572,28 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
 
       const option = template.options.find((item) => item.label === selected);
       const isCustom = selected === '__custom__' && note.length > 0;
-
       if (!option && !isCustom) throw new Error('INVALID_REALITY_ANSWER');
 
       const storedAnswer = isCustom ? '__custom__' : selected;
-      const riskPoints = isCustom
-        ? customRealityRiskPoints(note, template)
-        : option.points;
+      const riskPoints = riskPointsForRealityAnswer({
+        selectedAnswer: storedAnswer,
+        note,
+        template,
+        storedRiskPoints: 0,
+      });
 
       await connection.execute(
-        `INSERT INTO care_reality_answers (care_plan_id, user_id, question_key, category, question_text, selected_answer, risk_points, note)
+        `INSERT INTO care_reality_answers
+          (care_plan_id, user_id, question_key, category, question_text,
+           selected_answer, risk_points, note)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE selected_answer = VALUES(selected_answer), risk_points = VALUES(risk_points), note = VALUES(note), updated_at = CURRENT_TIMESTAMP`,
+         ON DUPLICATE KEY UPDATE
+           category = VALUES(category),
+           question_text = VALUES(question_text),
+           selected_answer = VALUES(selected_answer),
+           risk_points = VALUES(risk_points),
+           note = VALUES(note),
+           updated_at = CURRENT_TIMESTAMP`,
         [
           planId,
           req.auth.userId,
@@ -4455,26 +4606,39 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
         ],
       );
 
-      const realityPeriod = key === 'morning_routine'
-        ? 'morning'
-        : key === 'daytime_access'
-          ? 'afternoon'
-          : key === 'evening_routine'
-            ? 'evening'
-            : null;
+      const targetTasks = targetTasksForRealityQuestion(template, tasks);
+      const metadataPeriod = ['morning', 'afternoon', 'evening', 'night'].includes(template.period)
+        ? template.period
+        : null;
+      const inferredPeriod = metadataPeriod || (
+        targetTasks.length === 1
+          ? schedulePeriodKey(`${targetTasks[0].display_time || ''} ${targetTasks[0].recurrence_text || ''}`)
+          : null
+      );
+
       await recordRoutineLearningEvent({
         db: connection,
         userId: req.auth.userId,
         carePlanId: planId,
         eventType: 'reality_answer',
-        period: realityPeriod,
+        period: inferredPeriod,
         scheduleTime: routineNoteTime(note),
         signalValue: isCustom ? note : selected,
         sourceKey: `reality:${planId}:${key}`,
-        metadata: { questionKey: key, custom: isCustom },
+        metadata: {
+          questionKey: key,
+          intent: template.intent,
+          responseProfile: template.responseProfile,
+          targetTaskIds: template.targetTaskIds,
+          period: template.period,
+          source: template.source,
+          custom: isCustom,
+        },
       });
     }
+
     await connection.commit();
+    transactionStarted = false;
 
     await refreshCareGaps({
       db: pool,
@@ -4483,12 +4647,26 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
       realityQuestionTemplates,
     });
 
-    res.json({ success: true, message: 'Reality-check answers saved.', data: {} });
+    res.json({
+      success: true,
+      message: 'Reality-check answers saved.',
+      data: {
+        source: reality.source,
+        questionSetVersion: reality.questionSet?.version || null,
+      },
+    });
   } catch (error) {
-    await connection.rollback();
-    if (error?.message === 'INVALID_REALITY_ANSWER') return res.status(422).json({ success: false, message: 'Choose an option or write your own answer for every question.' });
+    if (transactionStarted) await connection.rollback();
+    if (error?.message === 'INVALID_REALITY_ANSWER') {
+      return res.status(422).json({
+        success: false,
+        message: 'Choose an option or write your own answer for every question.',
+      });
+    }
     next(error);
-  } finally { connection.release(); }
+  } finally {
+    connection.release();
+  }
 });
 
 
@@ -4733,7 +4911,14 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       [planId, req.auth.userId],
     );
 
-    const templates = realityQuestionTemplates(tasks);
+    const reality = await realityDecisionTemplatesForPlan({
+      db: pool,
+      planId,
+      userId: req.auth.userId,
+      tasks,
+      createIfMissing: false,
+    });
+    const templates = reality.templates;
     const templateByKey = new Map(templates.map((item) => [item.key, item]));
     const routineProfile = await readRoutineProfile(pool, req.auth.userId);
 
@@ -4758,8 +4943,11 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       });
     }
 
-    const unanswered = Math.max(0, templates.length - answers.length);
-    const evaluatedAnswers = answers.map((item) => {
+    const answeredKeys = new Set(answers.map((item) => item.question_key));
+    const unanswered = templates.filter((template) => !answeredKeys.has(template.key)).length;
+    const evaluatedAnswers = answers
+      .filter((item) => templateByKey.has(item.question_key))
+      .map((item) => {
       const template = templateByKey.get(item.question_key);
       const option = template?.options.find(
         (candidate) => candidate.label === item.selected_answer,
@@ -4767,6 +4955,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       const riskPoints = effectiveRealityRiskPoints(item, template);
       const adaptation = practicalAdaptationForAnswer(
         item,
+        template,
         option,
         tasks,
         routineProfile,
@@ -5543,9 +5732,20 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       ).length;
       const missingTimeCount = scheduleRows.filter((item) => item.schedule_time == null).length;
       const confirmationCount = scheduleRows.filter((item) => Boolean(item.requires_confirmation)).length;
-      const realityTemplates = realityQuestionTemplates(scheduleRows);
-      const unansweredRealityCount = Math.max(0, realityTemplates.length - realityAnswers.length);
-      const realityRiskCount = realityAnswers.filter((item) => Number(item.risk_points || 0) > 0).length;
+      const reality = await realityDecisionTemplatesForPlan({
+        db: pool,
+        planId,
+        userId: req.auth.userId,
+        tasks: scheduleRows,
+        createIfMissing: false,
+      });
+      const realityTemplates = reality.templates;
+      const realityAnswerKeys = new Set(realityAnswers.map((item) => item.question_key));
+      const currentRealityAnswers = realityAnswers.filter((item) =>
+        realityTemplates.some((template) => template.key === item.question_key));
+      const unansweredRealityCount = realityTemplates.filter((template) =>
+        !realityAnswerKeys.has(template.key)).length;
+      const realityRiskCount = currentRealityAnswers.filter((item) => Number(item.risk_points || 0) > 0).length;
 
       if (
         verifiedCount === 0 ||

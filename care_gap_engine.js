@@ -269,6 +269,45 @@ export function careGapSummary(rows) {
   };
 }
 
+async function realityRequirementTemplates({
+  db,
+  planId,
+  userId,
+  tasks,
+  realityQuestionTemplates,
+}) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT q.question_key, q.question_text
+       FROM care_reality_questions q
+       WHERE q.question_set_id = (
+         SELECT s.id
+         FROM care_reality_question_sets s
+         WHERE s.care_plan_id = ?
+           AND s.user_id = ?
+           AND s.status = 'active'
+         ORDER BY s.version DESC, s.id DESC
+         LIMIT 1
+       )
+         AND q.status = 'active'
+       ORDER BY q.ordinal, q.id`,
+      [planId, userId],
+    );
+    if (rows.length > 0) {
+      return rows.map((row) => ({
+        key: row.question_key,
+        question: row.question_text,
+      }));
+    }
+  } catch (error) {
+    if (error?.code !== 'ER_NO_SUCH_TABLE') throw error;
+  }
+
+  return typeof realityQuestionTemplates === 'function'
+    ? realityQuestionTemplates(tasks)
+    : [];
+}
+
 export async function refreshCareGaps({ db, planId, userId, realityQuestionTemplates }) {
   const [documents] = await db.execute(
     `SELECT id, document_type, processing_status
@@ -430,9 +469,13 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
     }
   }
 
-  const templates = typeof realityQuestionTemplates === 'function'
-    ? realityQuestionTemplates(tasks)
-    : [];
+  const templates = await realityRequirementTemplates({
+    db,
+    planId,
+    userId,
+    tasks,
+    realityQuestionTemplates,
+  });
   const answeredKeys = new Set(answers.map((item) => item.question_key));
   const missingRealityQuestions = templates.filter(
     (template) => !answeredKeys.has(template.key),
