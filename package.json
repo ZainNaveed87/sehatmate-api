@@ -12,7 +12,8 @@
     "test:reality-layer1": "node reality_check_layer1_test.js",
     "test:reality-layer2": "node reality_check_layer2_test.js",
     "test:reality-layer3": "node reality_check_layer3_test.js",
-    "test:schedule-time-guard": "node schedule_time_guard_test.js"
+    "test:schedule-time-guard": "node schedule_time_guard_test.js",
+    "test:reality-server-version": "node reality_check_server_version_test.js"
   },
   "engines": {
     "node": ">=20"

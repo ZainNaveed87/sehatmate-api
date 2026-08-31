@@ -40,6 +40,7 @@ import {
   ensureRealityCheckPersistenceSchema,
   getOrCreateRealityQuestionSet,
   readActiveRealityQuestionSet,
+  REALITY_CHECK_GENERATOR_VERSION,
 } from './reality_check_store.js';
 
 import {
@@ -4426,7 +4427,17 @@ async function realityDecisionTemplatesForPlan({
 }) {
   let activeSet = await readActiveRealityQuestionSet({ db, planId, userId });
 
-  if (!activeSet && createIfMissing && tasks.length > 0) {
+  // Never use a persisted question set produced by older safety rules.
+  // A GET of the Reality Check may regenerate it; downstream readers that do
+  // not create questions will use the deterministic fallback until that occurs.
+  if (
+    activeSet &&
+    activeSet.generatorVersion !== REALITY_CHECK_GENERATOR_VERSION
+  ) {
+    activeSet = null;
+  }
+
+  if (createIfMissing && tasks.length > 0) {
     const [instructions] = await db.execute(
       `SELECT id, category, title, instruction, timing, review_status,
         requires_professional_confirmation
@@ -4438,6 +4449,10 @@ async function realityDecisionTemplatesForPlan({
     const routineProfile = await readRoutineProfile(db, userId);
 
     try {
+      // Always go through the version-aware store resolver. It cheaply reuses
+      // the current set, but regenerates when the generator safety version
+      // changes. Assigning null is intentional: an obsolete set must not be
+      // served if safe regeneration cannot produce valid questions.
       activeSet = await getOrCreateRealityQuestionSet({
         db,
         planId,
@@ -4449,6 +4464,7 @@ async function realityDecisionTemplatesForPlan({
         refreshIfContextChanged: false,
       });
     } catch (error) {
+      activeSet = null;
       console.warn(
         `Reality Check AI generation failed for plan ${planId}; using the deterministic compatibility fallback.`,
         error?.message || error,
