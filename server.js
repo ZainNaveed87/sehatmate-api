@@ -58,6 +58,13 @@ import {
   isVerifiedExactScheduleItemLocked,
 } from './schedule_time_guard.js';
 
+import {
+  analyzeAndStoreCareGapContext,
+  enrichSimulationFindingsWithContext,
+  ensureCareContextSchema,
+  readCareContextInsightsForPlan,
+} from './care_context_engine.js';
+
 const requiredEnvironment = [
   'DB_HOST',
   'DB_NAME',
@@ -5086,7 +5093,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       Math.min(100, 100 - answerPenalty - (unclear * 8) - (unanswered * 10)),
     );
 
-    const findings = unresolvedRiskAnswers.map(
+    let findings = unresolvedRiskAnswers.map(
       ({ item, option, adaptation }) => {
         return {
           key: item.question_key,
@@ -5115,17 +5122,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
 
     findings.push(...buildScheduleConflictFindings(tasks, routineProfile));
 
-    const adaptations = findings
-      .filter((finding) =>
-        finding?.canApply === true &&
-        finding?.taskId &&
-        finding?.suggestedTime &&
-        finding?.suggestedPeriod,
-      )
-      .map((finding) => ({
-        ...finding,
-        taskId: String(finding.taskId),
-      }));
+   
 
     const careGapRows = await refreshCareGaps({
       db: pool,
@@ -5133,6 +5130,30 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
       userId: req.auth.userId,
       realityQuestionTemplates,
     });
+    const contextInsights =
+  await readCareContextInsightsForPlan(
+    pool,
+    planId,
+  );
+
+findings =
+  enrichSimulationFindingsWithContext(
+    findings,
+    contextInsights,
+  );
+
+const adaptations = findings
+  .filter(
+    (finding) =>
+      finding?.canApply === true &&
+      finding?.taskId &&
+      finding?.suggestedTime &&
+      finding?.suggestedPeriod,
+  )
+  .map((finding) => ({
+    ...finding,
+    taskId: String(finding.taskId),
+  }));
     const gapSummary = careGapSummary(careGapRows);
     const openBlockingGaps = careGapRows.filter(
       (item) =>
@@ -5218,6 +5239,7 @@ app.get('/api/care-plans/:id/simulation', authenticate, async (req, res, next) =
         adaptations,
         blockers,
         unanswered,
+        contextInsights,
         realityDiagnostics: {
           currentQuestionCount: templates.length,
           storedAnswerCount: answers.length,
@@ -5612,6 +5634,13 @@ app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
       );
     }
 
+    await analyzeAndStoreCareGapContext({
+  db: pool,
+  gapId,
+  userId: req.auth.userId,
+  generateAiText,
+});
+
     gap = await readCareGapForUser(pool, gapId, req.auth.userId);
 
     res.json({
@@ -5908,6 +5937,21 @@ app.patch('/api/doctor-questions/:id', authenticate, async (req, res, next) => {
         [rows[0].care_gap_id],
       );
     }
+
+    if (
+  rows[0].care_gap_id != null
+) {
+  await analyzeAndStoreCareGapContext({
+    db: pool,
+    gapId:
+      String(
+        rows[0].care_gap_id,
+      ),
+    userId:
+      req.auth.userId,
+    generateAiText,
+  });
+}
 
     res.json({
       success: true,
@@ -7053,11 +7097,12 @@ let lifecycleInterval;
 async function startServer() {
   await pool.query('SELECT 1');
 
-  await ensureSetupProgressSchema();
-  await ensureRoutineLearningSchema(pool);
-  await ensureRealityCheckPersistenceSchema(pool);
-  await ensureMedicalSafetySchema();
-  await ensureAdvancedTaskLifecycleSchema();
+ await ensureSetupProgressSchema();
+await ensureRoutineLearningSchema(pool);
+await ensureRealityCheckPersistenceSchema(pool);
+await ensureMedicalSafetySchema();
+await ensureAdvancedTaskLifecycleSchema();
+await ensureCareContextSchema(pool);
 
   /*
    * Clean duplicate pending Doctor Questions created by older builds
