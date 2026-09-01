@@ -5508,51 +5508,7 @@ app.post('/api/care-plans/:id/care-gaps/refresh', authenticate, async (req, res,
   }
 });
 
-app.get('/api/care-gaps/:id', authenticate, async (req, res, next) => {
-  const gapId = req.params.id;
-  if (!idPattern.test(gapId)) {
-    res.status(422).json({ success: false, message: 'Invalid care gap ID.' });
-    return;
-  }
 
-  try {
-    let gap = await readCareGapForUser(pool, gapId, req.auth.userId);
-    if (!gap) {
-      res.status(404).json({ success: false, message: 'Care gap not found.' });
-      return;
-    }
-
-    await refreshCareGaps({
-      db: pool,
-      planId: String(gap.care_plan_id),
-      userId: req.auth.userId,
-      realityQuestionTemplates,
-    });
-    gap = await readCareGapForUser(pool, gapId, req.auth.userId);
-
-    const [questions] = await pool.execute(
-      `SELECT id, care_gap_id, group_name, title, question, answer, status, answered_at, created_at, updated_at
-       FROM doctor_questions
-       WHERE care_gap_id = ? AND care_plan_id = ?
-       ORDER BY id`,
-      [gapId, gap.care_plan_id],
-    );
-
-    res.json({
-      success: true,
-      data: {
-        gap: careGapJson(gap),
-        doctorQuestions: questions.map((item) => ({
-          ...item,
-          id: String(item.id),
-          care_gap_id: item.care_gap_id == null ? null : String(item.care_gap_id),
-        })),
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
-});
 
 app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
   const gapId = req.params.id;
