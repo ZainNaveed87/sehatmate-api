@@ -5634,13 +5634,24 @@ app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
       );
     }
 
-    await analyzeAndStoreCareGapContext({
-  db: pool,
-  gapId,
-  userId: req.auth.userId,
-  generateAiText,
-});
-
+   try {
+  await analyzeAndStoreCareGapContext({
+    db: pool,
+    gapId,
+    userId:
+      req.auth.userId,
+    generateAiText,
+  });
+} catch (contextError) {
+  /*
+   * Saving the user's progress note is the primary
+   * operation. Context analysis must not block it.
+   */
+  console.error(
+    'Care-gap context analysis failed after progress note:',
+    contextError,
+  );
+}
     gap = await readCareGapForUser(pool, gapId, req.auth.userId);
 
     res.json({
@@ -5939,18 +5950,29 @@ app.patch('/api/doctor-questions/:id', authenticate, async (req, res, next) => {
     }
 
     if (
-  rows[0].care_gap_id != null
-) {
-  await analyzeAndStoreCareGapContext({
-    db: pool,
-    gapId:
-      String(
+ rows[0].care_gap_id != null) {
+  try {
+    await analyzeAndStoreCareGapContext({
+      db: pool,
+      gapId: String(
         rows[0].care_gap_id,
       ),
-    userId:
-      req.auth.userId,
-    generateAiText,
-  });
+      userId:
+        req.auth.userId,
+      generateAiText,
+    });
+  } catch (contextError) {
+    /*
+     * The professional answer has already been saved.
+     *
+     * AI/context analysis is secondary and must never
+     * make the primary answer-save operation fail.
+     */
+    console.error(
+      'Care-gap context analysis failed after professional answer:',
+      contextError,
+    );
+  }
 }
 
     res.json({
