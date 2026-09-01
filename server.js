@@ -5626,54 +5626,231 @@ app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
 
 app.post('/api/care-gaps/:id/doctor-question', authenticate, async (req, res, next) => {
   const gapId = req.params.id;
+
   if (!idPattern.test(gapId)) {
-    res.status(422).json({ success: false, message: 'Invalid care gap ID.' });
-    return;
-  }
-
-  const groupName = cleanText(req.body?.groupName, 60) || 'Care Instructions';
-  const title = cleanText(req.body?.title, 160) || 'Care-plan clarification';
-  const question = cleanText(req.body?.question, 2000);
-
-  if (!question) {
     res.status(422).json({
       success: false,
-      message: 'Enter the question you want to verify with a healthcare professional.',
+      message: 'Invalid care gap ID.',
     });
     return;
   }
 
+  const groupName =
+    cleanText(req.body?.groupName, 60) || 'Care Instructions';
+
+  const title =
+    cleanText(req.body?.title, 160) || 'Care-plan clarification';
+
+  const question =
+    cleanText(req.body?.question, 2000);
+
+  if (!question) {
+    res.status(422).json({
+      success: false,
+      message:
+        'Enter the question you want to verify with a healthcare professional.',
+    });
+    return;
+  }
+
+  const connection = await pool.getConnection();
+  let transactionStarted = false;
+
   try {
-    const gap = await readCareGapForUser(pool, gapId, req.auth.userId);
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    /*
+     * Lock the Care Gap row first.
+     *
+     * This is important because two fast taps, or two requests arriving
+     * at nearly the same time, must not both create a pending question.
+     *
+     * Every request for this exact gap has to wait for this row lock,
+     * so after the first request creates a question, the second request
+     * sees that pending question and reuses it.
+     */
+    const [gapRows] = await connection.execute(
+      `SELECT
+         g.id,
+         g.care_plan_id,
+         g.lifecycle_status
+       FROM care_gaps g
+       JOIN care_plans p
+         ON p.id = g.care_plan_id
+       WHERE g.id = ?
+         AND p.user_id = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        gapId,
+        req.auth.userId,
+      ],
+    );
+
+    const gap = gapRows[0];
+
     if (!gap) {
-      res.status(404).json({ success: false, message: 'Care gap not found.' });
+      await connection.rollback();
+      transactionStarted = false;
+
+      res.status(404).json({
+        success: false,
+        message: 'Care gap not found.',
+      });
       return;
     }
 
-    const [result] = await pool.execute(
-      `INSERT INTO doctor_questions (
-        care_plan_id, care_gap_id, group_name, title, question, status
-      ) VALUES (?, ?, ?, ?, ?, 'pending')`,
-      [gap.care_plan_id, gapId, groupName, title, question],
+    /*
+     * There should be only ONE pending healthcare-professional
+     * question per Care Gap.
+     *
+     * Answered questions are intentionally NOT included here because
+     * they are history and must not be deleted.
+     */
+    const [pendingQuestions] = await connection.execute(
+      `SELECT
+         id,
+         group_name,
+         title,
+         question,
+         status
+       FROM doctor_questions
+       WHERE care_gap_id = ?
+         AND care_plan_id = ?
+         AND status = 'pending'
+       ORDER BY id
+       FOR UPDATE`,
+      [
+        gapId,
+        gap.care_plan_id,
+      ],
     );
 
-    await pool.execute(
+    /*
+     * Existing pending question found:
+     * - Keep the oldest pending question as canonical.
+     * - Remove any duplicate pending rows left by older app builds.
+     * - Do NOT touch answered questions.
+     * - Do NOT create another question.
+     */
+    if (pendingQuestions.length > 0) {
+      const canonicalQuestion = pendingQuestions[0];
+
+      const duplicateCount = Math.max(
+        0,
+        pendingQuestions.length - 1,
+      );
+
+      if (duplicateCount > 0) {
+        await connection.execute(
+          `DELETE FROM doctor_questions
+           WHERE care_gap_id = ?
+             AND care_plan_id = ?
+             AND status = 'pending'
+             AND id <> ?`,
+          [
+            gapId,
+            gap.care_plan_id,
+            canonicalQuestion.id,
+          ],
+        );
+      }
+
+      /*
+       * Creating/reusing a Doctor Question means this Care Gap is being
+       * worked on. Do not reopen a gap that is already resolved.
+       */
+      await connection.execute(
+        `UPDATE care_gaps
+         SET lifecycle_status = CASE
+           WHEN lifecycle_status = 'resolved'
+             THEN lifecycle_status
+           ELSE 'in_progress'
+         END
+         WHERE id = ?`,
+        [gapId],
+      );
+
+      await connection.commit();
+      transactionStarted = false;
+
+      res.status(200).json({
+        success: true,
+        message:
+          duplicateCount > 0
+            ? 'Existing pending question kept; duplicate pending questions were removed.'
+            : 'A pending healthcare-professional question already exists for this care gap.',
+        data: {
+          questionId: String(canonicalQuestion.id),
+          created: false,
+          existing: true,
+          deduplicatedCount: duplicateCount,
+        },
+      });
+
+      return;
+    }
+
+    /*
+     * No pending question currently exists for this Care Gap,
+     * so creating one is safe.
+     */
+    const [result] = await connection.execute(
+      `INSERT INTO doctor_questions (
+         care_plan_id,
+         care_gap_id,
+         group_name,
+         title,
+         question,
+         status
+       ) VALUES (?, ?, ?, ?, ?, 'pending')`,
+      [
+        gap.care_plan_id,
+        gapId,
+        groupName,
+        title,
+        question,
+      ],
+    );
+
+    await connection.execute(
       `UPDATE care_gaps
        SET lifecycle_status = CASE
-         WHEN lifecycle_status = 'resolved' THEN lifecycle_status
+         WHEN lifecycle_status = 'resolved'
+           THEN lifecycle_status
          ELSE 'in_progress'
        END
        WHERE id = ?`,
       [gapId],
     );
 
+    await connection.commit();
+    transactionStarted = false;
+
     res.status(201).json({
       success: true,
-      message: 'Question saved for healthcare-professional verification.',
-      data: { questionId: String(result.insertId) },
+      message:
+        'Question saved for healthcare-professional verification.',
+      data: {
+        questionId: String(result.insertId),
+        created: true,
+        existing: false,
+        deduplicatedCount: 0,
+      },
     });
   } catch (error) {
+    if (transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (_) {
+        // Preserve the original error.
+      }
+    }
+
     next(error);
+  } finally {
+    connection.release();
   }
 });
 
@@ -6696,6 +6873,64 @@ async function ensureMedicalSafetySchema() {
   }
 }
 
+async function cleanupDuplicatePendingDoctorQuestions() {
+  /*
+   * Older builds allowed Create Doctor Question to insert a new
+   * pending row every time the button was tapped.
+   *
+   * Keep the oldest pending question for each Care Gap and delete
+   * only the extra pending copies.
+   *
+   * Important:
+   * - answered questions are preserved
+   * - questions not linked to a Care Gap are preserved
+   * - no medical instruction or schedule is changed
+   */
+  const [duplicateGroups] = await pool.execute(
+    `SELECT
+       care_gap_id,
+       care_plan_id,
+       MIN(id) AS keep_id,
+       COUNT(*) AS pending_count
+     FROM doctor_questions
+     WHERE status = 'pending'
+       AND care_gap_id IS NOT NULL
+     GROUP BY
+       care_gap_id,
+       care_plan_id
+     HAVING COUNT(*) > 1`,
+  );
+
+  let removedCount = 0;
+
+  for (const group of duplicateGroups) {
+    const [result] = await pool.execute(
+      `DELETE FROM doctor_questions
+       WHERE care_gap_id = ?
+         AND care_plan_id = ?
+         AND status = 'pending'
+         AND id <> ?`,
+      [
+        group.care_gap_id,
+        group.care_plan_id,
+        group.keep_id,
+      ],
+    );
+
+    removedCount += Number(result.affectedRows || 0);
+  }
+
+  if (removedCount > 0) {
+    console.log(
+      `Removed ${removedCount} duplicate pending healthcare-professional question${
+        removedCount === 1 ? '' : 's'
+      }.`,
+    );
+  }
+
+  return removedCount;
+}
+
 async function ensureAdvancedTaskLifecycleSchema() {
   await pool.execute(
     `CREATE TABLE IF NOT EXISTS care_task_occurrences (
@@ -6817,18 +7052,32 @@ let lifecycleInterval;
 
 async function startServer() {
   await pool.query('SELECT 1');
+
   await ensureSetupProgressSchema();
   await ensureRoutineLearningSchema(pool);
   await ensureRealityCheckPersistenceSchema(pool);
   await ensureMedicalSafetySchema();
   await ensureAdvancedTaskLifecycleSchema();
+
+  /*
+   * Clean duplicate pending Doctor Questions created by older builds
+   * before the API starts accepting requests.
+   */
+  await cleanupDuplicatePendingDoctorQuestions();
+
   await reconcilePlanLifecycle({ db: pool });
+
   lifecycleInterval = setInterval(() => {
     reconcilePlanLifecycle({ db: pool }).catch((error) => {
-      console.error('Care-plan lifecycle reconciliation failed.', error);
+      console.error(
+        'Care-plan lifecycle reconciliation failed.',
+        error,
+      );
     });
   }, 60 * 60 * 1000);
+
   lifecycleInterval.unref?.();
+
   server = app.listen(port, '0.0.0.0', () => {
     console.log(`SehatMate API listening on port ${port}`);
   });
