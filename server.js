@@ -28,8 +28,6 @@ import {
 import {
   careGapJson,
   careGapSummary,
-  readCareGapForUser,
-  readCareGaps,
   refreshCareGaps,
 } from './care_gap_engine.js';
 
@@ -43,15 +41,10 @@ import {
 
 import {
   ensureRealityCheckPersistenceSchema,
-  getOrCreateRealityQuestionSet,
-  readActiveRealityQuestionSet,
-  REALITY_CHECK_GENERATOR_VERSION,
 } from './reality_check_store.js';
 
 import {
   actionForRealityIntent,
-  dynamicQuestionToDecisionTemplate,
-  legacyTemplateToDecisionTemplate,
   matchRealityAnswersToTemplates,
   riskPointsForRealityAnswer,
   targetTasksForRealityQuestion,
@@ -59,8 +52,6 @@ import {
 
 import {
   applyVerifiedExactTimesToScheduleItems,
-  extractVerifiedExactClockTimes,
-  isVerifiedExactScheduleItemLocked,
 } from './schedule_time_guard.js';
 
 import {
@@ -69,6 +60,95 @@ import {
   ensureCareContextSchema,
   readCareContextInsightsForPlan,
 } from './care_context_engine.js';
+
+import {
+  cleanText,
+  dbDateKey,
+  idPattern,
+  parseStoredObject,
+  routineNoteTime,
+  schedulePeriodKey,
+  scheduleWindow,
+  serverDateKey,
+  taskOutcomeDate,
+  timeFitsScheduleWindow,
+} from './services/shared_utils.js';
+
+import {
+  applyTaskOutcome,
+  ensureOccurrencesForDate,
+  ensureOccurrencesForRange,
+  reconcileExpiredFixedDurationOccurrences,
+  reconcileMissedOccurrences,
+  reconcilePlanLifecycle,
+  recordLifecycleEvent,
+  taskOccurrenceJson,
+} from './services/task_outcome_service.js';
+
+import {
+  realityDecisionTemplatesForPlan,
+  realityQuestionTemplates,
+  saveRealityAnswers,
+} from './services/reality_answer_service.js';
+
+import {
+  confirmScheduleItem,
+} from './services/schedule_confirm_service.js';
+
+import {
+  carePlanJson,
+  inferredSetupStep,
+  listCarePlans,
+  readCarePlanDetail,
+  readPlanLifecycleEvents,
+} from './services/plan_query_service.js';
+
+import {
+  listCareGaps,
+  readCareGapDetail,
+  updateCareGapLifecycle,
+} from './services/care_gap_service.js';
+
+/*
+ * HTTP status mapping for structured service results. The services return
+ * stable domain error codes; this table (and only this table) decides which
+ * HTTP status each code produces, so REST behavior stays identical to the
+ * original inline handlers while the services remain transport-agnostic for
+ * future agent tools.
+ */
+const serviceErrorStatusByCode = {
+  INVALID_TASK_OUTCOME: 422,
+  INVALID_TASK_BASE_STATUS: 422,
+  INVALID_REALITY_ANSWERS: 422,
+  INVALID_REALITY_ANSWER: 422,
+  INVALID_SCHEDULE_ITEM_ID: 422,
+  INVALID_SCHEDULE_TIME: 422,
+  INVALID_PLAN_ID: 422,
+  INVALID_GAP_ID: 422,
+  INVALID_CARE_GAP_STATUS: 422,
+  TIME_OUTSIDE_PERIOD_WINDOW: 422,
+  TASK_OCCURRENCE_NOT_FOUND: 404,
+  PLAN_NOT_FOUND: 404,
+  SCHEDULE_ITEM_NOT_FOUND: 404,
+  GAP_NOT_FOUND: 404,
+  PAST_OCCURRENCE_PENDING_CONFLICT: 409,
+  TASK_BASE_STATUS_CONFLICT: 409,
+  QUESTION_SET_VERSION_CONFLICT: 409,
+  EXACT_TIME_LOCKED: 409,
+  MEDICAL_TIMING_CONFLICT: 409,
+  DUPLICATE_REMINDER_TIME: 409,
+  DUPLICATE_REMINDER_PERIOD: 409,
+  AUTO_MANAGED_GAP_NOT_RESOLVED: 409,
+};
+
+function sendServiceError(res, result) {
+  const status = serviceErrorStatusByCode[result.code] || 422;
+  res.status(status).json({
+    success: false,
+    message: result.message,
+    ...(result.data === undefined ? {} : { data: result.data }),
+  });
+}
 
 const requiredEnvironment = [
   'DB_HOST',
@@ -174,7 +254,6 @@ const aiLimiter = rateLimit({
 });
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const idPattern = /^[1-9]\d*$/;
 const ageGroups = new Set([
   'Under 18',
   '18 – 30',
@@ -211,12 +290,6 @@ const careSetupSteps = new Set([
   'complete',
 ]);
 
-function inferredSetupStep(status) {
-  if (status === 'active' || status === 'completed') return 'complete';
-  if (status === 'draft' || status === 'processing') return 'upload';
-  if (status === 'needs_review') return 'review';
-  return 'schedule';
-}
 const documentTypes = new Set([
   'prescription',
   'discharge',
@@ -355,16 +428,6 @@ function validateGoogleName(name, email) {
   return 'Google User';
 }
 
-function cleanText(value, maxLength) {
-  return typeof value === 'string'
-    ? value
-        .replace(/[\u0000-\u001f\u007f\u200b-\u200d\u2060\ufeff]/g, '')
-        .trim()
-        .replace(/\s+/g, ' ')
-        .slice(0, maxLength)
-    : '';
-}
-
 function validateProfile(body) {
   const usingFor = cleanText(body.usingFor, 40);
   const patientName = cleanText(body.patientName, 80);
@@ -421,98 +484,6 @@ function profileJson(row) {
   };
 }
 
-function carePlanJson(row) {
-  return {
-    id: String(row.id),
-    title: row.title,
-    status: row.status,
-    startDate: row.start_date,
-    readinessScore: Number(row.readiness_score || 0),
-    understandingScore: Number(row.understanding_score || 0),
-    activatedAt: row.activated_at,
-    completedAt: row.completed_at,
-    completionReason: row.completion_reason || null,
-    completedBy: row.completed_by || null,
-    durationMode: row.duration_mode || 'prescription',
-    suggestedEndDate: row.suggested_end_date,
-    plannedEndDate: row.planned_end_date,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    documentCount: Number(row.document_count || 0),
-    taskCount: Number(row.task_count || 0),
-    openGapCount: Number(row.open_gap_count || 0),
-    setupStep: row.setup_step || inferredSetupStep(row.status),
-  };
-}
-
-function parseStoredJson(value) {
-  if (value == null || value === '') return [];
-  if (Array.isArray(value)) return value;
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function parseStoredObject(value) {
-  if (value == null || value === '') return {};
-  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
-  try {
-    const parsed = JSON.parse(value);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-
-function taskOutcomeDate(value) {
-  const text = cleanText(value, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
-  const [year, month, day] = text.split('-').map(Number);
-  const parsed = new Date(Date.UTC(year, month - 1, day));
-  if (
-    parsed.getUTCFullYear() !== year ||
-    parsed.getUTCMonth() !== month - 1 ||
-    parsed.getUTCDate() !== day
-  ) {
-    return null;
-  }
-  return text;
-}
-
-function serverDateKey(value = new Date()) {
-  return value.toISOString().slice(0, 10);
-}
-
-function dbDateKey(value) {
-  if (!value) return '';
-
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value.toISOString().slice(0, 10);
-  }
-
-  const text = String(value).trim();
-  const direct = text.match(/^(\d{4}-\d{2}-\d{2})/);
-  if (direct) return direct[1];
-
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? '' : parsed.toISOString().slice(0, 10);
-}
-
-
-function addDaysToDateKey(dateKey, days) {
-  const parsed = taskOutcomeDate(dateKey);
-  if (!parsed || !Number.isFinite(Number(days))) return '';
-  const date = new Date(`${parsed}T00:00:00Z`);
-  date.setUTCDate(date.getUTCDate() + Number(days));
-  return date.toISOString().slice(0, 10);
-}
-
 function instructionDurationDays(value) {
   const text = String(value || '');
   const candidates = [];
@@ -534,403 +505,6 @@ function medicineFingerprint(title, instruction, timing) {
     .replace(/\s+/g, ' ')
     .trim();
   return [normalize(title), normalize(instruction), normalize(timing)].join('|');
-}
-
-function verifiedTimingConstraint(row) {
-  const currentText = [row?.instruction, row?.timing]
-    .filter(Boolean)
-    .join(' ')
-    .trim();
-  const fallbackText = [row?.original_instruction, row?.original_timing]
-    .filter(Boolean)
-    .join(' ')
-    .trim();
-  const text = (currentText || fallbackText).toLowerCase();
-
-  const rules = [
-    {
-      regex: /\b(?:after|before|with)\s+breakfast\b|\bbreakfast\b/,
-      period: 'morning',
-      phrase: 'breakfast',
-    },
-    {
-      regex: /\b(?:after|before|with)\s+lunch\b|\blunch\b/,
-      period: 'afternoon',
-      phrase: 'lunch',
-    },
-    {
-      regex: /\b(?:after|before|with)\s+(?:dinner|supper)\b|\b(?:dinner|supper)\b/,
-      period: 'evening',
-      phrase: 'dinner',
-    },
-    {
-      regex: /\b(?:at\s+)?bedtime\b/,
-      period: 'night',
-      phrase: 'bedtime',
-    },
-  ];
-
-  for (const rule of rules) {
-    if (rule.regex.test(text)) return rule;
-  }
-
-  const timingText = String(row?.original_timing || row?.timing || '').toLowerCase();
-  for (const period of ['morning', 'afternoon', 'evening', 'night']) {
-    if (new RegExp(`\\b${period}\\b`, 'i').test(timingText)) {
-      return { period, phrase: period };
-    }
-  }
-  return null;
-}
-
-function scheduleItemEffectiveStart(item, dateKey, plan) {
-  const activatedDate = dbDateKey(plan?.activated_at);
-  const scheduleDate = dbDateKey(item?.schedule_date);
-  const planStartDate = dbDateKey(plan?.start_date);
-
-  // Fixed medicine duration begins when the plan is actually activated.
-  // schedule_date is an operational reminder date and must not silently
-  // restart a "for N days" course on a later date.
-  //
-  // If a future version stores a clinician-specified medicine start date in
-  // its own dedicated field, that explicit medical date should outrank this.
-  if (activatedDate) return activatedDate;
-  if (scheduleDate) return scheduleDate;
-  if (planStartDate) return planStartDate;
-  return dateKey;
-}
-
-function scheduleItemDurationEndDate(item, dateKey, plan) {
-  const durationDays = Number(item?.instruction_duration_days || 0);
-  if (!Number.isInteger(durationDays) || durationDays <= 0) return '';
-  const effectiveStart = scheduleItemEffectiveStart(item, dateKey, plan);
-  return effectiveStart ? addDaysToDateKey(effectiveStart, durationDays - 1) : '';
-}
-
-function scheduleItemDurationExpired(item, dateKey, plan) {
-  const durationDays = Number(item?.instruction_duration_days || 0);
-  if (!Number.isInteger(durationDays) || durationDays <= 0) return false;
-
-  // Before activation, do not silently age a fixed medicine course just because
-  // the user spent time reviewing/setup. Once active, the course has a stable
-  // effective start and can be hard-stopped.
-  if (!['active', 'completed'].includes(String(plan?.status || ''))) return false;
-
-  const endDate = scheduleItemDurationEndDate(item, dateKey, plan);
-  return Boolean(endDate && dateKey > endDate);
-}
-
-function scheduleItemIsDaily(item) {
-  const recurrence = String(item?.recurrence_text || '').toLowerCase();
-  return /\b(?:daily|every\s+day|each\s+day|once\s+daily|twice\s+daily|times\s+daily|per\s+day)\b/.test(recurrence);
-}
-
-function scheduleItemAppliesOnDate(item, dateKey, plan) {
-  if (!item?.schedule_time) return false;
-
-  const daily = scheduleItemIsDaily(item);
-  const scheduleDate = dbDateKey(item.schedule_date);
-  const planStartDate = dbDateKey(plan?.start_date);
-  const activatedDate = dbDateKey(plan?.activated_at);
-
-  // Recurring reminder slots created from instructions such as "3 times daily"
-  // intentionally may not have a schedule_date. In that case the care-plan
-  // start/activation date is the effective beginning of the recurring series.
-  // A one-off task still requires its own explicit schedule_date.
-  if (!daily && !scheduleDate) return false;
-
-  const effectiveStart = scheduleItemEffectiveStart(item, dateKey, plan);
-
-  if (effectiveStart && dateKey < effectiveStart) return false;
-
-  const instructionEnd = scheduleItemDurationEndDate(item, dateKey, plan);
-  if (instructionEnd && dateKey > instructionEnd) return false;
-
-  const plannedEnd = dbDateKey(plan?.planned_end_date);
-  if (plan?.duration_mode !== 'ongoing' && plannedEnd && dateKey > plannedEnd) {
-    return false;
-  }
-
-  const completedDate = dbDateKey(plan?.completed_at);
-  if (plan?.status === 'completed' && completedDate && dateKey > completedDate) {
-    return false;
-  }
-
-  if (daily) return true;
-  return dateKey === scheduleDate;
-}
-
-function taskOccurrenceJson(row) {
-  const occurrenceDate = String(row.occurrence_date || '').slice(0, 10);
-  const scheduledTime = String(row.scheduled_time || '').slice(0, 5);
-  const completedTime = String(row.completed_time || '').slice(0, 5);
-  return {
-    id: String(row.id),
-    carePlanId: String(row.care_plan_id),
-    scheduleItemId: String(row.schedule_item_id),
-    occurrenceDate,
-    scheduledTime,
-    title: row.title,
-    taskKind: row.task_kind,
-    period: schedulePeriodKey(`${row.display_time || ''} ${row.recurrence_text || ''}`),
-    recurrenceText: row.recurrence_text || '',
-    grounding: row.grounding || 'suggested',
-    status: row.status || 'pending',
-    completedAt: row.completed_at || null,
-    completedTime: completedTime || null,
-    outcomeSource: row.outcome_source || 'user',
-    note: row.note || '',
-  };
-}
-
-async function reconcileExpiredFixedDurationOccurrences({
-  db,
-  userId,
-  planId,
-  dateKey,
-}) {
-  const [plans] = await db.execute(
-    `SELECT id, status, start_date, activated_at
-     FROM care_plans
-     WHERE id = ? AND user_id = ?
-     LIMIT 1`,
-    [planId, userId],
-  );
-  const plan = plans[0];
-  if (!plan || plan.status !== 'active') return;
-
-  const [items] = await db.execute(
-    `SELECT id, schedule_date, instruction_duration_days
-     FROM care_schedule_items
-     WHERE care_plan_id = ? AND user_id = ?
-       AND instruction_duration_days IS NOT NULL`,
-    [planId, userId],
-  );
-
-  for (const item of items) {
-    const instructionEnd = scheduleItemDurationEndDate(item, dateKey, plan);
-    if (!instructionEnd || dateKey <= instructionEnd) continue;
-
-    await db.execute(
-      `DELETE FROM care_task_occurrences
-       WHERE user_id = ?
-         AND care_plan_id = ?
-         AND schedule_item_id = ?
-         AND occurrence_date > ?
-         AND status = 'pending'`,
-      [userId, planId, item.id, instructionEnd],
-    );
-  }
-}
-
-async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) {
-  const [plans] = await db.execute(
-    `SELECT id, status, start_date, activated_at, completed_at,
-      duration_mode, planned_end_date
-     FROM care_plans
-     WHERE id = ? AND user_id = ?
-     LIMIT 1`,
-    [planId, userId],
-  );
-  const plan = plans[0];
-  if (!plan || plan.status !== 'active') return;
-
-  const [items] = await db.execute(
-    `SELECT id, care_plan_id, user_id, schedule_date, schedule_time,
-      display_time, recurrence_text, grounding, title, task_kind,
-      instruction_duration_days
-     FROM care_schedule_items
-     WHERE care_plan_id = ? AND user_id = ? AND schedule_time IS NOT NULL
-     ORDER BY id`,
-    [planId, userId],
-  );
-
-  for (const item of items) {
-    const instructionEnd = scheduleItemDurationEndDate(item, dateKey, plan);
-
-    // A fixed-duration medicine can already have pending occurrence rows that
-    // were generated while its course was still active. Once the verified
-    // medicine-specific end date has passed, remove only those future/pending
-    // rows. Completed/skipped/missed history is intentionally preserved.
-    if (instructionEnd && dateKey > instructionEnd) {
-      await db.execute(
-        `DELETE FROM care_task_occurrences
-         WHERE user_id = ?
-           AND care_plan_id = ?
-           AND schedule_item_id = ?
-           AND occurrence_date > ?
-           AND status = 'pending'`,
-        [userId, planId, item.id, instructionEnd],
-      );
-      continue;
-    }
-
-    if (!scheduleItemAppliesOnDate(item, dateKey, plan)) continue;
-    const scheduledTime = String(item.schedule_time || '').slice(0, 5);
-    if (!scheduledTime) continue;
-    await db.execute(
-      `INSERT IGNORE INTO care_task_occurrences (
-        user_id, care_plan_id, schedule_item_id, occurrence_date,
-        scheduled_at, status, outcome_source
-       ) VALUES (?, ?, ?, ?, ?, 'pending', 'system')`,
-      [
-        userId,
-        planId,
-        item.id,
-        dateKey,
-        `${dateKey} ${scheduledTime}:00`,
-      ],
-    );
-  }
-}
-
-async function ensureOccurrencesForRange({ db, userId, planId, startDate, endDate }) {
-  const start = new Date(`${startDate}T00:00:00Z`);
-  const end = new Date(`${endDate}T00:00:00Z`);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) return;
-  let count = 0;
-  for (let cursor = start; cursor <= end && count < 31; cursor = new Date(cursor.getTime() + 86400000)) {
-    await ensureOccurrencesForDate({
-      db,
-      userId,
-      planId,
-      dateKey: cursor.toISOString().slice(0, 10),
-    });
-    count += 1;
-  }
-}
-
-async function removeOccurrenceLearningSignals(db, userId, occurrenceId) {
-  await db.execute(
-    `DELETE FROM routine_learning_events
-     WHERE user_id = ? AND source_key LIKE ?`,
-    [userId, `task-occurrence:${occurrenceId}:%`],
-  );
-}
-
-async function recordOccurrenceLearning({ db, row, userId, outcome }) {
-  const period = schedulePeriodKey(`${row.display_time || ''} ${row.recurrence_text || ''}`);
-  const scheduleTime = String(row.scheduled_time || '').slice(0, 5);
-  if (!scheduleTime) return;
-  const eventType = outcome === 'completed'
-    ? 'task_completed'
-    : outcome === 'missed'
-      ? 'task_missed'
-      : outcome === 'skipped'
-        ? 'task_skipped'
-        : null;
-  if (!eventType) return;
-
-  await recordRoutineLearningEvent({
-    db,
-    userId,
-    carePlanId: String(row.care_plan_id),
-    eventType,
-    period,
-    scheduleTime,
-    signalValue: `${row.title || 'Care task'} · ${outcome}`,
-    sourceKey: `task-occurrence:${row.id}:${outcome}`,
-    metadata: {
-      occurrenceId: String(row.id),
-      taskId: String(row.schedule_item_id),
-      outcome,
-      occurrenceDate: String(row.occurrence_date || '').slice(0, 10),
-    },
-  });
-}
-
-async function reconcileMissedOccurrences({ db, userId, beforeDate }) {
-  const [rows] = await db.execute(
-    `SELECT o.id, o.care_plan_id, o.schedule_item_id, o.occurrence_date,
-      TIME_FORMAT(o.scheduled_at, '%H:%i') AS scheduled_time,
-      s.title, s.task_kind, s.display_time, s.recurrence_text
-     FROM care_task_occurrences o
-     JOIN care_schedule_items s ON s.id = o.schedule_item_id
-     WHERE o.user_id = ? AND o.status = 'pending' AND o.occurrence_date < ?
-     ORDER BY o.occurrence_date, o.scheduled_at
-     LIMIT 500`,
-    [userId, beforeDate],
-  );
-
-  for (const row of rows) {
-    const [result] = await db.execute(
-      `UPDATE care_task_occurrences
-       SET status = 'missed', outcome_source = 'system', updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND user_id = ? AND status = 'pending'`,
-      [row.id, userId],
-    );
-    if (!result.affectedRows) continue;
-    await removeOccurrenceLearningSignals(db, userId, row.id);
-    await recordOccurrenceLearning({ db, row, userId, outcome: 'missed' });
-  }
-}
-
-async function recordLifecycleEvent({ db, userId, planId, eventType, reason, metadata = null }) {
-  await db.execute(
-    `INSERT INTO care_plan_lifecycle_events (
-      user_id, care_plan_id, event_type, reason, metadata_json
-     ) VALUES (?, ?, ?, ?, ?)`,
-    [
-      userId,
-      planId,
-      cleanText(eventType, 60),
-      cleanText(reason, 500) || null,
-      metadata ? JSON.stringify(metadata).slice(0, 4000) : null,
-    ],
-  );
-}
-
-async function reconcilePlanLifecycle({ db, userId = null, today = serverDateKey() }) {
-  const params = [];
-  let userFilter = '';
-  if (userId != null) {
-    userFilter = ' AND user_id = ?';
-    params.push(userId);
-  }
-  params.push(today);
-
-  const [plans] = await db.execute(
-    `SELECT id, user_id, title, duration_mode, planned_end_date
-     FROM care_plans
-     WHERE status = 'active'
-       AND duration_mode <> 'ongoing'
-       AND planned_end_date IS NOT NULL
-       ${userFilter}
-       AND planned_end_date < ?
-     ORDER BY id`,
-    params,
-  );
-
-  for (const plan of plans) {
-    const [result] = await db.execute(
-      `UPDATE care_plans
-       SET status = 'completed', setup_step = 'complete',
-           completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
-           completion_reason = 'plan_end_date', completed_by = 'system',
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND user_id = ? AND status = 'active'`,
-      [plan.id, plan.user_id],
-    );
-    if (!result.affectedRows) continue;
-
-    await db.execute(
-      `DELETE FROM care_task_occurrences
-       WHERE care_plan_id = ? AND user_id = ?
-         AND status = 'pending' AND occurrence_date > ?`,
-      [plan.id, plan.user_id, dbDateKey(plan.planned_end_date)],
-    );
-
-    await recordLifecycleEvent({
-      db,
-      userId: plan.user_id,
-      planId: plan.id,
-      eventType: 'auto_completed',
-      reason: 'The selected care-plan end date was reached.',
-      metadata: { plannedEndDate: dbDateKey(plan.planned_end_date) },
-    });
-  }
-
-  return plans.length;
 }
 
 function safeDocumentName(value) {
@@ -1461,41 +1035,6 @@ function normalizeCareScheduleForInstructions(
   return output;
 }
 
-function scheduleWindow(displayTime) {
-  const label = String(displayTime || '').toLowerCase();
-  if (/\bmorning\b/.test(label)) {
-    return { start: 4 * 60, end: 11 * 60 + 59, label: 'morning (4:00 AM–11:59 AM)' };
-  }
-  if (/\bafternoon\b/.test(label)) {
-    return { start: 12 * 60, end: 16 * 60 + 59, label: 'afternoon (12:00 PM–4:59 PM)' };
-  }
-  if (/\b(bedtime|night)\b/.test(label)) {
-    return { start: 21 * 60, end: 3 * 60 + 59, label: 'night (9:00 PM–3:59 AM)' };
-  }
-  if (/\bevening\b/.test(label)) {
-    return { start: 17 * 60, end: 20 * 60 + 59, label: 'evening (5:00 PM–8:59 PM)' };
-  }
-  return null;
-}
-
-function timeFitsScheduleWindow(totalMinutes, window) {
-  if (!window) return true;
-  if (window.start <= window.end) {
-    return totalMinutes >= window.start && totalMinutes <= window.end;
-  }
-  // Overnight window, e.g. Night 21:00 -> 03:59.
-  return totalMinutes >= window.start || totalMinutes <= window.end;
-}
-
-function schedulePeriodKey(displayTime) {
-  const label = String(displayTime || '').toLowerCase();
-  if (/\b(bedtime|night)\b/.test(label)) return 'night';
-  if (/\bmorning\b/.test(label)) return 'morning';
-  if (/\bafternoon\b/.test(label)) return 'afternoon';
-  if (/\bevening\b/.test(label)) return 'evening';
-  return null;
-}
-
 function scheduleTimeToMinutes(value) {
   const match = String(value || '').trim().match(/^([01]?\d|2[0-3]):([0-5]\d)/);
   if (!match) return null;
@@ -1517,26 +1056,6 @@ function formatScheduleTime(value) {
   const suffix = hour24 >= 12 ? 'PM' : 'AM';
   const hour12 = hour24 % 12 || 12;
   return `${hour12}:${String(minute).padStart(2, '0')} ${suffix}`;
-}
-
-function routineNoteTime(note) {
-  const value = String(note || '').trim();
-  if (!value) return null;
-
-  const twelveHour = value.match(/\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b/i);
-  if (twelveHour) {
-    let hour = Number(twelveHour[1]) % 12;
-    const minute = Number(twelveHour[2] || 0);
-    if (twelveHour[3].toLowerCase() === 'pm') hour += 12;
-    return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-  }
-
-  const twentyFourHour = value.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-  if (twentyFourHour) {
-    return `${String(Number(twentyFourHour[1])).padStart(2, '0')}:${twentyFourHour[2]}`;
-  }
-
-  return null;
 }
 
 function defaultSuggestionTimes(period) {
@@ -2784,26 +2303,13 @@ app.post('/api/onboarding/complete', authenticate, async (req, res, next) => {
 
 app.get('/api/care-plans', authenticate, async (req, res, next) => {
   try {
-    await reconcilePlanLifecycle({ db: pool, userId: req.auth.userId });
-    const [rows] = await pool.execute(
-      `SELECT care_plans.*,
-        (SELECT COUNT(*) FROM care_documents
-          WHERE care_documents.care_plan_id = care_plans.id) AS document_count,
-        (SELECT COUNT(*) FROM care_schedule_items
-          WHERE care_schedule_items.care_plan_id = care_plans.id) AS task_count,
-        (SELECT COUNT(*) FROM care_gaps
-          WHERE care_gaps.care_plan_id = care_plans.id
-            AND care_gaps.status <> 'resolved') AS open_gap_count
-       FROM care_plans
-       WHERE care_plans.user_id = ?
-       ORDER BY care_plans.updated_at DESC`,
-      [req.auth.userId],
-    );
+    const result = await listCarePlans({ pool, userId: req.auth.userId });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
 
-    res.json({
-      success: true,
-      data: { plans: rows.map(carePlanJson) },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -4124,203 +3630,24 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
 });
 
 app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next) => {
-  const itemId = req.params.id;
-  const displayTime = cleanText(req.body?.displayTime, 160);
-  const scheduleTime = cleanText(req.body?.scheduleTime, 5);
-  const learningSource = cleanText(req.body?.learningSource, 60);
-  const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
-  if (!idPattern.test(itemId)) {
-    res.status(422).json({ success: false, message: 'Invalid schedule item ID.' });
-    return;
-  }
-  if (!timePattern.test(scheduleTime)) {
-    res.status(422).json({
-      success: false,
-      message: 'Select an exact reminder time before confirming this schedule item.',
-    });
-    return;
-  }
   try {
-    const [rows] = await pool.execute(
-      `SELECT s.id, s.care_plan_id, s.instruction_id, s.schedule_date,
-        TIME_FORMAT(s.schedule_time, '%H:%i') AS schedule_time,
-        s.display_time, s.grounding, s.title,
-        i.instruction, i.timing, i.original_instruction, i.original_timing
-       FROM care_schedule_items s
-       LEFT JOIN extracted_instructions i ON i.id = s.instruction_id
-       WHERE s.id = ? AND s.user_id = ?
-       LIMIT 1`,
-      [itemId, req.auth.userId],
-    );
-    if (rows.length === 0) {
-      res.status(404).json({ success: false, message: 'Schedule item not found.' });
-      return;
-    }
-
-    const verifiedExactTimes = extractVerifiedExactClockTimes(rows[0]);
-    if (isVerifiedExactScheduleItemLocked(rows[0]) && verifiedExactTimes.length > 0) {
-      const allowedTimes = verifiedExactTimes.map((item) => item.time.slice(0, 5));
-      const writtenTime = verifiedExactTimes
-        .map((item) => item.displayTime)
-        .join(' / ');
-      res.status(409).json({
-        success: false,
-        message:
-          `This reminder time is fixed by the verified instruction (${writtenTime}). ` +
-          'It cannot be edited from the schedule screen.',
-        data: {
-          medicalTimingConflict: true,
-          exactTimeLocked: true,
-          allowedTimes,
-          selectedTime: scheduleTime,
-        },
-      });
-      return;
-    }
-
-    // Prefer the period the user is saving now. Falling back to the stored
-    // display_time keeps older clients compatible, but does not let a stale
-    // AI-generated "Evening" label override a user-edited "Night" period.
-    const window = scheduleWindow(displayTime) || scheduleWindow(rows[0].display_time);
-    if (window) {
-      const [hour, minute] = scheduleTime.split(':').map(Number);
-      const selectedMinutes = (hour * 60) + minute;
-      if (!timeFitsScheduleWindow(selectedMinutes, window)) {
-        res.status(422).json({
-          success: false,
-          message: `Select a time within ${window.label} for this schedule item.`,
-        });
-        return;
-      }
-    }
-
-    const selectedPeriod = schedulePeriodKey(displayTime) ||
-      schedulePeriodKey(rows[0].display_time);
-
-    const medicalConstraint = verifiedTimingConstraint(rows[0]);
-    if (
-      selectedPeriod &&
-      medicalConstraint &&
-      selectedPeriod !== medicalConstraint.period
-    ) {
-      const requiredLabel =
-        medicalConstraint.period[0].toUpperCase() + medicalConstraint.period.slice(1);
-      const selectedLabel = selectedPeriod[0].toUpperCase() + selectedPeriod.slice(1);
-      res.status(409).json({
-        success: false,
-        message:
-          `Medical timing conflict: ${selectedLabel} conflicts with the verified ` +
-          `${medicalConstraint.phrase} instruction. SehatMate did not save this reminder.`,
-        data: {
-          medicalTimingConflict: true,
-          requiredPeriod: medicalConstraint.period,
-          selectedPeriod,
-          selectedTime: scheduleTime,
-          originalInstruction:
-            cleanText(rows[0].original_instruction || rows[0].instruction, 4000),
-          originalTiming:
-            cleanText(rows[0].original_timing || rows[0].timing, 160),
-          recommendation:
-            `Keep this reminder in ${requiredLabel}, or confirm a different medical timing with the prescribing clinician or pharmacist before changing it.`,
-        },
-      });
-      return;
-    }
-
-    // One instruction occurrence should not contain two reminder cards for
-    // the same period or the same exact time. Keep the check scoped to the
-    // same instruction and schedule date so repeating plans on other dates
-    // are not incorrectly blocked.
-    const [siblings] = await pool.execute(
-      `SELECT id, TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time, display_time
-       FROM care_schedule_items
-       WHERE care_plan_id = ?
-         AND user_id = ?
-         AND instruction_id <=> ?
-         AND schedule_date <=> ?
-         AND id <> ?`,
-      [
-        rows[0].care_plan_id,
-        req.auth.userId,
-        rows[0].instruction_id,
-        rows[0].schedule_date,
-        itemId,
-      ],
-    );
-
-    const sameTime = siblings.find(
-      (item) => String(item.schedule_time || '').slice(0, 5) === scheduleTime,
-    );
-    if (sameTime) {
-      res.status(409).json({
-        success: false,
-        message: 'This exact reminder time is already used for another dose of this instruction. Choose a different time.',
-      });
-      return;
-    }
-
-    if (selectedPeriod) {
-      const samePeriod = siblings.find(
-        (item) => schedulePeriodKey(item.display_time) === selectedPeriod,
-      );
-      if (samePeriod) {
-        const periodLabel = selectedPeriod[0].toUpperCase() + selectedPeriod.slice(1);
-        res.status(409).json({
-          success: false,
-          message: `${periodLabel} is already used for another reminder for this instruction. Choose a different period.`,
-        });
-        return;
-      }
-    }
-
-    await pool.execute(
-      `UPDATE care_schedule_items
-       SET schedule_time = ?, display_time = ?, requires_confirmation = 0,
-           confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND user_id = ?`,
-      [scheduleTime, displayTime || `Confirmed reminder at ${scheduleTime}`, itemId, req.auth.userId],
-    );
-
-    await pool.execute(
-      `UPDATE care_task_occurrences
-       SET scheduled_at = CONCAT(occurrence_date, ' ', ?, ':00'),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE schedule_item_id = ? AND user_id = ? AND status = 'pending'`,
-      [scheduleTime, itemId, req.auth.userId],
-    );
-
-    const oldTime = String(rows[0].schedule_time || '').slice(0, 5);
-    if (oldTime !== scheduleTime) {
-      await recordRoutineLearningEvent({
-        db: pool,
-        userId: req.auth.userId,
-        carePlanId: String(rows[0].care_plan_id),
-        eventType:
-          learningSource === 'ai_suggestion_accept'
-            ? 'suggestion_accepted'
-            : 'manual_schedule_edit',
-        period: selectedPeriod,
-        scheduleTime,
-        signalValue: rows[0].title || displayTime,
-        metadata: {
-          taskId: String(itemId),
-          previousTime: oldTime || null,
-          grounding: rows[0].grounding || null,
-        },
-      });
-    }
-
-    await refreshCareGaps({
-      db: pool,
-      planId: String(rows[0].care_plan_id),
+    const result = await confirmScheduleItem({
+      pool,
       userId: req.auth.userId,
-      realityQuestionTemplates,
+      itemId: req.params.id,
+      displayTime: req.body?.displayTime,
+      scheduleTime: req.body?.scheduleTime,
+      learningSource: req.body?.learningSource,
     });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
 
     res.json({
       success: true,
-      message: 'Exact reminder time confirmed.',
-      data: { scheduleTime },
+      message: result.message,
+      data: result.data,
     });
   } catch (error) {
     next(error);
@@ -4365,275 +3692,6 @@ function customRealityAction(questionKey) {
   if (questionKey === 'travel_access') return 'calendar';
   if (questionKey === 'medicine_access') return 'care_plan';
   return 'reality_check';
-}
-
-function legacyRealityQuestionText(key, fallback, preferredLanguage) {
-  const value = localizedAiFallbackText(key, preferredLanguage);
-  return value || fallback;
-}
-
-function realityQuestionTemplates(tasks, preferredLanguage = 'English') {
-  const text = tasks.map((item) => `${item.title} ${item.display_time || ''} ${item.recurrence_text || ''} ${item.reason || ''}`).join(' ').toLowerCase();
-  const kinds = new Set(tasks.map((item) => item.task_kind));
-  const questions = [];
-  const add = (key, category, question, options) => {
-    if (!questions.some((item) => item.key === key)) {
-      questions.push({
-        key,
-        category,
-        question,
-        reasonForAsking: localizedAiFallbackText(
-          'legacyRealityReason',
-          preferredLanguage,
-        ),
-        options,
-      });
-    }
-  };
-
-  if (/morning|breakfast|before food|after food/.test(text)) {
-    add('morning_routine', 'Routine', legacyRealityQuestionText(
-      'legacyMorningRoutineQuestion',
-      'Which option best matches your usual morning routine?',
-      preferredLanguage,
-    ), [
-      {
-        label: 'I can follow the stated morning or meal instruction',
-        points: 0,
-      },
-      {
-        label: 'My morning time changes on some days',
-        points: 8,
-        reason: 'Your morning routine changes on some days, so one fixed reminder may not fit every day.',
-        fix: 'Keep this honest answer. SehatMate can suggest a more practical reminder inside the allowed morning period without changing the medical instruction.',
-        action: 'schedule',
-      },
-      {
-        label: 'This timing is usually difficult for me',
-        points: 15,
-        reason: 'The current morning reminder does not fit your usual routine well.',
-        fix: 'Keep this honest answer. Review or adjust the reminder within the allowed morning period. If the timing came directly from the verified instruction, ask the prescribing clinician or pharmacist before changing it.',
-        action: 'schedule',
-      },
-    ]);
-  }
-
-  if (/afternoon|midday|lunch|3 times|three times/.test(text)) {
-    add('daytime_access', 'Routine', legacyRealityQuestionText(
-      'legacyDaytimeAccessQuestion',
-      'Can you access this medicine or task during the daytime?',
-      preferredLanguage,
-    ), [
-      {
-        label: 'Yes, reliably',
-        points: 0,
-      },
-      {
-        label: 'Sometimes',
-        points: 8,
-        reason: 'Daytime access is not reliable every day, so this reminder may need a more practical slot.',
-        fix: 'Keep this answer. SehatMate can suggest another allowed daytime reminder without changing the care instruction.',
-        action: 'schedule',
-      },
-      {
-        label: 'Usually not',
-        points: 15,
-        reason: 'You usually cannot access this medicine or task during the current daytime period.',
-        fix: 'Keep this answer. Review the allowed schedule for a practical time. If the prescribed timing itself cannot be followed, contact the prescribing clinician or pharmacist instead of changing the medical instruction yourself.',
-        action: 'schedule',
-      },
-    ]);
-  }
-
-  if (/evening|night|bedtime|dinner/.test(text)) {
-    add('evening_routine', 'Routine', legacyRealityQuestionText(
-      'legacyEveningRoutineQuestion',
-      'Can you follow the stated evening or bedtime instruction?',
-      preferredLanguage,
-    ), [
-      {
-        label: 'Yes, reliably',
-        points: 0,
-      },
-      {
-        label: 'My evening routine changes',
-        points: 8,
-        reason: 'Your evening routine changes, so one fixed reminder may not fit reliably every day.',
-        fix: 'Keep this answer. SehatMate can suggest another allowed evening or night reminder without changing the medical instruction.',
-        action: 'schedule',
-      },
-      {
-        label: 'This timing is usually difficult',
-        points: 15,
-        reason: 'The current evening or bedtime reminder is usually difficult for you to follow.',
-        fix: 'Keep this answer. Review the reminder inside its allowed period. If the timing came directly from the verified instruction, confirm any change with the prescribing clinician or pharmacist.',
-        action: 'schedule',
-      },
-    ]);
-  }
-
-  if (kinds.has('care_task') || /assist|caregiver|dressing/.test(text)) {
-    add('caregiver_support', 'Support', legacyRealityQuestionText(
-      'legacyCaregiverSupportQuestion',
-      'Is the required help available for this care task?',
-      preferredLanguage,
-    ), [
-      {
-        label: 'Yes, when needed',
-        points: 0,
-      },
-      {
-        label: 'Only sometimes',
-        points: 10,
-        reason: 'Required help is only available sometimes, so this care task may be harder to complete reliably.',
-        fix: 'Keep this answer. Arrange support for the times that need assistance where possible.',
-        action: 'family_care',
-      },
-      {
-        label: 'No help is currently available',
-        points: 20,
-        reason: 'This care task may need support that is not currently available.',
-        fix: 'Keep this answer. Arrange caregiver or family support where possible. If the verified instruction requires assistance and support cannot be arranged, contact the care team for guidance.',
-        action: 'family_care',
-      },
-    ]);
-  }
-
-  if (kinds.has('follow_up') || kinds.has('lab_test')) {
-    add('travel_access', 'Visits and tests', legacyRealityQuestionText(
-      'legacyTravelAccessQuestion',
-      'Can you reach the clinic or laboratory at the stated time?',
-      preferredLanguage,
-    ), [
-      {
-        label: 'Yes, transport is arranged',
-        points: 0,
-      },
-      {
-        label: 'Transport still needs arranging',
-        points: 10,
-        reason: 'Transport has not been arranged yet, so the planned visit or test may be difficult to attend.',
-        fix: 'Keep this answer. Arrange transport where possible. If the appointment time itself needs changing, confirm the new time with the clinic or laboratory.',
-        action: 'calendar',
-      },
-      {
-        label: 'I cannot reach it at that time',
-        points: 20,
-        reason: 'You cannot currently reach the clinic or laboratory at the stated time.',
-        fix: 'Keep this answer. Contact the clinic or laboratory to confirm a workable appointment time before changing the plan.',
-        action: 'calendar',
-      },
-    ]);
-  }
-
-  if (kinds.has('medicine')) {
-    add('medicine_access', 'Medicine access', legacyRealityQuestionText(
-      'legacyMedicineAccessQuestion',
-      'Have you obtained the medicines listed in this verified plan?',
-      preferredLanguage,
-    ), [
-      {
-        label: 'Yes, all of them',
-        points: 0,
-      },
-      {
-        label: 'Some are still missing',
-        points: 12,
-        reason: 'One or more medicines in the verified plan are not currently available to you.',
-        fix: 'Keep this answer. This is an availability warning, not a failed Reality Check. Obtain the prescribed medicines through your usual pharmacy or care provider when possible. Do not substitute or change a medicine without professional confirmation.',
-        action: 'care_plan',
-      },
-      {
-        label: 'None yet',
-        points: 20,
-        reason: 'The medicines in this verified plan have not been obtained yet.',
-        fix: 'Keep this answer. Obtain the prescribed medicines through your usual pharmacy or care provider when possible. Do not start substitutes or change the prescription yourself.',
-        action: 'care_plan',
-      },
-    ]);
-  }
-
-  return questions.slice(0, 6);
-}
-
-async function realityDecisionTemplatesForPlan({
-  db,
-  planId,
-  userId,
-  tasks = [],
-  createIfMissing = false,
-  preferredLanguage = null,
-}) {
-  const resolvedPreferredLanguage =
-    preferredLanguage || await readPreferredLanguageForUser(db, userId);
-  let activeSet = await readActiveRealityQuestionSet({ db, planId, userId });
-
-  // Never use a persisted question set produced by older safety rules.
-  // A GET of the Reality Check may regenerate it; downstream readers that do
-  // not create questions will use the deterministic fallback until that occurs.
-  if (
-    activeSet &&
-    (
-      activeSet.generatorVersion !== REALITY_CHECK_GENERATOR_VERSION ||
-      activeSet.preferredLanguage !== resolvedPreferredLanguage
-    )
-  ) {
-    activeSet = null;
-  }
-
-  if (createIfMissing && tasks.length > 0) {
-    const [instructions] = await db.execute(
-      `SELECT id, category, title, instruction, timing, review_status,
-        requires_professional_confirmation
-       FROM extracted_instructions
-       WHERE care_plan_id = ?
-       ORDER BY id`,
-      [planId],
-    );
-    const routineProfile = await readRoutineProfile(db, userId);
-
-    try {
-      // Always go through the version-aware store resolver. It cheaply reuses
-      // the current set, but regenerates when the generator safety version
-      // changes. Assigning null is intentional: an obsolete set must not be
-      // served if safe regeneration cannot produce valid questions.
-      activeSet = await getOrCreateRealityQuestionSet({
-        db,
-        planId,
-        userId,
-        instructions,
-        tasks,
-        routineProfile,
-        knownRealityFacts: [],
-        refreshIfContextChanged: false,
-        preferredLanguage: resolvedPreferredLanguage,
-      });
-    } catch (error) {
-      activeSet = null;
-      console.warn(
-        `Reality Check AI generation failed for plan ${planId}; using the deterministic compatibility fallback.`,
-        error?.message || error,
-      );
-    }
-  }
-
-  if (activeSet?.questions?.length) {
-    return {
-      source: 'ai_persisted',
-      questionSet: activeSet,
-      templates: activeSet.questions.map(dynamicQuestionToDecisionTemplate),
-    };
-  }
-
-  return {
-    source: 'legacy_fallback',
-    questionSet: null,
-    templates: realityQuestionTemplates(
-      tasks,
-      resolvedPreferredLanguage,
-    ).map((template) =>
-      legacyTemplateToDecisionTemplate(template, tasks)),
-  };
 }
 
 app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
@@ -4715,175 +3773,26 @@ app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next
 });
 
 app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, next) => {
-  const planId = req.params.id;
-  const answers = Array.isArray(req.body?.answers) ? req.body.answers : [];
-  const requestedQuestionSetVersion = Number(req.body?.questionSetVersion || 0);
-  if (!idPattern.test(planId) || !answers.length) {
-    return res.status(422).json({
-      success: false,
-      message: 'Complete the relevant reality-check questions.',
-    });
-  }
-
-  const connection = await pool.getConnection();
-  let transactionStarted = false;
   try {
-    const [plans] = await connection.execute(
-      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
-      [planId, req.auth.userId],
-    );
-    if (!plans.length) {
-      return res.status(404).json({ success: false, message: 'Care plan not found.' });
-    }
-
-    const [tasks] = await connection.execute(
-      `SELECT id, instruction_id, task_kind, schedule_date,
-        TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
-        title, display_time, recurrence_text, grounding, reason,
-        requires_confirmation
-       FROM care_schedule_items
-       WHERE care_plan_id = ? AND user_id = ?
-       ORDER BY id`,
-      [planId, req.auth.userId],
-    );
-    const reality = await realityDecisionTemplatesForPlan({
-      db: connection,
-      planId,
+    const result = await saveRealityAnswers({
+      pool,
       userId: req.auth.userId,
-      tasks,
-      createIfMissing: false,
-      preferredLanguage: await preferredLanguageForRequest(req, connection),
+      planId: req.params.id,
+      answers: req.body?.answers,
+      questionSetVersion: req.body?.questionSetVersion,
     });
-    const byKey = new Map(reality.templates.map((item) => [item.key, item]));
-
-    if (
-      requestedQuestionSetVersion > 0 &&
-      reality.questionSet?.version &&
-      requestedQuestionSetVersion !== Number(reality.questionSet.version)
-    ) {
-      return res.status(409).json({
-        success: false,
-        message:
-          'Your Reality Check was refreshed after this screen was opened. Reopen the Reality Check before saving these answers.',
-      });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
     }
-
-    await connection.beginTransaction();
-    transactionStarted = true;
-
-    for (const answer of answers) {
-      const key = cleanText(answer?.key, 80);
-      const selected = cleanText(answer?.answer, 240);
-      const note = cleanText(answer?.note, 500);
-      const template = byKey.get(key);
-
-      if (!template) throw new Error('INVALID_REALITY_ANSWER');
-
-      if (selected === '__clear__') {
-        await connection.execute(
-          `DELETE FROM care_reality_answers
-           WHERE care_plan_id = ? AND user_id = ? AND question_key = ?`,
-          [planId, req.auth.userId, key],
-        );
-        continue;
-      }
-
-      const option = template.options.find((item) => item.label === selected);
-      const isCustom = selected === '__custom__' && note.length > 0;
-      if (!option && !isCustom) throw new Error('INVALID_REALITY_ANSWER');
-
-      const storedAnswer = isCustom ? '__custom__' : selected;
-      const riskPoints = riskPointsForRealityAnswer({
-        selectedAnswer: storedAnswer,
-        note,
-        template,
-        storedRiskPoints: 0,
-      });
-
-      await connection.execute(
-        `INSERT INTO care_reality_answers
-          (care_plan_id, user_id, question_key, category, question_text,
-           selected_answer, risk_points, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           category = VALUES(category),
-           question_text = VALUES(question_text),
-           selected_answer = VALUES(selected_answer),
-           risk_points = VALUES(risk_points),
-           note = VALUES(note),
-           updated_at = CURRENT_TIMESTAMP`,
-        [
-          planId,
-          req.auth.userId,
-          key,
-          template.category,
-          template.question,
-          storedAnswer,
-          riskPoints,
-          note,
-        ],
-      );
-
-      const targetTasks = targetTasksForRealityQuestion(template, tasks);
-      const metadataPeriod = ['morning', 'afternoon', 'evening', 'night'].includes(template.period)
-        ? template.period
-        : null;
-      const inferredPeriod = metadataPeriod || (
-        targetTasks.length === 1
-          ? schedulePeriodKey(`${targetTasks[0].display_time || ''} ${targetTasks[0].recurrence_text || ''}`)
-          : null
-      );
-
-      await recordRoutineLearningEvent({
-        db: connection,
-        userId: req.auth.userId,
-        carePlanId: planId,
-        eventType: 'reality_answer',
-        period: inferredPeriod,
-        scheduleTime: routineNoteTime(note),
-        signalValue: isCustom ? note : selected,
-        sourceKey: `reality:${planId}:${key}`,
-        metadata: {
-          questionKey: key,
-          intent: template.intent,
-          responseProfile: template.responseProfile,
-          targetTaskIds: template.targetTaskIds,
-          period: template.period,
-          source: template.source,
-          custom: isCustom,
-        },
-      });
-    }
-
-    await connection.commit();
-    transactionStarted = false;
-
-    await refreshCareGaps({
-      db: pool,
-      planId,
-      userId: req.auth.userId,
-      realityQuestionTemplates,
-    });
 
     res.json({
       success: true,
-      message: 'Reality-check answers saved.',
-      data: {
-        source: reality.source,
-        questionSetVersion: reality.questionSet?.version || null,
-      },
+      message: result.message,
+      data: result.data,
     });
   } catch (error) {
-    if (transactionStarted) await connection.rollback();
-    if (error?.message === 'INVALID_REALITY_ANSWER') {
-      return res.status(422).json({
-        success: false,
-        message: 'Choose an option or write your own answer for every question.',
-      });
-    }
     next(error);
-  } finally {
-    connection.release();
   }
 });
 
@@ -5405,157 +4314,18 @@ const adaptations = findings
 });
 
 app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
-  const planId = req.params.id;
-  if (!idPattern.test(planId)) {
-    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
-    return;
-  }
-
   try {
-    await reconcilePlanLifecycle({ db: pool, userId: req.auth.userId });
-    const [plans] = await pool.execute(
-      'SELECT * FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
-      [planId, req.auth.userId],
-    );
-    if (plans.length === 0) {
-      res.status(404).json({ success: false, message: 'Care plan not found.' });
+    const result = await readCarePlanDetail({
+      pool,
+      userId: req.auth.userId,
+      planId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
       return;
     }
 
-    const [documents] = await pool.execute(
-      `SELECT id, document_type, original_name, mime_type, file_size_bytes,
-        page_count, processing_status, processing_error, created_at
-       FROM care_documents
-       WHERE care_plan_id = ? AND user_id = ? ORDER BY created_at DESC`,
-      [planId, req.auth.userId],
-    );
-    const [instructions] = await pool.execute(
-      `SELECT id, document_id, category, title, instruction, timing,
-        original_title, original_instruction, original_timing,
-        duplicate_of_instruction_id, duplicate_reason,
-        source_page, confidence_score, review_status,
-        requires_professional_confirmation, ambiguity_reason,
-        possible_interpretation, safety_note, safety_check_status,
-        safety_check_summary, safety_possible_interpretation,
-        safety_question, safety_sources,
-        safety_checked_at, verified_at
-       FROM extracted_instructions
-       WHERE care_plan_id = ? ORDER BY id`,
-      [planId],
-    );
-    const [tasks] = await pool.execute(
-      `SELECT id, instruction_id, NULL AS caregiver_id,
-        schedule_date AS task_date, schedule_date, schedule_time,
-        COALESCE(TIME_FORMAT(schedule_time, '%H:%i'), NULLIF(display_time, ''), 'Review timing') AS task_time,
-        title,
-        CONCAT_WS(
-          ' · ',
-          NULLIF(recurrence_text, ''),
-          NULLIF(display_time, ''),
-          NULLIF(reason, ''),
-          CASE
-            WHEN instruction_duration_days IS NOT NULL
-            THEN CONCAT('Fixed medicine course: ', instruction_duration_days, ' day', IF(instruction_duration_days = 1, '', 's'), '; stops automatically')
-            ELSE NULL
-          END
-        ) AS note,
-        task_kind, display_time, recurrence_text, grounding,
-        CASE
-          WHEN grounding = 'explicit' AND schedule_time IS NOT NULL THEN 1
-          ELSE 0
-        END AS time_locked,
-        instruction_duration_days,
-        CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
-        NULL AS completed_at
-       FROM care_schedule_items
-       WHERE care_plan_id = ? AND user_id = ?
-       ORDER BY schedule_date, schedule_time, id`,
-      [planId, req.auth.userId],
-    );
-    const visibleTasks = tasks.filter(
-      (item) => !scheduleItemDurationExpired(item, serverDateKey(), plans[0]),
-    );
-
-    const gaps = await refreshCareGaps({
-      db: pool,
-      planId,
-      userId: req.auth.userId,
-      realityQuestionTemplates,
-    });
-    const [caregivers] = await pool.execute(
-      `SELECT id, name, relationship, phone, availability, helps_with,
-        access_permissions
-       FROM caregivers
-       WHERE user_id = ? AND (care_plan_id = ? OR care_plan_id IS NULL)
-       ORDER BY name`,
-      [req.auth.userId, planId],
-    );
-    const [questions] = await pool.execute(
-      `SELECT id, care_gap_id, group_name, title, question, answer,
-        status, answered_at
-       FROM doctor_questions WHERE care_plan_id = ? ORDER BY id`,
-      [planId],
-    );
-
-    res.json({
-      success: true,
-      data: {
-        plan: carePlanJson(plans[0]),
-        documents: documents.map((item) => ({ ...item, id: String(item.id) })),
-        instructions: instructions
-          .filter((item) => cleanText(item.title, 160) && cleanText(item.instruction, 4000))
-          .map((item) => ({
-            ...item,
-            id: String(item.id),
-            title: cleanText(item.title, 160),
-            instruction: cleanText(item.instruction, 4000),
-            timing: cleanText(item.timing, 160) || null,
-            document_id: item.document_id == null ? null : String(item.document_id),
-            duplicate_of_instruction_id:
-              item.duplicate_of_instruction_id == null
-                ? null
-                : String(item.duplicate_of_instruction_id),
-            safety_sources: parseStoredJson(item.safety_sources),
-          })),
-        verifiedInstructions: instructions
-          .filter((item) =>
-            item.review_status === 'verified' &&
-            cleanText(item.title, 160) &&
-            cleanText(item.instruction, 4000))
-          .map((item) => ({
-            ...item,
-            id: String(item.id),
-            title: cleanText(item.title, 160),
-            instruction: cleanText(item.instruction, 4000),
-            timing: cleanText(item.timing, 160) || null,
-            document_id: item.document_id == null ? null : String(item.document_id),
-            duplicate_of_instruction_id:
-              item.duplicate_of_instruction_id == null
-                ? null
-                : String(item.duplicate_of_instruction_id),
-            safety_sources: parseStoredJson(item.safety_sources),
-          })),
-        tasks: visibleTasks.map((item) => ({
-          ...item,
-          id: String(item.id),
-          instruction_id: item.instruction_id == null ? null : String(item.instruction_id),
-          caregiver_id: item.caregiver_id == null ? null : String(item.caregiver_id),
-        })),
-        gaps: gaps.map(careGapJson),
-        gapSummary: careGapSummary(gaps),
-        caregivers: caregivers.map((item) => ({
-          ...item,
-          id: String(item.id),
-          helps_with: parseStoredJson(item.helps_with),
-          access_permissions: parseStoredJson(item.access_permissions),
-        })),
-        questions: questions.map((item) => ({
-          ...item,
-          id: String(item.id),
-          care_gap_id: item.care_gap_id == null ? null : String(item.care_gap_id),
-        })),
-      },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -5563,52 +4333,21 @@ app.get('/api/care-plans/:id', authenticate, async (req, res, next) => {
 
 
 app.get('/api/care-plans/:id/care-gaps', authenticate, async (req, res, next) => {
-  const planId = req.params.id;
-  if (!idPattern.test(planId)) {
-    res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
-    return;
-  }
-
   try {
-    const [plans] = await pool.execute(
-      'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
-      [planId, req.auth.userId],
-    );
-    if (!plans.length) {
-      res.status(404).json({ success: false, message: 'Care plan not found.' });
+    const result = await listCareGaps({
+      pool,
+      userId: req.auth.userId,
+      planId: req.params.id,
+      lifecycle: req.query?.lifecycle,
+      severity: req.query?.severity,
+      gapType: req.query?.type,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
       return;
     }
 
-    let gaps = await refreshCareGaps({
-      db: pool,
-      planId,
-      userId: req.auth.userId,
-      realityQuestionTemplates,
-    });
-
-    const lifecycle = cleanText(req.query?.lifecycle, 20).toLowerCase();
-    const severity = cleanText(req.query?.severity, 20).toLowerCase();
-    const gapType = cleanText(req.query?.type, 40).toLowerCase();
-
-    if (['open', 'in_progress', 'resolved'].includes(lifecycle)) {
-      gaps = gaps.filter((item) => item.lifecycle_status === lifecycle);
-    }
-    if (['blocking', 'attention'].includes(severity)) {
-      gaps = gaps.filter((item) => item.severity === severity);
-    }
-    if (gapType) {
-      gaps = gaps.filter((item) => item.gap_type === gapType);
-    }
-
-    const allRows = await readCareGaps(pool, planId);
-
-    res.json({
-      success: true,
-      data: {
-        summary: careGapSummary(allRows),
-        gaps: gaps.map(careGapJson),
-      },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -5652,72 +4391,18 @@ app.post('/api/care-plans/:id/care-gaps/refresh', authenticate, async (req, res,
 });
 
 app.get('/api/care-gaps/:id', authenticate, async (req, res, next) => {
-  const gapId = req.params.id;
-
-  if (!idPattern.test(gapId)) {
-    res.status(422).json({
-      success: false,
-      message: 'Invalid care gap ID.',
-    });
-    return;
-  }
-
   try {
-    const gap = await readCareGapForUser(
+    const result = await readCareGapDetail({
       pool,
-      gapId,
-      req.auth.userId,
-    );
-
-    if (!gap) {
-      res.status(404).json({
-        success: false,
-        message: 'Care gap not found.',
-      });
+      userId: req.auth.userId,
+      gapId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
       return;
     }
 
-    const [questions] = await pool.execute(
-      `SELECT
-         id,
-         care_gap_id,
-         group_name,
-         title,
-         question,
-         answer,
-         status,
-         answered_at,
-         created_at,
-         updated_at
-       FROM doctor_questions
-       WHERE care_gap_id = ?
-         AND care_plan_id = ?
-       ORDER BY id`,
-      [
-        gapId,
-        gap.care_plan_id,
-      ],
-    );
-
-    res.json({
-      success: true,
-      data: {
-        gap: careGapJson(gap),
-
-        doctorQuestions: questions.map(
-          (item) => ({
-            ...item,
-
-            id: String(item.id),
-
-            care_gap_id:
-              item.care_gap_id == null
-                ? null
-                : String(item.care_gap_id),
-          }),
-        ),
-      },
-    });
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -5725,111 +4410,24 @@ app.get('/api/care-gaps/:id', authenticate, async (req, res, next) => {
 
 
 app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
-  const gapId = req.params.id;
-  const lifecycleStatus = cleanText(req.body?.lifecycleStatus, 20).toLowerCase();
-  const resolutionNote = cleanText(req.body?.resolutionNote, 2000);
-
-  if (!idPattern.test(gapId)) {
-    res.status(422).json({ success: false, message: 'Invalid care gap ID.' });
-    return;
-  }
-  if (!['open', 'in_progress', 'resolved'].includes(lifecycleStatus)) {
-    res.status(422).json({
-      success: false,
-      message: 'Choose a valid care-gap status.',
-    });
-    return;
-  }
-
   try {
-    let gap = await readCareGapForUser(pool, gapId, req.auth.userId);
-    if (!gap) {
-      res.status(404).json({ success: false, message: 'Care gap not found.' });
+    const result = await updateCareGapLifecycle({
+      pool,
+      userId: req.auth.userId,
+      gapId: req.params.id,
+      lifecycleStatus: req.body?.lifecycleStatus,
+      resolutionNote: req.body?.resolutionNote,
+      preferredLanguage: await preferredLanguageForRequest(req),
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
       return;
     }
-
-    if (Boolean(gap.auto_managed) && lifecycleStatus === 'resolved') {
-      await refreshCareGaps({
-        db: pool,
-        planId: String(gap.care_plan_id),
-        userId: req.auth.userId,
-        realityQuestionTemplates,
-      });
-      gap = await readCareGapForUser(pool, gapId, req.auth.userId);
-
-      if (gap.lifecycle_status !== 'resolved') {
-        res.status(409).json({
-          success: false,
-          message: 'This care gap is managed automatically. Fix the underlying item first.',
-          data: {
-            gap: careGapJson(gap),
-            nextStep: gap.next_step,
-          },
-        });
-        return;
-      }
-
-      res.json({
-        success: true,
-        message: 'The underlying issue is already resolved.',
-        data: { gap: careGapJson(gap) },
-      });
-      return;
-    }
-
-    if (lifecycleStatus === 'resolved') {
-      await pool.execute(
-        `UPDATE care_gaps
-         SET lifecycle_status = 'resolved', status = 'resolved',
-           resolution_note = ?, resolved_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [resolutionNote || 'Resolved by the user.', gapId],
-      );
-    } else if (lifecycleStatus === 'in_progress') {
-      await pool.execute(
-        `UPDATE care_gaps
-         SET lifecycle_status = 'in_progress',
-           resolution_note = ?, resolved_at = NULL
-         WHERE id = ?`,
-        [resolutionNote || null, gapId],
-      );
-    } else {
-      const reopenedStatus = gap.severity === 'blocking' ? 'blocked' : 'at_risk';
-      await pool.execute(
-        `UPDATE care_gaps
-         SET lifecycle_status = 'open', status = ?,
-           resolution_note = ?, resolved_at = NULL
-         WHERE id = ?`,
-        [reopenedStatus, resolutionNote || null, gapId],
-      );
-    }
-
-   const preferredLanguage = await preferredLanguageForRequest(req);
-   try {
-  await analyzeAndStoreCareGapContext({
-    db: pool,
-    gapId,
-    userId:
-      req.auth.userId,
-    generateAiText,
-    preferredLanguage,
-  });
-} catch (contextError) {
-  /*
-   * Saving the user's progress note is the primary
-   * operation. Context analysis must not block it.
-   */
-  console.error(
-    'Care-gap context analysis failed after progress note:',
-    contextError,
-  );
-}
-    gap = await readCareGapForUser(pool, gapId, req.auth.userId);
 
     res.json({
       success: true,
-      message: 'Care gap updated.',
-      data: { gap: careGapJson(gap) },
+      message: result.message,
+      data: result.data,
     });
   } catch (error) {
     next(error);
@@ -6668,149 +5266,29 @@ app.get('/api/care-plans/:id/task-occurrences', authenticate, async (req, res, n
 });
 
 app.patch('/api/task-occurrences/:id/outcome', authenticate, async (req, res, next) => {
-  const occurrenceId = req.params.id;
-  const outcome = cleanText(req.body?.status, 20).toLowerCase();
-  const note = cleanText(req.body?.note, 500);
-  const operationKey = cleanText(req.body?.operationKey, 120);
-  const baseStatus = cleanText(req.body?.baseStatus, 20).toLowerCase();
-
-  if (!idPattern.test(occurrenceId) || !['pending', 'completed', 'skipped'].includes(outcome)) {
-    return res.status(422).json({ success: false, message: 'Select a valid task outcome.' });
-  }
-  if (baseStatus && !['pending', 'completed', 'skipped', 'missed'].includes(baseStatus)) {
-    return res.status(422).json({ success: false, message: 'Invalid task base status.' });
-  }
-
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-
-    const [rows] = await connection.execute(
-      `SELECT o.id, o.care_plan_id, o.schedule_item_id, o.occurrence_date,
-        TIME_FORMAT(o.scheduled_at, '%H:%i') AS scheduled_time,
-        o.status, o.completed_at,
-        TIME_FORMAT(o.completed_at, '%H:%i') AS completed_time,
-        o.outcome_source, o.note,
-        s.title, s.task_kind, s.display_time, s.recurrence_text, s.grounding
-       FROM care_task_occurrences o
-       JOIN care_schedule_items s ON s.id = o.schedule_item_id
-       WHERE o.id = ? AND o.user_id = ?
-       LIMIT 1 FOR UPDATE`,
-      [occurrenceId, req.auth.userId],
-    );
-    const row = rows[0];
-    if (!row) {
-      await connection.rollback();
-      return res.status(404).json({ success: false, message: 'Task occurrence not found.' });
+    const result = await applyTaskOutcome({
+      pool,
+      userId: req.auth.userId,
+      occurrenceId: req.params.id,
+      outcome: req.body?.status,
+      note: req.body?.note,
+      operationKey: req.body?.operationKey,
+      baseStatus: req.body?.baseStatus,
+      today: req.body?.today,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
     }
 
-    if (operationKey) {
-      const [operations] = await connection.execute(
-        `SELECT id
-         FROM care_task_outcome_operations
-         WHERE user_id = ? AND operation_key = ?
-         LIMIT 1`,
-        [req.auth.userId, operationKey],
-      );
-      if (operations.length) {
-        await connection.commit();
-        return res.json({
-          success: true,
-          message: 'Task outcome was already synchronized.',
-          data: { occurrence: taskOccurrenceJson(row), idempotentReplay: true },
-        });
-      }
-    }
-
-    const clientToday = taskOutcomeDate(req.body?.today) || serverDateKey();
-    if (outcome === 'pending' && String(row.occurrence_date).slice(0, 10) < clientToday) {
-      await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: 'A past occurrence cannot be returned to pending. Record what actually happened instead.',
-        data: { occurrence: taskOccurrenceJson(row), conflict: true },
-      });
-    }
-
-    if (baseStatus && row.status !== baseStatus && row.status !== outcome) {
-      await connection.rollback();
-      return res.status(409).json({
-        success: false,
-        message: 'This task changed on another device. The latest server outcome was kept.',
-        data: { occurrence: taskOccurrenceJson(row), conflict: true },
-      });
-    }
-
-    if (row.status !== outcome || (note || '') !== (row.note || '')) {
-      await connection.execute(
-        `UPDATE care_task_occurrences
-         SET status = ?,
-             completed_at = CASE
-               WHEN ? = 1 AND status <> 'completed' THEN CURRENT_TIMESTAMP
-               WHEN ? = 1 THEN completed_at
-               ELSE NULL
-             END,
-             outcome_source = 'user', note = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ? AND user_id = ?`,
-        [
-          outcome,
-          outcome === 'completed' ? 1 : 0,
-          outcome === 'completed' ? 1 : 0,
-          note || null,
-          occurrenceId,
-          req.auth.userId,
-        ],
-      );
-
-      await removeOccurrenceLearningSignals(connection, req.auth.userId, occurrenceId);
-      if (outcome === 'completed' || outcome === 'skipped') {
-        await recordOccurrenceLearning({
-          db: connection,
-          row,
-          userId: req.auth.userId,
-          outcome,
-        });
-      }
-    }
-
-    if (operationKey) {
-      await connection.execute(
-        `INSERT IGNORE INTO care_task_outcome_operations
-          (user_id, occurrence_id, operation_key, outcome)
-         VALUES (?, ?, ?, ?)`,
-        [req.auth.userId, occurrenceId, operationKey, outcome],
-      );
-    }
-
-    await connection.commit();
-
-    const [updated] = await pool.execute(
-      `SELECT o.id, o.care_plan_id, o.schedule_item_id, o.occurrence_date,
-        TIME_FORMAT(o.scheduled_at, '%H:%i') AS scheduled_time,
-        o.status, o.completed_at,
-        TIME_FORMAT(o.completed_at, '%H:%i') AS completed_time,
-        o.outcome_source, o.note,
-        s.title, s.task_kind, s.display_time, s.recurrence_text, s.grounding
-       FROM care_task_occurrences o
-       JOIN care_schedule_items s ON s.id = o.schedule_item_id
-       WHERE o.id = ? AND o.user_id = ? LIMIT 1`,
-      [occurrenceId, req.auth.userId],
-    );
-
-    return res.json({
+    res.json({
       success: true,
-      message: outcome === 'completed'
-        ? 'Task marked completed.'
-        : outcome === 'skipped'
-          ? 'Task recorded as skipped.'
-          : 'Task outcome cleared.',
-      data: { occurrence: taskOccurrenceJson(updated[0]) },
+      message: result.message,
+      data: result.data,
     });
   } catch (error) {
-    try { await connection.rollback(); } catch (_) {}
     next(error);
-  } finally {
-    connection.release();
   }
 });
 
@@ -6879,36 +5357,18 @@ app.get('/api/care-plans/:id/task-outcomes/summary', authenticate, async (req, r
 });
 
 app.get('/api/care-plans/:id/lifecycle', authenticate, async (req, res, next) => {
-  const planId = req.params.id;
-  if (!idPattern.test(planId)) {
-    return res.status(422).json({ success: false, message: 'Invalid care plan ID.' });
-  }
   try {
-    const [plans] = await pool.execute(
-      `SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1`,
-      [planId, req.auth.userId],
-    );
-    if (!plans.length) return res.status(404).json({ success: false, message: 'Care plan not found.' });
-    const [events] = await pool.execute(
-      `SELECT id, event_type, reason, metadata_json, created_at
-       FROM care_plan_lifecycle_events
-       WHERE care_plan_id = ? AND user_id = ?
-       ORDER BY created_at DESC, id DESC
-       LIMIT 100`,
-      [planId, req.auth.userId],
-    );
-    res.json({
-      success: true,
-      data: {
-        events: events.map((event) => ({
-          id: String(event.id),
-          eventType: event.event_type,
-          reason: event.reason || '',
-          metadata: parseStoredObject(event.metadata_json),
-          createdAt: event.created_at,
-        })),
-      },
+    const result = await readPlanLifecycleEvents({
+      pool,
+      userId: req.auth.userId,
+      planId: req.params.id,
     });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
