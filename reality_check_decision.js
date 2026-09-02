@@ -157,7 +157,10 @@ export function legacyTemplateToDecisionTemplate(template, tasks = []) {
     responseProfile: metadata.responseProfile,
     targetTaskIds: legacyTargetIds(key, tasks),
     period: metadata.period,
-    reasonForAsking: 'Legacy compatibility question for practical care-plan fit.',
+    reasonForAsking: clean(
+      template?.reasonForAsking ?? template?.reason_for_asking,
+      500,
+    ) || 'Legacy compatibility question for practical care-plan fit.',
     source: 'legacy_fallback',
   };
 }

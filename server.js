@@ -21,6 +21,11 @@ import {
 } from './ai_service.js';
 
 import {
+  localizedAiFallbackText,
+  readPreferredLanguageForUser,
+} from './language_support.js';
+
+import {
   careGapJson,
   careGapSummary,
   readCareGapForUser,
@@ -950,7 +955,7 @@ function validDocumentSignature(buffer, mimeType) {
   return false;
 }
 
-function parseAiInstructions(text) {
+function parseAiInstructions(text, preferredLanguage) {
   const cleaned = String(text || '')
     .trim()
     .replace(/^```(?:json)?\s*/i, '')
@@ -1010,11 +1015,20 @@ function parseAiInstructions(text) {
       parsed.reviewStatus = 'unclear';
       parsed.requiresProfessionalConfirmation = true;
       parsed.ambiguityReason = parsed.ambiguityReason ||
-        'The slash between the amount and frequency may be interpreted in more than one way.';
+        localizedAiFallbackText(
+          'slashDoseFrequencyAmbiguity',
+          preferredLanguage,
+        );
       parsed.possibleInterpretation = parsed.possibleInterpretation ||
-        'The written amount may be an amount per dose or a total amount divided across the stated frequency.';
+        localizedAiFallbackText(
+          'slashDoseFrequencyInterpretation',
+          preferredLanguage,
+        );
       parsed.safetyNote = parsed.safetyNote ||
-        'Confirm whether the written amount is per dose or the total daily amount before using this instruction.';
+        localizedAiFallbackText(
+          'slashDoseFrequencySafety',
+          preferredLanguage,
+        );
     }
 
     return parsed;
@@ -1081,7 +1095,7 @@ function parseAiInstructions(text) {
   return merged;
 }
 
-function parseSafetyCheck(text, citations) {
+function parseSafetyCheck(text, citations, preferredLanguage) {
   const cleaned = String(text || '')
     .trim()
     .replace(/^```(?:json)?\s*/i, '')
@@ -1105,12 +1119,18 @@ function parseSafetyCheck(text, citations) {
     status,
     summary: hasSources
       ? cleanText(value?.summary, 2500)
-      : 'No matching trusted source was found. The written instruction has not been changed.',
+      : localizedAiFallbackText(
+          'safetyNoTrustedSource',
+          preferredLanguage,
+        ),
     possibleInterpretation: hasSources
       ? cleanText(value?.possibleInterpretation, 2000)
       : null,
     questionForProfessional: cleanText(value?.questionForProfessional, 1000) ||
-      'Please confirm the exact medicine, amount per dose, frequency, route, and duration written here.',
+      localizedAiFallbackText(
+        'safetyConfirmExactInstruction',
+        preferredLanguage,
+      ),
     sources,
   };
 }
@@ -1240,7 +1260,11 @@ function explicitPeriodsFromInstruction(instruction) {
   return periods;
 }
 
-function normalizeCareScheduleForInstructions(schedule, instructions) {
+function normalizeCareScheduleForInstructions(
+  schedule,
+  instructions,
+  preferredLanguage,
+) {
   const instructionById = new Map(
     instructions.map((instruction) => [String(instruction.id), instruction]),
   );
@@ -1353,6 +1377,10 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
         const source = guardedItems[index] || base;
         const period = desiredPeriods[index] || defaultPeriods[index];
         const label = periodDisplayLabel(period);
+        const frequency =
+          source.recurrence ||
+          base.recurrence ||
+          `${expectedCount} times daily`;
 
         output.push({
           ...source,
@@ -1360,14 +1388,19 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
           date: base.date || source.date || null,
           time: null,
           displayTime: label,
-          recurrence:
-            source.recurrence ||
-            base.recurrence ||
-            `${expectedCount} times daily`,
+          recurrence: frequency,
           grounding: 'suggested',
           requiresConfirmation: true,
-          reason:
-            `Reminder slot ${index + 1} of ${expectedCount} was organized from the verified "${expectedCount} times daily" frequency. ${label} is a reminder period for confirmation, not a change to the medical instruction.`,
+          reason: localizedAiFallbackText(
+            'scheduleSlotReason',
+            preferredLanguage,
+            {
+              index: index + 1,
+              expectedCount,
+              frequency,
+              label,
+            },
+          ),
         });
       }
       continue;
@@ -1393,6 +1426,10 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
         const source = guardedItems[index] || base;
         const period = defaultPeriods[index];
         const label = periodDisplayLabel(period);
+        const frequency =
+          source.recurrence ||
+          base.recurrence ||
+          `${expectedCount} times daily`;
 
         output.push({
           ...source,
@@ -1400,14 +1437,19 @@ function normalizeCareScheduleForInstructions(schedule, instructions) {
           date: base.date || source.date || null,
           time: null,
           displayTime: label,
-          recurrence:
-            source.recurrence ||
-            base.recurrence ||
-            `${expectedCount} times daily`,
+          recurrence: frequency,
           grounding: 'suggested',
           requiresConfirmation: true,
-          reason:
-            `Reminder slot ${index + 1} of ${expectedCount} was organized from the verified "${expectedCount} times daily" frequency. ${label} is a reminder period for confirmation, not a change to the medical instruction.`,
+          reason: localizedAiFallbackText(
+            'scheduleSlotReason',
+            preferredLanguage,
+            {
+              index: index + 1,
+              expectedCount,
+              frequency,
+              label,
+            },
+          ),
         });
       }
       continue;
@@ -1905,7 +1947,7 @@ function practicalAdaptationForAnswer(answer, template, option, tasks, routinePr
   };
 }
 
-function parseIngredientLabel(text) {
+function parseIngredientLabel(text, preferredLanguage) {
   const value = parseJsonObject(
     text,
     'AI could not read a structured ingredient label. Please use a clearer photo.',
@@ -1931,12 +1973,18 @@ function parseIngredientLabel(text) {
     labelNeedsConfirmation: Boolean(value.labelNeedsConfirmation) || activeIngredients.length === 0,
     labelNote: cleanText(value.labelNote, 800) ||
       (activeIngredients.length === 0
-        ? 'No active ingredient was readable. Try a clear photo of the ingredients panel.'
-        : 'Confirm the extracted label text against the package.'),
+        ? localizedAiFallbackText(
+            'noActiveIngredientReadable',
+            preferredLanguage,
+          )
+        : localizedAiFallbackText(
+            'confirmLabelAgainstPackage',
+            preferredLanguage,
+          )),
   };
 }
 
-function parsePurposeCheck(text, citations) {
+function parsePurposeCheck(text, citations, preferredLanguage) {
   const value = parseJsonObject(
     text,
     'AI could not complete the ingredient-purpose comparison.',
@@ -1956,9 +2004,15 @@ function parsePurposeCheck(text, citations) {
       ? 'needs_confirmation'
       : status,
     summary: cleanText(value.summary, 1000) ||
-      'The ingredient and written purpose could not be compared reliably.',
+      localizedAiFallbackText(
+        'ingredientPurposeUnreliable',
+        preferredLanguage,
+      ),
     questionForProfessional: cleanText(value.questionForProfessional, 800) ||
-      'Please confirm that this package is the medicine intended for this instruction.',
+      localizedAiFallbackText(
+        'confirmIntendedMedicine',
+        preferredLanguage,
+      ),
     sources,
   };
 }
@@ -2238,6 +2292,16 @@ async function logAiUsage({
   } catch (error) {
     console.error('Could not save AI usage log:', error?.message || error);
   }
+}
+
+async function preferredLanguageForRequest(req, db = pool) {
+  if (!req?.auth?.userId) return 'English';
+  if (req.auth.preferredLanguage) return req.auth.preferredLanguage;
+  req.auth.preferredLanguage = await readPreferredLanguageForUser(
+    db,
+    req.auth.userId,
+  );
+  return req.auth.preferredLanguage;
 }
 
 async function saveProfile(userId, profile, onboardingCompleted) {
@@ -3215,6 +3279,7 @@ app.post(
         return;
       }
 
+      const preferredLanguage = await preferredLanguageForRequest(req);
       let instructionCount = 0;
       const failedDocuments = [];
       for (const document of documents) {
@@ -3235,8 +3300,12 @@ app.post(
             fileName: document.original_name,
             mimeType: document.mime_type,
             documentType: document.document_type,
+            preferredLanguage,
           });
-          const instructions = parseAiInstructions(aiResult.text);
+          const instructions = parseAiInstructions(
+            aiResult.text,
+            preferredLanguage,
+          );
           if (instructions.length === 0) {
             throw new AiServiceError('No clear care instructions were found in this document.', 422);
           }
@@ -3275,8 +3344,10 @@ app.post(
                 );
                 duplicateOfInstructionId = medicineFingerprints.get(fingerprint) || null;
                 if (duplicateOfInstructionId) {
-                  duplicateReason =
-                    'Possible duplicate medicine instruction detected. Compare both source entries before confirming either as a separate medicine instruction.';
+                  duplicateReason = localizedAiFallbackText(
+                    'duplicateMedicineAmbiguity',
+                    preferredLanguage,
+                  );
                   instruction.reviewStatus = 'unclear';
                   instruction.requiresProfessionalConfirmation = true;
                   instruction.ambiguityReason = [
@@ -3514,6 +3585,7 @@ app.post('/api/instructions/:id/ingredient-evidence', authenticate, aiLimiter, a
       return;
     }
 
+    const preferredLanguage = await preferredLanguageForRequest(req);
     const labelAiResult = await analyzeMedicineLabel({
       fileBuffer: imageBuffer,
       fileName: originalName,
@@ -3521,8 +3593,9 @@ app.post('/api/instructions/:id/ingredient-evidence', authenticate, aiLimiter, a
       prescriptionTitle: instruction.title,
       prescriptionInstruction: instruction.instruction,
       prescriptionTiming: instruction.timing,
+      preferredLanguage,
     });
-    const label = parseIngredientLabel(labelAiResult.text);
+    const label = parseIngredientLabel(labelAiResult.text, preferredLanguage);
 
     const ingredientChecks = await Promise.all(
       label.activeIngredients.slice(0, 4).map(async (ingredient) => ({
@@ -3539,9 +3612,18 @@ app.post('/api/instructions/:id/ingredient-evidence', authenticate, aiLimiter, a
     let purposeCheck = {
       status: 'needs_confirmation',
       summary: label.activeIngredients.length === 0
-        ? 'No active ingredient was readable, so purpose consistency could not be checked.'
-        : 'Purpose consistency could not be checked automatically.',
-      questionForProfessional: 'Please confirm that this package belongs to the medicine written in the prescription.',
+        ? localizedAiFallbackText(
+            'noActiveIngredientPurpose',
+            preferredLanguage,
+          )
+        : localizedAiFallbackText(
+            'purposeCheckUnavailable',
+            preferredLanguage,
+          ),
+      questionForProfessional: localizedAiFallbackText(
+        'confirmPackagePrescription',
+        preferredLanguage,
+      ),
       sources: [],
     };
     let purposeAiResult = null;
@@ -3552,8 +3634,13 @@ app.post('/api/instructions/:id/ingredient-evidence', authenticate, aiLimiter, a
           prescriptionTitle: instruction.title,
           prescriptionInstruction: instruction.instruction,
           prescriptionTiming: instruction.timing,
+          preferredLanguage,
         });
-        purposeCheck = parsePurposeCheck(purposeAiResult.text, purposeAiResult.citations);
+        purposeCheck = parsePurposeCheck(
+          purposeAiResult.text,
+          purposeAiResult.citations,
+          preferredLanguage,
+        );
       } catch (purposeError) {
         console.error('Ingredient purpose check unavailable:', purposeError?.message || purposeError);
       }
@@ -3892,6 +3979,7 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
       return;
     }
 
+    const preferredLanguage = await preferredLanguageForRequest(req);
     const aiResult = await generateGroundedCareSchedule({
       today: new Date().toISOString().slice(0, 10),
       instructions: instructions.map((item) => ({
@@ -3901,12 +3989,14 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
         instruction: cleanText(item.instruction, 4000),
         timing: cleanText(item.timing, 160),
       })),
+      preferredLanguage,
     });
     const allowedIds = new Set(instructions.map((item) => String(item.id)));
     const parsedSchedule = parseCareSchedule(aiResult.text, allowedIds);
     const schedule = normalizeCareScheduleForInstructions(
       parsedSchedule,
       instructions,
+      preferredLanguage,
     );
     if (schedule.length === 0) {
       throw new AiServiceError('No schedulable details were found in the verified instructions.', 422);
@@ -4277,16 +4367,36 @@ function customRealityAction(questionKey) {
   return 'reality_check';
 }
 
-function realityQuestionTemplates(tasks) {
+function legacyRealityQuestionText(key, fallback, preferredLanguage) {
+  const value = localizedAiFallbackText(key, preferredLanguage);
+  return value || fallback;
+}
+
+function realityQuestionTemplates(tasks, preferredLanguage = 'English') {
   const text = tasks.map((item) => `${item.title} ${item.display_time || ''} ${item.recurrence_text || ''} ${item.reason || ''}`).join(' ').toLowerCase();
   const kinds = new Set(tasks.map((item) => item.task_kind));
   const questions = [];
   const add = (key, category, question, options) => {
-    if (!questions.some((item) => item.key === key)) questions.push({ key, category, question, options });
+    if (!questions.some((item) => item.key === key)) {
+      questions.push({
+        key,
+        category,
+        question,
+        reasonForAsking: localizedAiFallbackText(
+          'legacyRealityReason',
+          preferredLanguage,
+        ),
+        options,
+      });
+    }
   };
 
   if (/morning|breakfast|before food|after food/.test(text)) {
-    add('morning_routine', 'Routine', 'Which option best matches your usual morning routine?', [
+    add('morning_routine', 'Routine', legacyRealityQuestionText(
+      'legacyMorningRoutineQuestion',
+      'Which option best matches your usual morning routine?',
+      preferredLanguage,
+    ), [
       {
         label: 'I can follow the stated morning or meal instruction',
         points: 0,
@@ -4309,7 +4419,11 @@ function realityQuestionTemplates(tasks) {
   }
 
   if (/afternoon|midday|lunch|3 times|three times/.test(text)) {
-    add('daytime_access', 'Routine', 'Can you access this medicine or task during the daytime?', [
+    add('daytime_access', 'Routine', legacyRealityQuestionText(
+      'legacyDaytimeAccessQuestion',
+      'Can you access this medicine or task during the daytime?',
+      preferredLanguage,
+    ), [
       {
         label: 'Yes, reliably',
         points: 0,
@@ -4332,7 +4446,11 @@ function realityQuestionTemplates(tasks) {
   }
 
   if (/evening|night|bedtime|dinner/.test(text)) {
-    add('evening_routine', 'Routine', 'Can you follow the stated evening or bedtime instruction?', [
+    add('evening_routine', 'Routine', legacyRealityQuestionText(
+      'legacyEveningRoutineQuestion',
+      'Can you follow the stated evening or bedtime instruction?',
+      preferredLanguage,
+    ), [
       {
         label: 'Yes, reliably',
         points: 0,
@@ -4355,7 +4473,11 @@ function realityQuestionTemplates(tasks) {
   }
 
   if (kinds.has('care_task') || /assist|caregiver|dressing/.test(text)) {
-    add('caregiver_support', 'Support', 'Is the required help available for this care task?', [
+    add('caregiver_support', 'Support', legacyRealityQuestionText(
+      'legacyCaregiverSupportQuestion',
+      'Is the required help available for this care task?',
+      preferredLanguage,
+    ), [
       {
         label: 'Yes, when needed',
         points: 0,
@@ -4378,7 +4500,11 @@ function realityQuestionTemplates(tasks) {
   }
 
   if (kinds.has('follow_up') || kinds.has('lab_test')) {
-    add('travel_access', 'Visits and tests', 'Can you reach the clinic or laboratory at the stated time?', [
+    add('travel_access', 'Visits and tests', legacyRealityQuestionText(
+      'legacyTravelAccessQuestion',
+      'Can you reach the clinic or laboratory at the stated time?',
+      preferredLanguage,
+    ), [
       {
         label: 'Yes, transport is arranged',
         points: 0,
@@ -4401,7 +4527,11 @@ function realityQuestionTemplates(tasks) {
   }
 
   if (kinds.has('medicine')) {
-    add('medicine_access', 'Medicine access', 'Have you obtained the medicines listed in this verified plan?', [
+    add('medicine_access', 'Medicine access', legacyRealityQuestionText(
+      'legacyMedicineAccessQuestion',
+      'Have you obtained the medicines listed in this verified plan?',
+      preferredLanguage,
+    ), [
       {
         label: 'Yes, all of them',
         points: 0,
@@ -4432,7 +4562,10 @@ async function realityDecisionTemplatesForPlan({
   userId,
   tasks = [],
   createIfMissing = false,
+  preferredLanguage = null,
 }) {
+  const resolvedPreferredLanguage =
+    preferredLanguage || await readPreferredLanguageForUser(db, userId);
   let activeSet = await readActiveRealityQuestionSet({ db, planId, userId });
 
   // Never use a persisted question set produced by older safety rules.
@@ -4440,7 +4573,10 @@ async function realityDecisionTemplatesForPlan({
   // not create questions will use the deterministic fallback until that occurs.
   if (
     activeSet &&
-    activeSet.generatorVersion !== REALITY_CHECK_GENERATOR_VERSION
+    (
+      activeSet.generatorVersion !== REALITY_CHECK_GENERATOR_VERSION ||
+      activeSet.preferredLanguage !== resolvedPreferredLanguage
+    )
   ) {
     activeSet = null;
   }
@@ -4470,6 +4606,7 @@ async function realityDecisionTemplatesForPlan({
         routineProfile,
         knownRealityFacts: [],
         refreshIfContextChanged: false,
+        preferredLanguage: resolvedPreferredLanguage,
       });
     } catch (error) {
       activeSet = null;
@@ -4491,7 +4628,10 @@ async function realityDecisionTemplatesForPlan({
   return {
     source: 'legacy_fallback',
     questionSet: null,
-    templates: realityQuestionTemplates(tasks).map((template) =>
+    templates: realityQuestionTemplates(
+      tasks,
+      resolvedPreferredLanguage,
+    ).map((template) =>
       legacyTemplateToDecisionTemplate(template, tasks)),
   };
 }
@@ -4528,12 +4668,14 @@ app.get('/api/care-plans/:id/reality-check', authenticate, async (req, res, next
       });
     }
 
+    const preferredLanguage = await preferredLanguageForRequest(req);
     const reality = await realityDecisionTemplatesForPlan({
       db: pool,
       planId,
       userId: req.auth.userId,
       tasks,
       createIfMissing: true,
+      preferredLanguage,
     });
     const [saved] = await pool.execute(
       `SELECT question_key, selected_answer, note
@@ -4610,6 +4752,7 @@ app.post('/api/care-plans/:id/reality-check', authenticate, async (req, res, nex
       userId: req.auth.userId,
       tasks,
       createIfMissing: false,
+      preferredLanguage: await preferredLanguageForRequest(req, connection),
     });
     const byKey = new Map(reality.templates.map((item) => [item.key, item]));
 
@@ -5661,6 +5804,7 @@ app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
       );
     }
 
+   const preferredLanguage = await preferredLanguageForRequest(req);
    try {
   await analyzeAndStoreCareGapContext({
     db: pool,
@@ -5668,6 +5812,7 @@ app.patch('/api/care-gaps/:id', authenticate, async (req, res, next) => {
     userId:
       req.auth.userId,
     generateAiText,
+    preferredLanguage,
   });
 } catch (contextError) {
   /*
@@ -5978,6 +6123,7 @@ app.patch('/api/doctor-questions/:id', authenticate, async (req, res, next) => {
 
     if (
  rows[0].care_gap_id != null) {
+  const preferredLanguage = await preferredLanguageForRequest(req);
   try {
     await analyzeAndStoreCareGapContext({
       db: pool,
@@ -5987,6 +6133,7 @@ app.patch('/api/doctor-questions/:id', authenticate, async (req, res, next) => {
       userId:
         req.auth.userId,
       generateAiText,
+      preferredLanguage,
     });
   } catch (contextError) {
     /*

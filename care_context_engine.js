@@ -1,3 +1,8 @@
+import {
+  aiLanguageInstruction,
+  normalizePreferredLanguage,
+} from './language_support.js';
+
 const ALLOWED_SIGNALS = new Set([
   'practical_support',
   'practical_constraint',
@@ -12,6 +17,64 @@ const ALLOWED_ACTIONS = new Set([
   'review_verified_instruction',
   'no_change',
 ]);
+
+const CARE_CONTEXT_TEXT = Object.freeze({
+  English: Object.freeze({
+    possibleInstructionChangeSummary:
+      'A healthcare-professional response may affect the written care instruction. The existing verified instruction remains unchanged until the change is formally reviewed and verified.',
+    possibleInstructionChangeQuestion:
+      'Does this professional response require the verified care instruction to be formally updated?',
+    professionalGuidanceSummary:
+      'Healthcare-professional guidance has been recorded for this care gap.',
+    professionalGuidanceQuestion:
+      'With this professional guidance, is the current care task now practical to follow reliably?',
+    userContextSummary:
+      'New user-provided practical context has been recorded for this care gap.',
+    userContextQuestion:
+      'Has this new information changed how reliably the care task can be followed?',
+    newContextRecorded:
+      'New care-gap context was recorded.',
+  }),
+  Urdu: Object.freeze({
+    possibleInstructionChangeSummary:
+      'صحت کے پیشہ ور فرد کا جواب لکھی ہوئی دیکھ بھال کی ہدایت کو متاثر کر سکتا ہے۔ موجودہ تصدیق شدہ ہدایت اس وقت تک تبدیل نہیں ہو گی جب تک تبدیلی کا باقاعدہ جائزہ لے کر تصدیق نہ کر لی جائے۔',
+    possibleInstructionChangeQuestion:
+      'کیا اس پیشہ ورانہ جواب کی وجہ سے تصدیق شدہ دیکھ بھال کی ہدایت کو باقاعدہ اپ ڈیٹ کرنے کی ضرورت ہے؟',
+    professionalGuidanceSummary:
+      'اس دیکھ بھال کے خلا کے لیے صحت کے پیشہ ور فرد کی رہنمائی محفوظ کر دی گئی ہے۔',
+    professionalGuidanceQuestion:
+      'اس پیشہ ورانہ رہنمائی کے بعد، کیا موجودہ دیکھ بھال کا کام اب قابل اعتماد طریقے سے کرنا عملی ہے؟',
+    userContextSummary:
+      'اس دیکھ بھال کے خلا کے لیے صارف کی دی ہوئی عملی معلومات محفوظ کر دی گئی ہیں۔',
+    userContextQuestion:
+      'کیا اس نئی معلومات سے دیکھ بھال کے کام کو قابل اعتماد طریقے سے کرنے کی صورتحال بدلی ہے؟',
+    newContextRecorded:
+      'دیکھ بھال کے خلا کی نئی معلومات محفوظ کر دی گئی ہیں۔',
+  }),
+  'Roman Urdu': Object.freeze({
+    possibleInstructionChangeSummary:
+      'Healthcare-professional response likhi hui care instruction ko affect kar sakta hai. Maujooda verified instruction tab tak unchanged rahegi jab tak change ka formal review aur verification na ho.',
+    possibleInstructionChangeQuestion:
+      'Kya is professional response ki wajah se verified care instruction ko formally update karna zaroori hai?',
+    professionalGuidanceSummary:
+      'Is care gap ke liye healthcare-professional guidance record ho gayi hai.',
+    professionalGuidanceQuestion:
+      'Is professional guidance ke baad, kya current care task ab reliably follow karna practical hai?',
+    userContextSummary:
+      'Is care gap ke liye user-provided practical context record ho gaya hai.',
+    userContextQuestion:
+      'Kya is new information se care task ko reliably follow karne ki situation badli hai?',
+    newContextRecorded:
+      'Naya care-gap context record ho gaya hai.',
+  }),
+});
+
+function careContextText(key, preferredLanguage) {
+  const language = normalizePreferredLanguage(preferredLanguage);
+  return CARE_CONTEXT_TEXT[language]?.[key] ||
+    CARE_CONTEXT_TEXT.English[key] ||
+    '';
+}
 
 function cleanContextText(
   value,
@@ -53,6 +116,7 @@ function parseAiJson(text) {
 function normalizeAnalysis(
   raw,
   fallbackSummary = '',
+  preferredLanguage,
 ) {
   const signal = cleanContextText(
     raw?.signal,
@@ -78,7 +142,10 @@ function normalizeAnalysis(
         fallbackSummary,
         700,
       ) ||
-      'New care-gap context was recorded.',
+      careContextText(
+        'newContextRecorded',
+        preferredLanguage,
+      ),
 
     nextAction:
       ALLOWED_ACTIONS.has(nextAction)
@@ -98,9 +165,10 @@ function normalizeAnalysis(
   };
 }
 
-function fallbackAnalysis({
+export function fallbackAnalysis({
   note,
   professionalAnswers,
+  preferredLanguage,
 }) {
   const combined = [
     cleanContextText(note),
@@ -120,11 +188,12 @@ function fallbackAnalysis({
    * changing treatment/timing, never apply it.
    * Send it to verified-instruction review instead.
    */
+  const treatmentChangePattern =
+    /\b(change|changed|switch|stop|stopped|discontinue|dose|dosage|frequency|instead|take at|move the time|new time|tabdeel|badal|rok|dawa|waqt|naya time|naya waqt)\b|(?:تبدیل|بدل|روک|خوراک|دوا|وقت|نیا وقت)/i;
+
   const possibleTreatmentChange =
     professionalAnswers.length > 0 &&
-    /\b(change|changed|switch|stop|stopped|discontinue|dose|dosage|frequency|instead|take at|move the time|new time)\b/i.test(
-      combined,
-    );
+    treatmentChangePattern.test(combined);
 
   if (possibleTreatmentChange) {
     return {
@@ -132,13 +201,19 @@ function fallbackAnalysis({
         'possible_instruction_change',
 
       summary:
-        'A healthcare-professional response may affect the written care instruction. The existing verified instruction remains unchanged until the change is formally reviewed and verified.',
+        careContextText(
+          'possibleInstructionChangeSummary',
+          preferredLanguage,
+        ),
 
       nextAction:
         'review_verified_instruction',
 
       followUpQuestion:
-        'Does this professional response require the verified care instruction to be formally updated?',
+        careContextText(
+          'possibleInstructionChangeQuestion',
+          preferredLanguage,
+        ),
 
       requiresInstructionReview: true,
     };
@@ -152,13 +227,19 @@ function fallbackAnalysis({
         'professional_guidance',
 
       summary:
-        'Healthcare-professional guidance has been recorded for this care gap.',
+        careContextText(
+          'professionalGuidanceSummary',
+          preferredLanguage,
+        ),
 
       nextAction:
         'recheck_reality',
 
       followUpQuestion:
-        'With this professional guidance, is the current care task now practical to follow reliably?',
+        careContextText(
+          'professionalGuidanceQuestion',
+          preferredLanguage,
+        ),
 
       requiresInstructionReview: false,
     };
@@ -171,13 +252,19 @@ function fallbackAnalysis({
       signal: 'neutral',
 
       summary:
-        'New user-provided practical context has been recorded for this care gap.',
+        careContextText(
+          'userContextSummary',
+          preferredLanguage,
+        ),
 
       nextAction:
         'recheck_reality',
 
       followUpQuestion:
-        'Has this new information changed how reliably the care task can be followed?',
+        careContextText(
+          'userContextQuestion',
+          preferredLanguage,
+        ),
 
       requiresInstructionReview: false,
     };
@@ -306,7 +393,10 @@ export async function analyzeAndStoreCareGapContext({
   gapId,
   userId,
   generateAiText,
+  preferredLanguage,
 }) {
+  const normalizedPreferredLanguage =
+    normalizePreferredLanguage(preferredLanguage);
   const [gapRows] =
     await db.execute(
       `SELECT g.*
@@ -385,6 +475,7 @@ export async function analyzeAndStoreCareGapContext({
     fallbackAnalysis({
       note,
       professionalAnswers,
+      preferredLanguage: normalizedPreferredLanguage,
     });
 
   let analysis = fallback;
@@ -432,6 +523,14 @@ STRICT SAFETY RULES:
 11. Practical improvement should normally use:
     nextAction = "recheck_reality"
 because the user must confirm whether the task is now reliably achievable.
+12. Apply the server-selected language only to summary and followUpQuestion.
+13. Keep signal, nextAction and requiresInstructionReview as canonical machine values.
+14. Keep user notes and healthcare-professional answers unchanged as source context. Never rewrite them as verified medical instructions.
+
+Language rules:
+${aiLanguageInstruction(normalizedPreferredLanguage, {
+  scope: 'summary and followUpQuestion',
+})}
 
 Return JSON only.`,
 
@@ -540,6 +639,7 @@ Return JSON only.`,
 
           temperature: 0,
           maxTokens: 700,
+          preferredLanguage: normalizedPreferredLanguage,
         });
 
       const parsed =
@@ -552,6 +652,7 @@ Return JSON only.`,
           normalizeAnalysis(
             parsed,
             fallback.summary,
+            normalizedPreferredLanguage,
           );
       }
     } catch (error) {

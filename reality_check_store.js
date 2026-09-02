@@ -4,6 +4,9 @@ import {
   generatePersonalizedRealityCheckQuestions,
   REALITY_CHECK_MAX_QUESTIONS,
 } from './reality_check_engine.js';
+import {
+  normalizePreferredLanguage,
+} from './language_support.js';
 
 export const REALITY_CHECK_GENERATOR_VERSION = 'reality-ai-v3-question-contract';
 
@@ -101,8 +104,10 @@ export function buildRealityCheckContextHash({
   tasks = [],
   routineProfile = null,
   knownRealityFacts = [],
+  preferredLanguage,
 }) {
   return hashValue({
+    preferredLanguage: normalizePreferredLanguage(preferredLanguage),
     instructions: normalizedInstructions(instructions),
     tasks: normalizedTasks(tasks),
     routineProfile: normalizedRoutineProfile(routineProfile),
@@ -155,6 +160,7 @@ function rowToQuestionSet(row, questions = []) {
     contextHash: row.context_hash,
     version: Number(row.version),
     generatorVersion: row.generator_version,
+    preferredLanguage: normalizePreferredLanguage(row.preferred_language),
     status: row.status,
     questionCount: Number(row.question_count || questions.length),
     createdAt: row.created_at,
@@ -172,6 +178,7 @@ export async function ensureRealityCheckPersistenceSchema(db) {
       context_hash CHAR(64) NOT NULL,
       version INT UNSIGNED NOT NULL,
       generator_version VARCHAR(60) NOT NULL,
+      preferred_language VARCHAR(20) NOT NULL DEFAULT 'English',
       status ENUM('active', 'retired') NOT NULL DEFAULT 'active',
       question_count SMALLINT UNSIGNED NOT NULL DEFAULT 0,
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -186,6 +193,22 @@ export async function ensureRealityCheckPersistenceSchema(db) {
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   );
+
+  const [setColumns] = await db.execute(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = 'care_reality_question_sets'
+       AND COLUMN_NAME = 'preferred_language'
+     LIMIT 1`,
+  );
+  if (!setColumns.length) {
+    await db.execute(
+      `ALTER TABLE care_reality_question_sets
+       ADD COLUMN preferred_language VARCHAR(20) NOT NULL DEFAULT 'English'
+       AFTER generator_version`,
+    );
+  }
 
   await db.execute(
     `CREATE TABLE IF NOT EXISTS care_reality_questions (
@@ -223,6 +246,7 @@ export async function ensureRealityCheckPersistenceSchema(db) {
 export async function readActiveRealityQuestionSet({ db, planId, userId }) {
   const [sets] = await db.execute(
     `SELECT id, care_plan_id, user_id, context_hash, version, generator_version,
+            preferred_language,
             status, question_count, created_at, updated_at
      FROM care_reality_question_sets
      WHERE care_plan_id = ? AND user_id = ? AND status = 'active'
@@ -269,7 +293,9 @@ async function persistNewQuestionSet({
   contextHash,
   questions,
   generatorVersion,
+  preferredLanguage,
 }) {
+  const normalizedLanguage = normalizePreferredLanguage(preferredLanguage);
   return withTransaction(db, async (connection) => {
     const [versionRows] = await connection.execute(
       `SELECT COALESCE(MAX(version), 0) AS max_version
@@ -289,9 +315,18 @@ async function persistNewQuestionSet({
 
     const [insertSet] = await connection.execute(
       `INSERT INTO care_reality_question_sets
-        (care_plan_id, user_id, context_hash, version, generator_version, status, question_count)
-       VALUES (?, ?, ?, ?, ?, 'active', ?)`,
-      [planId, userId, contextHash, nextVersion, generatorVersion, questions.length],
+        (care_plan_id, user_id, context_hash, version, generator_version,
+         preferred_language, status, question_count)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+      [
+        planId,
+        userId,
+        contextHash,
+        nextVersion,
+        generatorVersion,
+        normalizedLanguage,
+        questions.length,
+      ],
     );
     const setId = insertSet.insertId;
 
@@ -338,6 +373,7 @@ async function persistNewQuestionSet({
       contextHash,
       version: nextVersion,
       generatorVersion,
+      preferredLanguage: normalizedLanguage,
       status: 'active',
       questionCount: storedQuestions.length,
       questions: storedQuestions.map(rowToQuestion),
@@ -364,23 +400,30 @@ export async function getOrCreateRealityQuestionSet({
   refreshIfContextChanged = false,
   maxQuestions = REALITY_CHECK_MAX_QUESTIONS,
   generatorVersion = REALITY_CHECK_GENERATOR_VERSION,
+  preferredLanguage,
 }) {
   if (!db) throw new Error('Reality Check persistence requires a database connection.');
   if (!normalizeId(planId) || !normalizeId(userId)) throw new Error('Reality Check persistence requires planId and userId.');
   if (!Array.isArray(tasks) || tasks.length === 0) return null;
 
+  const normalizedLanguage = normalizePreferredLanguage(preferredLanguage);
   const contextHash = buildRealityCheckContextHash({
     instructions,
     tasks,
     routineProfile,
     knownRealityFacts,
+    preferredLanguage: normalizedLanguage,
   });
 
   const active = await readActiveRealityQuestionSet({ db, planId, userId });
   const generatorChanged = Boolean(active && active.generatorVersion !== generatorVersion);
+  const languageChanged = Boolean(
+    active && active.preferredLanguage !== normalizedLanguage,
+  );
   if (
     active &&
     !generatorChanged &&
+    !languageChanged &&
     (!refreshIfContextChanged || active.contextHash === contextHash)
   ) {
     return {
@@ -388,6 +431,7 @@ export async function getOrCreateRealityQuestionSet({
       reused: true,
       contextChanged: active.contextHash !== contextHash,
       generatorChanged: false,
+      languageChanged: false,
     };
   }
 
@@ -397,13 +441,14 @@ export async function getOrCreateRealityQuestionSet({
     routineProfile,
     knownRealityFacts,
     maxQuestions,
+    preferredLanguage: normalizedLanguage,
   });
 
   if (!questions.length) {
     // A safety-version change must never silently fall back to questions
     // generated by the older rules. Return null so the caller can use its safe
     // non-AI fallback and retry generation on a later request.
-    if (generatorChanged) return null;
+    if (generatorChanged || languageChanged) return null;
 
     if (active) {
       return {
@@ -412,6 +457,7 @@ export async function getOrCreateRealityQuestionSet({
         contextChanged: true,
         regenerationSkipped: true,
         generatorChanged: false,
+        languageChanged,
       };
     }
     return null;
@@ -424,6 +470,7 @@ export async function getOrCreateRealityQuestionSet({
     contextHash,
     questions,
     generatorVersion,
+    preferredLanguage: normalizedLanguage,
   });
 
   return {
@@ -431,5 +478,6 @@ export async function getOrCreateRealityQuestionSet({
     reused: false,
     contextChanged: Boolean(active),
     generatorChanged,
+    languageChanged,
   };
 }

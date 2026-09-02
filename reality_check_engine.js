@@ -1,4 +1,7 @@
 import { generateRealityCheckQuestionCandidates } from './ai_service.js';
+import {
+  normalizePreferredLanguage,
+} from './language_support.js';
 
 export const REALITY_CHECK_MAX_QUESTIONS = 6;
 
@@ -55,6 +58,12 @@ function normalizedQuestionKey(question) {
     .replace(/\b(the|a|an|your|you|do|does|can|are|is|this|that|usually|normally)\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function isSafetyCheckableCanonicalEnglish(question, reasonForAsking) {
+  const combined = `${question} ${reasonForAsking}`;
+  if (/[^\t\n\r -~]/.test(combined)) return false;
+  return /^\s*(?:are|can|could|do|does|have|has|is|will|would|which)\b/i.test(question);
 }
 
 function hasUnsafeClinicalLanguage(question) {
@@ -168,6 +177,7 @@ function targetDetailsForQuestion({ targetTaskIds, tasks, instructions }) {
   return {
     targetTasks,
     targetInstructions,
+    verifiedSourceText: cleanText(verifiedText, 1600),
     verifiedText: normalizedClinicalText(verifiedText),
     taskText: normalizedClinicalText(taskText),
   };
@@ -211,6 +221,37 @@ function verifiedMealRelation(verifiedText) {
     'before food', 'after food', 'with food', 'without food',
   ];
   return relations.find((value) => verifiedText.includes(value)) || '';
+}
+
+function verifiedMealRelationSource(sourceText) {
+  const match = cleanText(sourceText, 1600).match(
+    /\b(?:before|after|with|without)\s+(?:breakfast|lunch|dinner|food)\b/i,
+  );
+  return match ? match[0] : '';
+}
+
+function verifiedBedtimeSource(sourceText) {
+  const match = cleanText(sourceText, 1600).match(/\bat bedtime\b|\bbedtime\b/i);
+  return match ? match[0] : '';
+}
+
+function verifiedDateSource(sourceText) {
+  const value = cleanText(sourceText, 1600);
+  const month =
+    '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
+  const patterns = [
+    /\b\d{4}-\d{2}-\d{2}\b/,
+    new RegExp(`\\b\\d{1,2}\\s+${month}\\s+\\d{4}\\b`, 'i'),
+    new RegExp(`\\b${month}\\s+\\d{1,2},?\\s+\\d{4}\\b`, 'i'),
+    /\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) return match[0];
+  }
+
+  return '';
 }
 
 function hasTemporalIntensifier(question) {
@@ -462,6 +503,385 @@ function sanitizeRoutineProfile(profile) {
   };
 }
 
+function periodName(period, language) {
+  const normalized = allowedPeriods.has(period) ? period : 'any';
+  const labels = {
+    English: {
+      morning: 'morning',
+      afternoon: 'afternoon',
+      evening: 'evening',
+      night: 'night',
+      any: 'daily',
+    },
+    Urdu: {
+      morning: 'صبح',
+      afternoon: 'دوپہر',
+      evening: 'شام',
+      night: 'رات',
+      any: 'روزمرہ',
+    },
+    'Roman Urdu': {
+      morning: 'subah',
+      afternoon: 'dopahar',
+      evening: 'shaam',
+      night: 'raat',
+      any: 'rozmarra',
+    },
+  };
+  return labels[language][normalized];
+}
+
+function displayDateForQuestion(singleTask, details) {
+  return verifiedDateSource(details.verifiedSourceText) ||
+    cleanText(singleTask?.scheduleDate ?? singleTask?.schedule_date, 40);
+}
+
+function displayTargetForQuestion(details, language) {
+  const singleTask =
+    details.targetTasks.length === 1 ? details.targetTasks[0] : null;
+  const title = cleanText(singleTask?.title, 180);
+  if (title) return title;
+  if (details.targetTasks.length > 1) {
+    if (language === 'Urdu') return 'ان دیکھ بھال کے کاموں';
+    if (language === 'Roman Urdu') return 'in care tasks';
+    return 'these care tasks';
+  }
+  if (language === 'Urdu') return 'اس دیکھ بھال کے کام';
+  if (language === 'Roman Urdu') return 'is care task';
+  return 'this care task';
+}
+
+function realityQuestionContext(question, tasks, instructions, language) {
+  const targetTaskIds = Array.isArray(question?.targetTaskIds)
+    ? question.targetTaskIds.map(String)
+    : [];
+  const details = targetDetailsForQuestion({
+    targetTaskIds,
+    tasks,
+    instructions,
+  });
+  const singleTask =
+    details.targetTasks.length === 1 ? details.targetTasks[0] : null;
+  const period = cleanText(question?.period, 20).toLowerCase();
+
+  return {
+    title: displayTargetForQuestion(details, language),
+    time: singleTask ? displayClockTime(singleTask) : '',
+    date: singleTask ? displayDateForQuestion(singleTask, details) : '',
+    mealRelation: verifiedMealRelationSource(details.verifiedSourceText),
+    bedtime: verifiedBedtimeSource(details.verifiedSourceText),
+    period: allowedPeriods.has(period) ? period : 'any',
+  };
+}
+
+function englishRealityDisplay(question, context) {
+  const when = [context.date, context.time].filter(Boolean).join(' at ');
+  const period = periodName(context.period, 'English');
+  const target = context.title;
+
+  switch (question.intent) {
+    case 'meal_routine': {
+      if (context.mealRelation && context.time) {
+        const meal = context.mealRelation.split(' ').at(-1);
+        const relation = context.mealRelation.toLowerCase();
+        const prompt = relation.startsWith('after ')
+          ? `Is your ${meal} usually finished by ${context.time} so ${target} can be taken ${context.mealRelation}?`
+          : relation.startsWith('before ')
+            ? `Is ${context.time} usually before your ${meal} so ${target} can be taken ${context.mealRelation}?`
+            : `Does your usual routine around ${context.time} allow ${target} to be taken ${context.mealRelation}?`;
+        return {
+          question: prompt,
+          reasonForAsking:
+            `This checks whether the practical meal routine fits ${target} while preserving ${context.mealRelation}.`,
+        };
+      }
+      return {
+        question: `Does your usual meal routine make ${target} practical to follow as written?`,
+        reasonForAsking:
+          `This checks meal-routine fit without changing the verified instruction for ${target}.`,
+      };
+    }
+    case 'medicine_access':
+      return {
+        question: `Do you have ${target} available when you need it?`,
+        reasonForAsking:
+          `This checks medicine access only and does not change ${target}.`,
+      };
+    case 'caregiver_availability':
+    case 'task_support':
+      return {
+        question: `Is the required help available for ${target}?`,
+        reasonForAsking:
+          `This checks practical support for ${target}.`,
+      };
+    case 'travel_access':
+      return {
+        question: when
+          ? `Can you reach the clinic or laboratory for ${target} on ${when}?`
+          : `Can you reach the clinic or laboratory for ${target} at the stated time?`,
+        reasonForAsking:
+          `This checks travel access separately from any medical instruction for ${target}.`,
+      };
+    case 'location_access':
+      return {
+        question: `Can you access the required location for ${target}?`,
+        reasonForAsking:
+          `This checks practical location access for ${target}.`,
+      };
+    case 'school_or_work_conflict':
+      return {
+        question: context.time
+          ? `Does ${target} at ${context.time} usually fit your school or work routine?`
+          : `Does ${target} usually fit your school or work routine?`,
+        reasonForAsking:
+          `This checks practical routine fit for ${target}.`,
+      };
+    case 'sleep_routine':
+      return {
+        question: context.time && context.bedtime
+          ? `Is ${context.time} usually close to your ${context.bedtime} for ${target}?`
+          : `Does your usual sleep routine make ${target} practical to follow as written?`,
+        reasonForAsking:
+          `This checks sleep-routine fit without changing the verified instruction for ${target}.`,
+      };
+    case 'equipment_access':
+      return {
+        question: `Do you have the required equipment for ${target}?`,
+        reasonForAsking:
+          `This checks practical equipment access for ${target}.`,
+      };
+    case 'appointment_availability':
+      return {
+        question: when
+          ? `Are you available for ${target} on ${when}?`
+          : `Are you available for ${target} at its scheduled time?`,
+        reasonForAsking:
+          'This checks appointment availability separately from transport or medical changes.',
+      };
+    case 'instruction_feasibility':
+      return {
+        question: `Is ${target} practical for you to follow as written?`,
+        reasonForAsking:
+          'This checks practical feasibility without changing the verified instruction.',
+      };
+    case 'routine_time':
+    default:
+      return {
+        question: context.time
+          ? `Can you reliably be available at ${context.time} for ${target}?`
+          : `Can you reliably fit ${target} into your ${period} routine?`,
+        reasonForAsking:
+          `This checks practical routine fit for ${target}.`,
+      };
+  }
+}
+
+function urduRealityDisplay(question, context) {
+  const period = periodName(context.period, 'Urdu');
+  const target = context.title;
+  const atTime = context.time ? `${context.time} پر ` : '';
+  const onWhen = [context.date, context.time].filter(Boolean).join('، ');
+
+  switch (question.intent) {
+    case 'meal_routine':
+      return {
+        question: context.mealRelation && context.time
+          ? `کیا آپ کا معمول ${context.time} کے آس پاس ${target} کو ${context.mealRelation} لینے کی اجازت دیتا ہے؟`
+          : `کیا آپ کے کھانے کا معمول ${target} کو لکھی ہوئی ہدایت کے مطابق لینا عملی بناتا ہے؟`,
+        reasonForAsking:
+          `یہ صرف کھانے کے معمول کو چیک کرتا ہے اور ${target} کی تصدیق شدہ ہدایت کو تبدیل نہیں کرتا۔`,
+      };
+    case 'medicine_access':
+      return {
+        question: `کیا ${target} ضرورت کے وقت آپ کے پاس دستیاب ہے؟`,
+        reasonForAsking:
+          `یہ صرف دوا تک رسائی چیک کرتا ہے اور ${target} کو تبدیل نہیں کرتا۔`,
+      };
+    case 'caregiver_availability':
+    case 'task_support':
+      return {
+        question: `کیا ${target} کے لیے ضروری مدد دستیاب ہے؟`,
+        reasonForAsking:
+          `یہ ${target} کے لیے عملی مدد چیک کرتا ہے۔`,
+      };
+    case 'travel_access':
+      return {
+        question: onWhen
+          ? `کیا آپ ${target} کے لیے ${onWhen} پر کلینک یا لیبارٹری پہنچ سکتے ہیں؟`
+          : `کیا آپ ${target} کے لیے مقررہ وقت پر کلینک یا لیبارٹری پہنچ سکتے ہیں؟`,
+        reasonForAsking:
+          `یہ ${target} کے لیے سفر کی عملی رسائی الگ سے چیک کرتا ہے۔`,
+      };
+    case 'location_access':
+      return {
+        question: `کیا آپ ${target} کے لیے مطلوبہ جگہ تک رسائی حاصل کر سکتے ہیں؟`,
+        reasonForAsking:
+          `یہ ${target} کے لیے جگہ تک عملی رسائی چیک کرتا ہے۔`,
+      };
+    case 'school_or_work_conflict':
+      return {
+        question: `کیا ${atTime}${target} عموماً آپ کے اسکول یا کام کے معمول میں فٹ بیٹھتا ہے؟`,
+        reasonForAsking:
+          `یہ ${target} کے لیے عملی معمول کا فٹ چیک کرتا ہے۔`,
+      };
+    case 'sleep_routine':
+      return {
+        question: context.time && context.bedtime
+          ? `کیا ${context.time} عموماً آپ کے ${context.bedtime} کے قریب ہوتا ہے تاکہ ${target} پر عمل ہو سکے؟`
+          : `کیا آپ کا نیند کا معمول ${target} کو لکھی ہوئی ہدایت کے مطابق کرنا عملی بناتا ہے؟`,
+        reasonForAsking:
+          `یہ نیند کے معمول کو چیک کرتا ہے اور ${target} کی تصدیق شدہ ہدایت کو تبدیل نہیں کرتا۔`,
+      };
+    case 'equipment_access':
+      return {
+        question: `کیا ${target} کے لیے ضروری سامان آپ کے پاس ہے؟`,
+        reasonForAsking:
+          `یہ ${target} کے لیے سامان تک عملی رسائی چیک کرتا ہے۔`,
+      };
+    case 'appointment_availability':
+      return {
+        question: onWhen
+          ? `کیا آپ ${target} کے لیے ${onWhen} پر دستیاب ہیں؟`
+          : `کیا آپ ${target} کے مقررہ وقت پر دستیاب ہیں؟`,
+        reasonForAsking:
+          'یہ ملاقات کی دستیابی کو سفر یا طبی تبدیلیوں سے الگ چیک کرتا ہے۔',
+      };
+    case 'instruction_feasibility':
+      return {
+        question: `کیا ${target} کو لکھی ہوئی ہدایت کے مطابق کرنا آپ کے لیے عملی ہے؟`,
+        reasonForAsking:
+          'یہ تصدیق شدہ ہدایت کو تبدیل کیے بغیر عملی امکان چیک کرتا ہے۔',
+      };
+    case 'routine_time':
+    default:
+      return {
+        question: context.time
+          ? `کیا آپ ${context.time} پر ${target} کے لیے قابل اعتماد طور پر دستیاب ہوتے ہیں؟`
+          : `کیا آپ ${target} کو اپنے ${period} کے معمول میں قابل اعتماد طور پر شامل کر سکتے ہیں؟`,
+        reasonForAsking:
+          `یہ ${target} کے لیے عملی معمول کا فٹ چیک کرتا ہے۔`,
+      };
+  }
+}
+
+function romanUrduRealityDisplay(question, context) {
+  const period = periodName(context.period, 'Roman Urdu');
+  const target = context.title;
+  const atTime = context.time ? `${context.time} par ` : '';
+  const onWhen = [context.date, context.time].filter(Boolean).join(', ');
+
+  switch (question.intent) {
+    case 'meal_routine':
+      return {
+        question: context.mealRelation && context.time
+          ? `Kya aap ka routine ${context.time} ke aas paas ${target} ko ${context.mealRelation} lene deta hai?`
+          : `Kya aap ka meal routine ${target} ko written instruction ke mutabiq follow karna practical banata hai?`,
+        reasonForAsking:
+          `Yeh sirf meal routine check karta hai aur ${target} ki verified instruction ko change nahi karta.`,
+      };
+    case 'medicine_access':
+      return {
+        question: `Kya ${target} zaroorat ke waqt aap ke paas available hota hai?`,
+        reasonForAsking:
+          `Yeh sirf medicine access check karta hai aur ${target} ko change nahi karta.`,
+      };
+    case 'caregiver_availability':
+    case 'task_support':
+      return {
+        question: `Kya ${target} ke liye zaroori help available hai?`,
+        reasonForAsking:
+          `Yeh ${target} ke liye practical support check karta hai.`,
+      };
+    case 'travel_access':
+      return {
+        question: onWhen
+          ? `Kya aap ${target} ke liye ${onWhen} par clinic ya laboratory pohanch sakte hain?`
+          : `Kya aap ${target} ke liye stated time par clinic ya laboratory pohanch sakte hain?`,
+        reasonForAsking:
+          `Yeh ${target} ke liye travel access ko medical instruction se alag check karta hai.`,
+      };
+    case 'location_access':
+      return {
+        question: `Kya aap ${target} ke liye required location tak access kar sakte hain?`,
+        reasonForAsking:
+          `Yeh ${target} ke liye practical location access check karta hai.`,
+      };
+    case 'school_or_work_conflict':
+      return {
+        question: `Kya ${atTime}${target} aam tor par aap ke school ya work routine mein fit hota hai?`,
+        reasonForAsking:
+          `Yeh ${target} ke liye practical routine fit check karta hai.`,
+      };
+    case 'sleep_routine':
+      return {
+        question: context.time && context.bedtime
+          ? `Kya ${context.time} aam tor par aap ke ${context.bedtime} ke qareeb hota hai taake ${target} follow ho sake?`
+          : `Kya aap ka sleep routine ${target} ko written instruction ke mutabiq follow karna practical banata hai?`,
+        reasonForAsking:
+          `Yeh sleep routine check karta hai aur ${target} ki verified instruction ko change nahi karta.`,
+      };
+    case 'equipment_access':
+      return {
+        question: `Kya ${target} ke liye zaroori equipment aap ke paas hai?`,
+        reasonForAsking:
+          `Yeh ${target} ke liye practical equipment access check karta hai.`,
+      };
+    case 'appointment_availability':
+      return {
+        question: onWhen
+          ? `Kya aap ${target} ke liye ${onWhen} par available hain?`
+          : `Kya aap ${target} ke scheduled time par available hain?`,
+        reasonForAsking:
+          'Yeh appointment availability ko transport ya medical changes se alag check karta hai.',
+      };
+    case 'instruction_feasibility':
+      return {
+        question: `Kya ${target} ko written instruction ke mutabiq follow karna aap ke liye practical hai?`,
+        reasonForAsking:
+          'Yeh verified instruction ko change kiye baghair practical feasibility check karta hai.',
+      };
+    case 'routine_time':
+    default:
+      return {
+        question: context.time
+          ? `Kya aap ${context.time} par ${target} ke liye bharosemand taur par available hote hain?`
+          : `Kya aap ${target} ko apne ${period} routine mein reliably fit kar sakte hain?`,
+        reasonForAsking:
+          `Yeh ${target} ke liye practical routine fit check karta hai.`,
+      };
+  }
+}
+
+function localizedRealityDisplay(question, context, language) {
+  if (language === 'Urdu') return urduRealityDisplay(question, context);
+  if (language === 'Roman Urdu') return romanUrduRealityDisplay(question, context);
+  return englishRealityDisplay(question, context);
+}
+
+export function localizeRealityCheckQuestions({
+  questions = [],
+  tasks = [],
+  instructions = [],
+  preferredLanguage,
+}) {
+  const language = normalizePreferredLanguage(preferredLanguage);
+  return questions.map((question) => {
+    const context = realityQuestionContext(
+      question,
+      tasks,
+      instructions,
+      language,
+    );
+    const display = localizedRealityDisplay(question, context, language);
+
+    return {
+      ...question,
+      question: cleanText(display.question, 500),
+      reasonForAsking: cleanText(display.reasonForAsking, 500),
+    };
+  });
+}
+
 /**
  * Deterministically validate model-generated question candidates.
  * Unsafe, ungrounded, malformed and duplicate questions are dropped.
@@ -515,6 +935,7 @@ export function normalizeRealityCheckQuestionCandidates({
     question = canonical.question;
     reasonForAsking = canonical.reasonForAsking;
 
+    if (!isSafetyCheckableCanonicalEnglish(question, reasonForAsking)) continue;
     if (question.length < 8 || !question.endsWith('?')) continue;
     if (!reasonForAsking) continue;
     if (hasUnsafeClinicalLanguage(`${question} ${reasonForAsking}`)) continue;
@@ -570,6 +991,7 @@ export async function generatePersonalizedRealityCheckQuestions({
   routineProfile = null,
   knownRealityFacts = [],
   maxQuestions = REALITY_CHECK_MAX_QUESTIONS,
+  preferredLanguage,
 }) {
   if (!Array.isArray(tasks) || tasks.length === 0) return [];
 
@@ -583,10 +1005,17 @@ export async function generatePersonalizedRealityCheckQuestions({
     maxQuestions,
   });
 
-  return normalizeRealityCheckQuestionCandidates({
+  const questions = normalizeRealityCheckQuestionCandidates({
     rawText: result.text,
     tasks: safeTasks,
     instructions: safeInstructions,
     maxQuestions,
+  });
+
+  return localizeRealityCheckQuestions({
+    questions,
+    tasks: safeTasks,
+    instructions: safeInstructions,
+    preferredLanguage,
   });
 }
