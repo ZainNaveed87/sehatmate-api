@@ -84,6 +84,15 @@ const DOSE_LITERAL_PATTERN =
 const DOSE_LITERAL_VALUE_PATTERN = /^(\d+(?:\.\d+)?)\s*(?:mg|mcg|ml|gm|g|iu|units?)$/i;
 const PERCENT_LITERAL_PATTERN = /\b\d+(?:\.\d+)?\s*%/g;
 const INTERNAL_MACHINE_LABEL_PATTERN = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g;
+const INTERNAL_MACHINE_LABEL_EXACT_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;
+const INTERNAL_SEMANTIC_MEANINGS = Object.freeze({
+  insufficient_data: 'there is not enough verified data to determine a trend',
+  needs_attention: 'this item needs attention',
+  at_risk: 'this item may need attention',
+  in_progress: 'this item is in progress',
+  not_started: 'this item has not started yet',
+  no_data: 'there is no verified data available',
+});
 const VALIDATION_DIGITS = Object.freeze({
   '٠': '0',
   '١': '1',
@@ -162,6 +171,34 @@ const CANONICAL_FACT_KEYWORDS = Object.freeze([
   'opengapcount',
 ]);
 
+const EXACT_PLACEHOLDER_FACT_KEYWORDS = Object.freeze([
+  'title',
+  'name',
+  'medicinename',
+  'medicationname',
+  'drugname',
+  'dose',
+  'unit',
+  'route',
+  'frequency',
+  'duration',
+  'timing',
+  'time',
+  'scheduledtime',
+  'completedtime',
+  'exacttime',
+  'appointmenttime',
+  'date',
+  'startdate',
+  'enddate',
+  'appointmentdate',
+  'score',
+  'rate',
+  'completionrate',
+  'count',
+  'total',
+]);
+
 const AGENT_LANGUAGE_LABELS = Object.freeze({
   en: 'English',
   ur: 'Urdu',
@@ -225,6 +262,29 @@ function semanticLabelForPath(pathSegments = []) {
   return pathSegments.map((segment) => String(segment)).join('.');
 }
 
+function semanticMeaningForInternalLabel(value) {
+  const label = String(value || '').trim();
+  if (!INTERNAL_MACHINE_LABEL_EXACT_PATTERN.test(label)) return null;
+  return INTERNAL_SEMANTIC_MEANINGS[label] || label.replace(/_/g, ' ');
+}
+
+function inferInternalSemanticFact({ factId, value, pathSegments = [] }) {
+  const semanticMeaning = semanticMeaningForInternalLabel(value);
+  if (!semanticMeaning) return null;
+
+  const segments = [
+    ...pathSegments,
+    String(factId || '').replace(/[A-Z]/g, (letter) => `_${letter}`),
+  ].map(canonicalSegmentKey).filter(Boolean);
+
+  if (segments.some((segment) =>
+    EXACT_PLACEHOLDER_FACT_KEYWORDS.some((keyword) => segment.includes(keyword)))) {
+    return null;
+  }
+
+  return semanticMeaning;
+}
+
 function inferCanonicalFact({ factId, value, pathSegments = [] }) {
   if (typeof value === 'number' || typeof value === 'boolean') return true;
 
@@ -274,14 +334,17 @@ export function createAgentFactRegistry() {
       if (typeof value === 'number' && !Number.isFinite(value)) {
         return { ok: false, code: 'INVALID_FACT_VALUE', message: 'Fact value must be finite.' };
       }
+      const semanticMeaning = inferInternalSemanticFact({ factId, value, pathSegments });
       const inferredCanonical = canonical == null
-        ? inferCanonicalFact({ factId, value, pathSegments })
+        ? !semanticMeaning && inferCanonicalFact({ factId, value, pathSegments })
         : Boolean(canonical);
       facts.set(factId, Object.freeze({
         factId,
         value,
         source,
         canonical: inferredCanonical,
+        internalSemantic: Boolean(semanticMeaning),
+        semanticMeaning: semanticMeaning || null,
         semanticLabel:
           cleanText(semanticLabel, 200) ||
           semanticLabelForPath(pathSegments) ||
@@ -446,6 +509,9 @@ function redactCanonicalFacts(value, registry, prefix, depth) {
     );
   }
   const fact = registry.get(prefix);
+  if (fact?.internalSemantic) {
+    return `[internal semantic state: ${fact.semanticMeaning}; explain naturally, do not print the raw enum]`;
+  }
   if (fact?.canonical) return `{{fact:${prefix}}}`;
   return value;
 }
@@ -502,7 +568,9 @@ function prepareAgentReplyContext(capabilityResults) {
   let catalogChars = 0;
   let omittedFacts = 0;
   for (const fact of facts) {
-    const line = fact.canonical
+    const line = fact.internalSemantic
+      ? `- ${fact.factId} (internal semantic state ${fact.semanticLabel}: ${fact.semanticMeaning}; explain naturally, do not use a fact placeholder)`
+      : fact.canonical
       ? `- ${fact.factId} (canonical ${fact.semanticLabel}; use {{fact:${fact.factId}}})`
       : `- ${fact.factId} = ${factDisplayValue(fact.value)}`;
     if (catalogChars + line.length > AGENT_GROUNDER_LIMITS.catalogMaxChars) {
@@ -866,6 +934,17 @@ export function validateAndSubstituteAgentTemplate({ registry, template }) {
         ok: false,
         code: 'AGENT_FACT_UNKNOWN',
         message: `Unknown fact reference: ${factId}`,
+        factId,
+      };
+    }
+    const fact = registry.get(factId);
+    if (fact?.internalSemantic) {
+      return {
+        ok: false,
+        code: 'AGENT_FACT_CONFLICT',
+        message: `messageTemplate would surface an internal machine value ("${fact.value}") in the final reply.`,
+        literal: factDisplayValue(fact.value),
+        kind: 'internal_label',
         factId,
       };
     }

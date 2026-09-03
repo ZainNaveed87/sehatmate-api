@@ -945,6 +945,101 @@ await test('reply prompt forbids raw internal machine labels', async () => {
   assert.equal(placeholderLabel.literal, 'insufficient_data');
 });
 
+await test('internal semantic enum facts are explained without raw placeholder leakage', async () => {
+  const prompts = buildAgentReplyPrompts({
+    language: 'roman_ur',
+    message: 'Pichlay 7 din aur 30 din compare karo.',
+    contextSlice: {},
+    capabilityResults: [{
+      name: 'compare_performance',
+      result: {
+        ok: true,
+        data: {
+          periods: {
+            comparison: {
+              direction: 'insufficient_data',
+            },
+          },
+        },
+      },
+    }],
+  });
+
+  assert.doesNotMatch(prompts.userPrompt, /insufficient_data/);
+  assert.match(
+    prompts.userPrompt,
+    /there is not enough verified data to determine a trend/,
+  );
+  assert.doesNotMatch(
+    prompts.userPrompt,
+    /use \{\{fact:c1_periods_comparison_direction\}\}/,
+  );
+
+  const reply = await generateGroundedAgentReply({
+    provider: createAgentProvider({
+      generateJson: async () => ({
+        json: {
+          messageTemplate:
+            'Is waqt trend clear nahi hai kyun ke enough verified data available nahi.',
+        },
+        model: 'mock',
+        provider: 'mock',
+      }),
+    }),
+    language: 'roman_ur',
+    message: 'Pichlay 7 din aur 30 din compare karo.',
+    contextSlice: {},
+    capabilityResults: [{
+      name: 'compare_performance',
+      result: {
+        ok: true,
+        data: {
+          periods: {
+            comparison: {
+              direction: 'insufficient_data',
+            },
+          },
+        },
+      },
+    }],
+  });
+
+  assert.equal(reply.ok, true);
+  assert.doesNotMatch(reply.reply, /insufficient_data/);
+});
+
+await test('care gap internal state can be explained without leaking enum labels', async () => {
+  const reply = await generateGroundedAgentReply({
+    provider: createAgentProvider({
+      generateJson: async () => ({
+        json: {
+          messageTemplate:
+            'Care gap ko attention chahiye; app verified details ke mutabiq is par nazar rakhni chahiye.',
+        },
+        model: 'mock',
+        provider: 'mock',
+      }),
+    }),
+    language: 'roman_ur',
+    message: 'Care gaps batao.',
+    contextSlice: {},
+    capabilityResults: [{
+      name: 'get_care_gaps',
+      result: {
+        ok: true,
+        data: {
+          gaps: [{
+            state: 'needs_attention',
+          }],
+        },
+      },
+    }],
+  });
+
+  assert.equal(reply.ok, true);
+  assert.doesNotMatch(reply.reply, /needs_attention/);
+});
+
 await test('reply language validation fails closed for Urdu and Roman Urdu script mismatches', async () => {
   const urduMismatch = await generateGroundedAgentReply({
     provider: createAgentProvider({
