@@ -885,6 +885,100 @@ await test('reply prompts redact canonical raw values but keep placeholders visi
   assert.match(prompts.userPrompt, /Take after lunch/);
 });
 
+await test('reply prompts make server-authoritative language mandatory', async () => {
+  const roman = buildAgentReplyPrompts({
+    language: 'roman_ur',
+    message: 'Pichlay 7 din aur 30 din compare karo.',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+  assert.match(roman.systemPrompt, /Mandatory output language: Roman Urdu \(canonical roman_ur\)/);
+  assert.match(roman.systemPrompt, /All user-facing natural-language prose.*Roman Urdu/i);
+  assert.match(roman.systemPrompt, /entire explanatory sentences must not silently switch to English/i);
+  assert.doesNotMatch(roman.systemPrompt, /Mandatory output language: English \(canonical en\)/);
+  assert.doesNotMatch(roman.userPrompt, /Reply language: English/);
+
+  const urdu = buildAgentReplyPrompts({
+    language: 'ur',
+    message: 'Meri performance kesi hai?',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+  assert.match(urdu.systemPrompt, /Mandatory output language: Urdu \(canonical ur\)/);
+  assert.match(urdu.systemPrompt, /Urdu script/);
+});
+
+await test('reply prompt forbids raw internal machine labels', async () => {
+  const prompts = buildAgentReplyPrompts({
+    language: 'roman_ur',
+    message: 'Compare performance',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+  assert.match(prompts.systemPrompt, /insufficient_data/);
+  assert.match(prompts.systemPrompt, /snake_case status values/);
+  assert.match(prompts.systemPrompt, /Explain their meaning naturally/);
+
+  const registry = createAgentFactRegistry();
+  const rawLabel = validateAndSubstituteAgentTemplate({
+    registry,
+    template: 'Comparison direction is insufficient_data.',
+  });
+  assert.equal(rawLabel.ok, false);
+  assert.equal(rawLabel.code, 'AGENT_FACT_CONFLICT');
+  assert.equal(rawLabel.kind, 'internal_label');
+
+  assert.equal(
+    registry.register({
+      factId: 'c1_periods_comparison_direction',
+      value: 'insufficient_data',
+    }).ok,
+    true,
+  );
+  const placeholderLabel = validateAndSubstituteAgentTemplate({
+    registry,
+    template: 'Trend {{fact:c1_periods_comparison_direction}} hai.',
+  });
+  assert.equal(placeholderLabel.ok, false);
+  assert.equal(placeholderLabel.code, 'AGENT_FACT_CONFLICT');
+  assert.equal(placeholderLabel.kind, 'internal_label');
+  assert.equal(placeholderLabel.literal, 'insufficient_data');
+});
+
+await test('reply language validation fails closed for Urdu and Roman Urdu script mismatches', async () => {
+  const urduMismatch = await generateGroundedAgentReply({
+    provider: createAgentProvider({
+      generateJson: async () => ({
+        json: { messageTemplate: 'I compared your recent performance.' },
+        model: 'mock',
+        provider: 'mock',
+      }),
+    }),
+    language: 'ur',
+    message: 'Meri performance kesi hai?',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+  assert.equal(urduMismatch.ok, false);
+  assert.equal(urduMismatch.code, 'AGENT_REPLY_LANGUAGE_MISMATCH');
+
+  const romanMismatch = await generateGroundedAgentReply({
+    provider: createAgentProvider({
+      generateJson: async () => ({
+        json: { messageTemplate: 'میں نے آپ کی performance compare کی۔' },
+        model: 'mock',
+        provider: 'mock',
+      }),
+    }),
+    language: 'roman_ur',
+    message: 'Meri performance kesi hai?',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+  assert.equal(romanMismatch.ok, false);
+  assert.equal(romanMismatch.code, 'AGENT_REPLY_LANGUAGE_MISMATCH');
+});
+
 await test('reply-stage malformed structured output fails safely', async () => {
   const malformed = await generateGroundedAgentReply({
     provider: createAgentProvider({
