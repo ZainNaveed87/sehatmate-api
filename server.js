@@ -26,6 +26,10 @@ import {
 } from './language_support.js';
 
 import {
+  agentRateLimits,
+} from './agent/agent_config.js';
+
+import {
   careGapJson,
   careGapSummary,
   refreshCareGaps,
@@ -250,6 +254,26 @@ const aiLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many AI requests. Please try again later.',
+  },
+});
+
+/*
+ * Conversational Agent rate limiter, separate from aiLimiter (which guards
+ * heavier one-shot AI operations). Reserved for future /api/agent/* routes:
+ * Phase A2 only defines and configures it, no route is attached yet. Values
+ * come from agent/agent_config.js so they stay environment-tunable with safe
+ * defaults; the existing authLimiter, uploadLimiter and aiLimiter are not
+ * weakened or changed.
+ */
+const agentRateLimitSettings = agentRateLimits();
+const agentLimiter = rateLimit({
+  windowMs: agentRateLimitSettings.windowMs,
+  limit: agentRateLimitSettings.limit,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many agent requests. Please try again later.',
   },
 });
 

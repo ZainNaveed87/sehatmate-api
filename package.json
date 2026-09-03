@@ -9,6 +9,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "migrate:care-gaps": "node migrate_care_gaps.js",
+    "migrate:agent-foundation": "node migrate_agent_foundation.js",
     "test:reality-layer1": "node reality_check_layer1_test.js",
     "test:reality-layer2": "node reality_check_layer2_test.js",
     "test:reality-layer3": "node reality_check_layer3_test.js",
@@ -16,7 +17,8 @@
     "test:reality-server-version": "node reality_check_server_version_test.js",
     "test:simulation-reality": "node simulation_reality_integration_test.js",
     "test:language": "node language_support_test.js",
-    "test:services": "node services_boundary_test.js"
+    "test:services": "node services_boundary_test.js",
+    "test:agent-foundation": "node agent_foundation_test.js"
   },
   "engines": {
     "node": ">=20"
