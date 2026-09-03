@@ -66,6 +66,7 @@ const AGENT_CONTEXT_ENTITY_TYPES = Object.freeze(['care_plan', 'care_gap']);
  * but the provider-facing slice only ever exposes the most recent few.
  */
 const MAX_RECENT_ENTITIES_IN_SLICE = 5;
+const MAX_ORDERED_ENTITIES_IN_SLICE = 10;
 
 const ENTITY_TITLE_MAX_LENGTH = 200;
 
@@ -251,6 +252,80 @@ export async function readAgentScreenContext({ pool, userId, clientContext }) {
 }
 
 /**
+ * Revalidate every persisted conversation reference before Phase E uses it.
+ * Session memory is a pointer cache, never an authorization cache.
+ */
+export async function readAgentConversationStateContext({
+  pool,
+  userId,
+  sessionState = null,
+}) {
+  const state = sessionState || {};
+  const verifiedByKey = new Map();
+
+  const verify = async (rawEntity) => {
+    const validated = validateAgentEntityReference(rawEntity);
+    if (!validated.ok) return null;
+    const key = `${validated.entity.type}:${validated.entity.id}`;
+    if (verifiedByKey.has(key)) return verifiedByKey.get(key);
+    const owned = await verifyAgentEntityOwnership({
+      pool,
+      userId,
+      entity: validated.entity,
+    });
+    const entity = owned.ok ? owned.entity : null;
+    verifiedByKey.set(key, entity);
+    return entity;
+  };
+
+  const currentFocus = await verify(state.currentFocus);
+
+  const recentEntities = [];
+  for (const rawEntity of (Array.isArray(state.lastReferencedEntities)
+    ? state.lastReferencedEntities.slice(-MAX_RECENT_ENTITIES_IN_SLICE)
+    : [])) {
+    const entity = await verify(rawEntity);
+    if (entity) recentEntities.push(entity);
+  }
+
+  let recentOrderedEntityList = null;
+  if (
+    state.recentOrderedEntityList &&
+    Array.isArray(state.recentOrderedEntityList.entities)
+  ) {
+    const entities = [];
+    for (const rawEntity of state.recentOrderedEntityList.entities.slice(
+      0,
+      MAX_ORDERED_ENTITIES_IN_SLICE,
+    )) {
+      const entity = await verify(rawEntity);
+      if (entity) entities.push(entity);
+    }
+    if (entities.length) {
+      recentOrderedEntityList = {
+        kind: cleanText(state.recentOrderedEntityList.kind, 40),
+        entities,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    currentFocus,
+    recentEntities,
+    recentOrderedEntityList,
+    lastIntent:
+      typeof state.lastIntent === 'string' ? cleanText(state.lastIntent, 80) || null : null,
+    lastCapabilityNames: Array.isArray(state.lastCapabilityNames)
+      ? state.lastCapabilityNames
+          .map((name) => cleanText(name, 60))
+          .filter(Boolean)
+          .slice(0, 5)
+      : [],
+  };
+}
+
+/**
  * Assemble the bounded, provider-safe context slice from validated parts.
  * Pure function: no database access, no transport objects.
  *
@@ -271,24 +346,47 @@ export function buildAgentContextSlice({
   language,
   screenContext = null,
   sessionState = null,
+  conversationContext = null,
+  referenceResolution = null,
 }) {
   const state = sessionState || {};
 
-  const recentEntities = (Array.isArray(state.lastReferencedEntities)
-    ? state.lastReferencedEntities
-    : [])
-    .slice(-MAX_RECENT_ENTITIES_IN_SLICE)
-    .map((item) => validateAgentEntityReference(item))
-    .filter((result) => result.ok)
-    .map((result) => result.entity);
+  const recentEntities = conversationContext
+    ? (conversationContext.recentEntities || []).slice(-MAX_RECENT_ENTITIES_IN_SLICE)
+    : (Array.isArray(state.lastReferencedEntities)
+        ? state.lastReferencedEntities
+        : [])
+        .slice(-MAX_RECENT_ENTITIES_IN_SLICE)
+        .map((item) => validateAgentEntityReference(item))
+        .filter((result) => result.ok)
+        .map((result) => result.entity);
+
+  const currentFocus = conversationContext?.currentFocus || null;
+  const ordered = conversationContext?.recentOrderedEntityList || null;
 
   return Object.freeze({
     language: canonicalAgentLanguage(language),
     screenId: screenContext?.screenId || null,
     currentEntity: screenContext?.entity || null,
+    currentFocus: currentFocus
+      ? Object.freeze({ type: currentFocus.type, id: currentFocus.id })
+      : null,
     recentEntities: Object.freeze(
-      recentEntities.map((item) => Object.freeze({ ...item })),
+      recentEntities.map((item) => Object.freeze({ type: item.type, id: item.id })),
     ),
+    recentOrderedEntityList: ordered
+      ? Object.freeze({
+          kind: ordered.kind,
+          entities: Object.freeze(
+            ordered.entities.map((item) => Object.freeze({ type: item.type, id: item.id })),
+          ),
+        })
+      : null,
+    lastIntent: conversationContext?.lastIntent || null,
+    lastCapabilityNames: Object.freeze([
+      ...(conversationContext?.lastCapabilityNames || []),
+    ]),
+    referenceResolution: referenceResolution || null,
     lastActionSummary:
       typeof state.lastActionSummary === 'string' ? state.lastActionSummary : null,
   });

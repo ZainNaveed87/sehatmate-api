@@ -62,8 +62,22 @@ import './agent_read_tools.js';
 import './agent_draft_tools.js';
 import {
   buildAgentContextSlice,
+  readAgentConversationStateContext,
   readAgentScreenContext,
 } from './agent_context_engine.js';
+import {
+  deriveServerCapabilityNames,
+  deriveServerNormalizedIntent,
+  deriveVerifiedCurrentFocus,
+  deriveVerifiedOrderedEntityList,
+} from './agent_conversation_state.js';
+import {
+  classifyBareConfirmationDecision,
+  localizedReferenceClarification,
+  referenceResolutionContext,
+  resolveAgentConversationReference,
+  reviewPlanAgainstResolvedReference,
+} from './agent_reference_resolver.js';
 import { authorizeAgentNavigationIntent } from './agent_navigation_registry.js';
 import {
   AGENT_PLANNER_LIMITS,
@@ -446,6 +460,8 @@ function buildNextSessionState({
   sessionState,
   intent,
   capabilityCalls,
+  successfulCapabilityCalls = [],
+  capabilityResults = [],
   navigation,
   navigationEntity,
   screenEntity,
@@ -485,8 +501,38 @@ function buildNextSessionState({
     AGENT_STATE_LIMITS.summaryMaxLength,
   );
 
+  const verifiedFocus = deriveVerifiedCurrentFocus({
+    successfulCapabilityCalls,
+    navigationEntity,
+  });
+  const verifiedOrderedList = deriveVerifiedOrderedEntityList(capabilityResults);
+  const hasVerifiedOperation = successfulCapabilityCalls.length > 0 || Boolean(navigation);
+  const normalizedIntent = deriveServerNormalizedIntent({
+    successfulCapabilityCalls,
+    navigation,
+  });
+  const capabilityNames = deriveServerCapabilityNames(successfulCapabilityCalls);
+
   return {
     lastReferencedEntities,
+    currentFocus:
+      verifiedFocus === undefined
+        ? sessionState?.currentFocus ?? null
+        : verifiedFocus,
+    recentOrderedEntityList:
+      verifiedOrderedList !== undefined
+        ? verifiedOrderedList
+        : hasVerifiedOperation
+          ? null
+          : sessionState?.recentOrderedEntityList ?? null,
+    lastIntent:
+      hasVerifiedOperation
+        ? normalizedIntent
+        : sessionState?.lastIntent ?? null,
+    lastCapabilityNames:
+      hasVerifiedOperation
+        ? capabilityNames
+        : sessionState?.lastCapabilityNames ?? [],
     pendingConfirmation:
       pendingConfirmation === undefined
         ? sessionState?.pendingConfirmation ?? null
@@ -541,6 +587,8 @@ async function finishAgentTurn({
   fallbackCode,
   intent,
   capabilityCalls,
+  successfulCapabilityCalls = [],
+  capabilityResults = [],
   navigation,
   navigationEntity,
   screenEntity,
@@ -553,6 +601,8 @@ async function finishAgentTurn({
     sessionState: session.state,
     intent,
     capabilityCalls,
+    successfulCapabilityCalls,
+    capabilityResults,
     navigation,
     navigationEntity,
     screenEntity,
@@ -902,6 +952,34 @@ export async function handleAgentMessage({
       });
     }
 
+    // Phase E conversational confirmation/cancellation is deterministic and
+    // bypasses planner/provider completely. It can only consume the exact
+    // server-stored Phase D pending confirmation in this owned session.
+    const conversationalDecision = classifyBareConfirmationDecision(boundedMessage);
+    if (conversationalDecision) {
+      const pendingConfirmation = session.state?.pendingConfirmation;
+      const confirmationId = pendingConfirmation?.confirmationId;
+      if (!confirmationId) {
+        return finishAgentConfirmationTurn({
+          session,
+          reply: confirmationText('noPending', session.language),
+          fallbackCode: 'AGENT_CONFIRMATION_NOT_FOUND',
+          confirmation: null,
+          actionStatus: 'rejected',
+        });
+      }
+      return handleAgentConfirmation({
+        pool,
+        userId,
+        session,
+        confirmationRequest: {
+          ok: true,
+          confirmationId,
+          decision: conversationalDecision,
+        },
+      });
+    }
+
     // --- bounded verified context (fail-safe drops, ownership first) ---
     const context = await readAgentScreenContext({
       pool,
@@ -910,10 +988,52 @@ export async function handleAgentMessage({
     });
     const screenEntity = context.screenContext?.entity || null;
 
+    const conversationContext = await readAgentConversationStateContext({
+      pool,
+      userId,
+      sessionState: session.state,
+    });
+
+    const referenceResolution = await resolveAgentConversationReference({
+      pool,
+      userId,
+      message: boundedMessage,
+      screenEntity,
+      currentFocus: conversationContext.currentFocus,
+      recentEntities: conversationContext.recentEntities,
+      recentOrderedEntityList: conversationContext.recentOrderedEntityList,
+    });
+
+    if (
+      referenceResolution.status === 'ambiguous' ||
+      referenceResolution.status === 'missing'
+    ) {
+      return finishAgentTurn({
+        pool,
+        userId,
+        session,
+        reply: localizedReferenceClarification({
+          language: session.language,
+          resolution: referenceResolution,
+        }),
+        fallbackCode:
+          referenceResolution.status === 'ambiguous'
+            ? 'AGENT_REFERENCE_AMBIGUOUS'
+            : 'AGENT_REFERENCE_NOT_FOUND',
+        intent: 'clarify_entity_reference',
+        capabilityCalls: [],
+        navigation: null,
+        navigationEntity: null,
+        screenEntity,
+      });
+    }
+
     const contextSlice = buildAgentContextSlice({
       language: session.language,
       screenContext: context.screenContext,
       sessionState: session.state,
+      conversationContext,
+      referenceResolution: referenceResolutionContext(referenceResolution),
     });
 
     // --- one bounded planning turn ---
@@ -955,6 +1075,28 @@ export async function handleAgentMessage({
     }
 
     const plan = planned.plan;
+    const referenceBinding = reviewPlanAgainstResolvedReference({
+      plan,
+      resolution: referenceResolution,
+    });
+    if (!referenceBinding.ok) {
+      return finishAgentTurn({
+        pool,
+        userId,
+        session,
+        reply: localizedReferenceClarification({
+          language: session.language,
+          resolution: referenceResolution,
+          code: referenceBinding.code,
+        }),
+        fallbackCode: referenceBinding.code,
+        intent: 'clarify_entity_reference',
+        capabilityCalls: [],
+        navigation: null,
+        navigationEntity: null,
+        screenEntity,
+      });
+    }
     const declined =
       plan.capabilityCalls.length === 0 && DECLINE_INTENT_PATTERN.test(plan.intent);
     const plannedDraftCall = plan.capabilityCalls.find(
@@ -980,6 +1122,7 @@ export async function handleAgentMessage({
 
     // --- execute validated READ/DRAFT calls (bounded by the gateway) ---
     const capabilityResults = [];
+    const successfulCapabilityCalls = [];
     let capabilityFailureCode = null;
     let pendingDraft = null;
     for (const call of plan.capabilityCalls) {
@@ -1032,6 +1175,7 @@ export async function handleAgentMessage({
         errorCode: result.ok ? null : result.code || 'AGENT_CAPABILITY_FAILED',
       });
       if (result.ok) {
+        successfulCapabilityCalls.push({ name: call.name, args: call.args });
         if (capability?.permissionClass === 'DRAFT') {
           if (pendingDraft) {
             capabilityFailureCode = 'AGENT_MULTIPLE_DRAFTS_NOT_ALLOWED';
@@ -1042,7 +1186,7 @@ export async function handleAgentMessage({
             }
           }
         } else {
-          capabilityResults.push({ name: call.name, result });
+          capabilityResults.push({ name: call.name, args: call.args, result });
         }
       } else {
         capabilityFailureCode = result.code || 'AGENT_CAPABILITY_FAILED';
@@ -1073,6 +1217,8 @@ export async function handleAgentMessage({
         fallbackCode: null,
         intent: 'draft_awaiting_confirmation',
         capabilityCalls: plan.capabilityCalls,
+        successfulCapabilityCalls,
+        capabilityResults,
         navigation: null,
         navigationEntity: null,
         screenEntity,
@@ -1165,6 +1311,8 @@ export async function handleAgentMessage({
       fallbackCode,
       intent: plan.intent,
       capabilityCalls: plan.capabilityCalls,
+      successfulCapabilityCalls,
+      capabilityResults,
       navigation,
       navigationEntity,
       screenEntity,

@@ -330,6 +330,13 @@ await test('readAgentSession: approved canonical stored state fields survive rea
   const stored = {
     version: 1,
     lastReferencedEntities: [{ type: 'care_plan', id: '7' }],
+    currentFocus: { type: 'care_plan', id: '7' },
+    recentOrderedEntityList: {
+      kind: 'care_plan',
+      entities: [{ type: 'care_plan', id: '7' }],
+    },
+    lastIntent: 'get_care_plan',
+    lastCapabilityNames: ['get_care_plan'],
     pendingConfirmation: {
       confirmationId: 'confirm-state-1',
       kind: 'task_outcome',
@@ -474,6 +481,17 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
       'junk-entry',
       { type: 'document', id: '9' },
     ],
+    currentFocus: { type: 'care_plan', id: '7' },
+    recentOrderedEntityList: {
+      kind: 'care_plan',
+      entities: [
+        { type: 'care_plan', id: '7' },
+        { type: 'care_gap', id: '5' },
+        { type: 'document', id: '9' },
+      ],
+    },
+    lastIntent: 'get_care_plan',
+    lastCapabilityNames: ['get_care_plan', 'get_simulation'],
     pendingConfirmation: {
       confirmationId: 'confirm-state-2',
       kind: 'task_outcome',
@@ -500,6 +518,19 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
   );
   assert.deepEqual(sanitized.state.pendingDraft, { title: 'Metformin' });
   assert.equal(sanitized.state.lastActionSummary, 'Reminder confirmed');
+  assert.deepEqual(sanitized.state.currentFocus, { type: 'care_plan', id: '7' });
+  assert.deepEqual(sanitized.state.recentOrderedEntityList, {
+    kind: 'care_plan',
+    entities: [
+      { type: 'care_plan', id: '7' },
+      { type: 'care_gap', id: '5' },
+    ],
+  });
+  assert.equal(sanitized.state.lastIntent, 'get_care_plan');
+  assert.deepEqual(sanitized.state.lastCapabilityNames, [
+    'get_care_plan',
+    'get_simulation',
+  ]);
   assert.equal('evilKey' in sanitized.state, false);
 });
 
