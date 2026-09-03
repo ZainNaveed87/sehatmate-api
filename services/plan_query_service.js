@@ -91,6 +91,45 @@ export async function listCarePlans({ pool, userId }) {
 }
 
 /**
+ * Verify that one care plan is owned by the authenticated user without
+ * loading any plan detail. This is the authoritative lightweight
+ * ownership primitive for agent context validation and agent navigation
+ * authorization: the same ownership-scoped query readPlanLifecycleEvents
+ * performs, exposed as a standalone bounded read.
+ *
+ * Returns:
+ *   { ok: false, code: 'INVALID_PLAN_ID', message }
+ *   { ok: false, code: 'PLAN_NOT_FOUND', message }
+ *   { ok: true, data: { planId, title } }
+ */
+export async function verifyCarePlanOwnership({ pool, userId, planId }) {
+  if (!idPattern.test(planId)) {
+    return {
+      ok: false,
+      code: 'INVALID_PLAN_ID',
+      message: 'Invalid care plan ID.',
+    };
+  }
+
+  const [plans] = await pool.execute(
+    'SELECT id, title FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+    [planId, userId],
+  );
+  if (!plans.length) {
+    return {
+      ok: false,
+      code: 'PLAN_NOT_FOUND',
+      message: 'Care plan not found.',
+    };
+  }
+
+  return {
+    ok: true,
+    data: { planId: String(plans[0].id), title: plans[0].title || '' },
+  };
+}
+
+/**
  * Read the full detail payload for one care plan.
  *
  * Returns:

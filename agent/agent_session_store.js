@@ -232,6 +232,36 @@ export async function updateAgentSessionState({ db, userId, sessionId, state }) 
 }
 
 /**
+ * Update the persisted language of an active session owned by the
+ * authenticated user. This is the smallest safe user-scoped
+ * session-language update: when the user changes their profile language
+ * between two agent messages, the session follows the profile instead of
+ * answering in a stale language. Only the language column (and
+ * last_active_at) is touched; the session state is preserved.
+ */
+export async function updateAgentSessionLanguage({ db, userId, sessionId, language }) {
+  if (!idPattern.test(sessionId || '')) return invalidSessionIdResult();
+
+  const canonicalLanguage = canonicalAgentLanguage(language);
+  const [result] = await db.execute(
+    `UPDATE agent_sessions
+     SET language = ?, last_active_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP`,
+    [canonicalLanguage, sessionId, userId],
+  );
+  if (!result.affectedRows) return sessionNotFoundResult();
+
+  const row = await readActiveSessionRow(db, sessionId, userId);
+  if (!row) return sessionNotFoundResult();
+
+  return {
+    ok: true,
+    message: 'Agent session language updated.',
+    data: { session: sessionForRow(row) },
+  };
+}
+
+/**
  * Explicitly delete a session owned by the authenticated user. Related
  * audit records survive via ON DELETE SET NULL.
  */

@@ -18,6 +18,8 @@
     "test:simulation-reality": "node simulation_reality_integration_test.js",
     "test:language": "node language_support_test.js",
     "test:services": "node services_boundary_test.js",
+    "test:performance": "node performance_summary_test.js",
+    "test:agent-phase-b": "node agent_phase_b_test.js",
     "test:agent-foundation": "node agent_foundation_test.js"
   },
   "engines": {

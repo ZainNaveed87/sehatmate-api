@@ -321,6 +321,107 @@ export async function realityDecisionTemplatesForPlan({
 }
 
 /**
+ * Read the Reality Check question set and any saved answers for one plan.
+ *
+ * Extracted verbatim from the GET /api/care-plans/:id/reality-check route
+ * handler in server.js so the REST route and the Phase B agent
+ * get_reality_check capability share ONE implementation. This is not a
+ * pure read: with createIfMissing it may persist a newly generated
+ * question set for the plan, preserving the original route behavior.
+ *
+ * Returns:
+ *   { ok: false, code: 'INVALID_PLAN_ID', message }
+ *   { ok: false, code: 'PLAN_NOT_FOUND', message }
+ *   { ok: false, code: 'SCHEDULE_NOT_GENERATED', message }
+ *   { ok: true, data: { source, questionSetVersion, questions } }
+ */
+export async function readRealityCheckState({
+  pool,
+  userId,
+  planId,
+  preferredLanguage = null,
+}) {
+  if (!idPattern.test(planId)) {
+    return {
+      ok: false,
+      code: 'INVALID_PLAN_ID',
+      message: 'Invalid care plan ID.',
+    };
+  }
+
+  const [plans] = await pool.execute(
+    'SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+    [planId, userId],
+  );
+  if (!plans.length) {
+    return {
+      ok: false,
+      code: 'PLAN_NOT_FOUND',
+      message: 'Care plan not found.',
+    };
+  }
+
+  const [tasks] = await pool.execute(
+    `SELECT id, instruction_id, task_kind, schedule_date,
+      TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
+      title, display_time, recurrence_text, grounding, reason,
+      requires_confirmation
+     FROM care_schedule_items
+     WHERE care_plan_id = ? AND user_id = ?
+     ORDER BY id`,
+    [planId, userId],
+  );
+  if (!tasks.length) {
+    return {
+      ok: false,
+      code: 'SCHEDULE_NOT_GENERATED',
+      message: 'Generate the schedule before starting the reality check.',
+    };
+  }
+
+  const reality = await realityDecisionTemplatesForPlan({
+    db: pool,
+    planId,
+    userId,
+    tasks,
+    createIfMissing: true,
+    preferredLanguage,
+  });
+  const [saved] = await pool.execute(
+    `SELECT question_key, selected_answer, note
+     FROM care_reality_answers
+     WHERE care_plan_id = ? AND user_id = ?`,
+    [planId, userId],
+  );
+  const savedByKey = new Map(saved.map((item) => [item.question_key, item]));
+
+  return {
+    ok: true,
+    data: {
+      source: reality.source,
+      questionSetVersion: reality.questionSet?.version || null,
+      questions: reality.templates.map((item) => ({
+        key: item.key,
+        category: item.category,
+        question: item.question,
+        options: item.options.map((option) => option.label),
+        intent: item.intent,
+        responseProfile: item.responseProfile,
+        targetTaskIds: item.targetTaskIds,
+        period: item.period,
+        reasonForAsking: item.reasonForAsking,
+        source: item.source,
+        selectedAnswer:
+          savedByKey.get(item.key)?.selected_answer === '__custom__'
+            ? ''
+            : savedByKey.get(item.key)?.selected_answer || '',
+        note: savedByKey.get(item.key)?.note || '',
+      })),
+    },
+  };
+}
+
+/**
  * Save one batch of Reality Check answers for a plan.
  *
  * Returns a structured domain result:

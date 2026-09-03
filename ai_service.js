@@ -282,6 +282,52 @@ export async function generateAiText({
   });
 }
 
+/*
+ * Structured-JSON completion for callers that need a parsed object back
+ * (Phase B agent planner / response generator). Follows the same provider
+ * contract as the other JSON-mode requests: deterministic temperature,
+ * bounded output, JSON-only response format, and no reasoning payload.
+ * The parsed value must be a plain object - arrays and scalars are
+ * rejected so callers can rely on object-shaped structured output.
+ */
+export async function generateAiJson({
+  systemPrompt,
+  userPrompt,
+  temperature = 0,
+  maxTokens = 800,
+  preferredLanguage = null,
+}) {
+  const completion = await requestCompletion({
+    messages: [
+      {
+        role: 'system',
+        content: languageAwareSystemPrompt(systemPrompt, preferredLanguage),
+      },
+      { role: 'user', content: userPrompt },
+    ],
+    temperature,
+    max_tokens: maxTokens,
+    reasoning: { effort: 'none' },
+    response_format: { type: 'json_object' },
+  });
+
+  let json;
+  try {
+    json = JSON.parse(completion.text);
+  } catch {
+    throw new AiServiceError('The AI provider returned invalid JSON.');
+  }
+
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    throw new AiServiceError('The AI provider returned invalid JSON.');
+  }
+
+  return {
+    ...completion,
+    json,
+  };
+}
+
 export async function extractCareInstructions({
   fileBuffer,
   fileName,

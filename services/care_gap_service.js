@@ -184,6 +184,47 @@ export async function readCareGapDetail({ pool, userId, gapId }) {
 }
 
 /**
+ * Verify that one care gap is reachable for the authenticated user
+ * without loading doctor questions or the full gap payload. Ownership is
+ * enforced by readCareGapForUser (a gap is only reachable through a plan
+ * owned by the authenticated user); this is the authoritative lightweight
+ * primitive for agent context validation and agent navigation
+ * authorization.
+ *
+ * Returns:
+ *   { ok: false, code: 'INVALID_GAP_ID', message }
+ *   { ok: false, code: 'GAP_NOT_FOUND', message }
+ *   { ok: true, data: { gapId, planId, title } }
+ */
+export async function verifyCareGapOwnership({ pool, userId, gapId }) {
+  if (!idPattern.test(gapId)) {
+    return {
+      ok: false,
+      code: 'INVALID_GAP_ID',
+      message: 'Invalid care gap ID.',
+    };
+  }
+
+  const gap = await readCareGapForUser(pool, gapId, userId);
+  if (!gap) {
+    return {
+      ok: false,
+      code: 'GAP_NOT_FOUND',
+      message: 'Care gap not found.',
+    };
+  }
+
+  return {
+    ok: true,
+    data: {
+      gapId: String(gap.id),
+      planId: String(gap.care_plan_id),
+      title: gap.title || '',
+    },
+  };
+}
+
+/**
  * Update the lifecycle status of one care gap.
  *
  * Returns:

@@ -109,6 +109,12 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'Can you reach the clinic or laboratory at the stated time?',
     legacyMedicineAccessQuestion:
       'Have you obtained the medicines listed in this verified plan?',
+    agentUnavailable:
+      'I could not complete that request right now. Nothing was changed. Please try again in a little while.',
+    agentDisabled:
+      'The SehatMate assistant is currently unavailable.',
+    agentPermissionDenied:
+      'I cannot make changes to your medicines, doses, times, or care plan. Nothing was changed, and your verified plan stays exactly as it is.',
   }),
   Urdu: Object.freeze({
     noActiveIngredientReadable:
@@ -153,6 +159,12 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'کیا آپ مقررہ وقت پر کلینک یا لیبارٹری پہنچ سکتے ہیں؟',
     legacyMedicineAccessQuestion:
       'کیا آپ نے اس تصدیق شدہ منصوبے میں لکھی دوائیں حاصل کر لی ہیں؟',
+    agentUnavailable:
+      'میں ابھی یہ درخواست مکمل نہیں کر سکا۔ کچھ بھی تبدیل نہیں ہوا۔ براہ کرم تھوڑی دیر بعد دوبارہ کوشش کریں۔',
+    agentDisabled:
+      'SehatMate اسسٹنٹ فی الحال دستیاب نہیں ہے۔',
+    agentPermissionDenied:
+      'میں آپ کی دواؤں، خوراک، اوقات یا دیکھ بھال کے منصوبے میں تبدیلی نہیں کر سکتا۔ کچھ بھی تبدیل نہیں ہوا، اور آپ کا تصدیق شدہ منصوبہ بالکل ویسا ہی ہے۔',
   }),
   'Roman Urdu': Object.freeze({
     noActiveIngredientReadable:
@@ -197,6 +209,12 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'Kya aap stated time par clinic ya laboratory pohanch sakte hain?',
     legacyMedicineAccessQuestion:
       'Kya aap ne is verified plan mein listed medicines hasil kar li hain?',
+    agentUnavailable:
+      'Main abhi yeh request complete nahi kar saka. Kuch bhi change nahi hua. Please thori der baad dobara try karein.',
+    agentDisabled:
+      'SehatMate assistant filhal available nahi hai.',
+    agentPermissionDenied:
+      'Main aap ki medicines, dose, timings ya care plan mein change nahi kar sakta. Kuch bhi change nahi hua, aur aap ka verified plan bilkul waisa hi hai.',
   }),
 });
 
