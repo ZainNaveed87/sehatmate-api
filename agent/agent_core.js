@@ -104,6 +104,77 @@ function localizedAgentText(key, canonicalLanguage) {
   return localizedAiFallbackText(key, agentReplyLanguageLabel(canonicalLanguage));
 }
 
+const NAVIGATION_TARGET_LABELS = Object.freeze({
+  home: Object.freeze({ en: 'Home', ur: 'ہوم', roman_ur: 'Home' }),
+  today: Object.freeze({ en: 'Today', ur: 'آج', roman_ur: 'Today' }),
+  care_plans: Object.freeze({
+    en: 'Care plans',
+    ur: 'دیکھ بھال کے منصوبے',
+    roman_ur: 'Care plans',
+  }),
+  care_plan_detail: Object.freeze({
+    en: 'Care plan',
+    ur: 'دیکھ بھال کا منصوبہ',
+    roman_ur: 'Care plan',
+  }),
+  reality_check: Object.freeze({
+    en: 'Reality Check',
+    ur: 'ریئلٹی چیک',
+    roman_ur: 'Reality Check',
+  }),
+  simulation: Object.freeze({
+    en: 'Simulation',
+    ur: 'سیمولیشن',
+    roman_ur: 'Simulation',
+  }),
+  care_gaps: Object.freeze({
+    en: 'Care gaps',
+    ur: 'دیکھ بھال کے خلا',
+    roman_ur: 'Care gaps',
+  }),
+  care_gap_detail: Object.freeze({
+    en: 'Care gap',
+    ur: 'دیکھ بھال کا خلا',
+    roman_ur: 'Care gap',
+  }),
+  routine_settings: Object.freeze({
+    en: 'Routine settings',
+    ur: 'روٹین سیٹنگز',
+    roman_ur: 'Routine settings',
+  }),
+  profile: Object.freeze({ en: 'Profile', ur: 'پروفائل', roman_ur: 'Profile' }),
+  documents: Object.freeze({
+    en: 'Documents',
+    ur: 'دستاویزات',
+    roman_ur: 'Documents',
+  }),
+  notifications: Object.freeze({
+    en: 'Notifications',
+    ur: 'نوٹیفکیشنز',
+    roman_ur: 'Notifications',
+  }),
+  settings: Object.freeze({ en: 'Settings', ur: 'سیٹنگز', roman_ur: 'Settings' }),
+});
+
+function navigationTargetLabel(target, canonicalLanguage) {
+  const language = canonicalAgentLanguage(canonicalLanguage);
+  return NAVIGATION_TARGET_LABELS[target]?.[language] ||
+    NAVIGATION_TARGET_LABELS[target]?.en ||
+    'that screen';
+}
+
+function navigationReadyText(target, canonicalLanguage) {
+  const language = canonicalAgentLanguage(canonicalLanguage);
+  const label = navigationTargetLabel(target, language);
+  if (language === 'ur') {
+    return `${label} کھولنے کے لیے نیچے کھولیں دبائیں۔`;
+  }
+  if (language === 'roman_ur') {
+    return `${label} kholne ke liye neeche Kholein dabayein.`;
+  }
+  return `Use Open below to open ${label}.`;
+}
+
 /**
  * Intent labels the planner produces for refused change requests (for
  * example decline_change_request). The label only routes the reply to the
@@ -595,6 +666,12 @@ export async function handleAgentMessage({
     if (declined) {
       reply = localizedAgentText('agentPermissionDenied', session.language);
       fallbackCode = 'AGENT_PERMISSION_DENIED';
+    } else if (
+      navigation &&
+      capabilityResults.length === 0 &&
+      plan.capabilityCalls.length === 0
+    ) {
+      reply = navigationReadyText(navigation.target, session.language);
     } else {
       const replyResult = await generateGroundedAgentReply({
         provider,

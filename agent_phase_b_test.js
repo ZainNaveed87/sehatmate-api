@@ -22,6 +22,7 @@ import { readAgentScreenContext } from './agent/agent_context_engine.js';
 import { handleAgentMessage } from './agent/agent_core.js';
 import { createAgentProvider } from './agent/agent_provider.js';
 import {
+  buildAgentPlannerPrompts,
   planAgentMessage,
   validateAgentPlan,
 } from './agent/agent_planner.js';
@@ -114,6 +115,10 @@ function createFakePool({
 
     if (text.includes('COUNT(*) AS open_count')) {
       return [[{ open_count: gapCount }]];
+    }
+
+    if (text.startsWith('SELECT care_plans.*,')) {
+      return [activePlans];
     }
 
     if (text.startsWith('SELECT id, title, readiness_score FROM care_plans')) {
@@ -332,6 +337,68 @@ await test('planner/provider malformed output and unknown capability plans fail 
   assert.equal(unknown.code, 'UNKNOWN_CAPABILITY');
 });
 
+await test('planner prompt distinguishes open care gaps from screen navigation', async () => {
+  const prompts = buildAgentPlannerPrompts({
+    message: 'mere open care gaps list karo',
+    contextSlice: {},
+  });
+
+  assert.match(prompts.systemPrompt, /open care gaps.*mean lifecycle=open, not opening a screen/i);
+  assert.match(prompts.systemPrompt, /care gaps batao.*READ requests, not navigation requests/i);
+  assert.match(prompts.systemPrompt, /For a general care-gap READ.*call get_care_plans/i);
+  assert.match(prompts.systemPrompt, /Do not invent a planId/i);
+});
+
+await test('planner accepts routine settings as explicit navigation intent', async () => {
+  const planned = validateAgentPlan({
+    intent: 'open_routine_settings',
+    capabilityCalls: [],
+    navigationIntent: { target: 'routine_settings', params: {} },
+  });
+
+  assert.equal(planned.ok, true);
+  assert.deepEqual(planned.plan.navigationIntent, {
+    target: 'routine_settings',
+    params: {},
+  });
+});
+
+await test('planner can use get_care_plans for general care-gap reads without planId', async () => {
+  const planned = validateAgentPlan({
+    intent: 'read_general_care_gaps',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  });
+
+  assert.equal(planned.ok, true);
+  assert.deepEqual(planned.plan.capabilityCalls, [
+    { name: 'get_care_plans', args: {} },
+  ]);
+});
+
+await test('planner can use get_care_gaps lifecycle=open with safe single-plan context', async () => {
+  const prompts = buildAgentPlannerPrompts({
+    message: 'mere open care gaps list karo',
+    contextSlice: {
+      currentEntity: { type: 'care_plan', id: '7', title: 'Prescription Care Plan' },
+      recentEntities: [],
+    },
+  });
+  assert.match(prompts.systemPrompt, /exactly one owned care_plan id is safely resolved/i);
+  assert.match(prompts.systemPrompt, /get_care_gaps.*lifecycle="open"/i);
+
+  const planned = validateAgentPlan({
+    intent: 'read_open_care_gaps_for_plan',
+    capabilityCalls: [{ name: 'get_care_gaps', args: { planId: '7', lifecycle: 'open' } }],
+    navigationIntent: null,
+  });
+
+  assert.equal(planned.ok, true);
+  assert.deepEqual(planned.plan.capabilityCalls, [
+    { name: 'get_care_gaps', args: { planId: '7', lifecycle: 'open' } },
+  ]);
+});
+
 await test('handleAgentMessage rejects an empty message before creating a session', async () => {
   const pool = createFakePool();
   const result = await handleAgentMessage({
@@ -448,6 +515,80 @@ await test('clarification zero-tool plan does not invent an entity id', async ()
   assert.deepEqual(result.referencedEntities, []);
   assert.ok(!pool.calls.some((call) => call.sql.startsWith('SELECT id, title FROM care_plans')));
   assert.ok(!pool.calls.some((call) => call.sql.includes('FROM care_gaps WHERE id = ?')));
+});
+
+await test('general care-gap read without planId uses owned care-plan summaries', async () => {
+  const pool = createFakePool({
+    preferredLanguage: 'roman_ur',
+    activePlans: [{
+      id: 7,
+      title: 'Prescription Care Plan',
+      status: 'active',
+      readiness_score: 85,
+      open_gap_count: 1,
+      document_count: 1,
+      task_count: 4,
+      updated_at: '2026-09-03 10:00:00',
+    }],
+  });
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    message: 'mere open care gaps list karo',
+    provider: mockProvider({
+      plan: {
+        intent: 'read_general_care_gaps',
+        capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+        navigationIntent: null,
+      },
+      replyTemplate: () =>
+        '{{fact:c1_plans_1_title}} mein {{fact:c1_plans_1_openGapCount}} open care gap hai. Individual gap details ke liye plan open/select karna hoga.',
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(
+    result.reply,
+    'Prescription Care Plan mein 1 open care gap hai. Individual gap details ke liye plan open/select karna hoga.',
+  );
+  assert.equal(result.navigation, null);
+  assert.ok(
+    pool.calls.some((call) =>
+      call.sql.startsWith('SELECT care_plans.*,') &&
+      call.params[0] === USER),
+  );
+  assert.ok(!pool.calls.some((call) => call.sql.includes('FROM care_gaps WHERE care_plan_id = ?')));
+  assert.doesNotMatch(result.reply, /verified data nahi mila|refresh karein/i);
+});
+
+await test('navigation-only turn returns deterministic localized reply without reply provider', async () => {
+  const pool = createFakePool({ preferredLanguage: 'roman_ur' });
+  const { provider, calls } = countingMockProvider({
+    plan: {
+      intent: 'open_routine_settings',
+      capabilityCalls: [],
+      navigationIntent: { target: 'routine_settings', params: {} },
+    },
+    replyTemplate: () => 'abhi koi capability results nahi hain',
+  });
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    message: 'routine settings kholo',
+    provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(calls.plan, 1);
+  assert.equal(calls.reply, 0);
+  assert.equal(result.reply, 'Routine settings kholne ke liye neeche Kholein dabayein.');
+  assert.deepEqual(result.navigation, {
+    target: 'routine_settings',
+    params: {},
+  });
+  assert.equal(result.fallbackCode, undefined);
 });
 
 await test('READ capability execution is audited and exact 14:00 facts are backend-grounded', async () => {
@@ -1038,6 +1179,71 @@ await test('care gap internal state can be explained without leaking enum labels
 
   assert.equal(reply.ok, true);
   assert.doesNotMatch(reply.reply, /needs_attention/);
+});
+
+await test('empty capability results reject invented missing-data and refresh claims', async () => {
+  const prompts = buildAgentReplyPrompts({
+    language: 'roman_ur',
+    message: 'routine settings kholo',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+  assert.match(prompts.systemPrompt, /Do not claim verified data was missing/i);
+  assert.match(prompts.systemPrompt, /refresh is needed/i);
+  assert.match(prompts.systemPrompt, /unless a verified capability result explicitly says that/i);
+
+  const reply = await generateGroundedAgentReply({
+    provider: createAgentProvider({
+      generateJson: async () => ({
+        json: {
+          messageTemplate:
+            'Verified data nahi mila; routine settings se refresh karein.',
+        },
+        model: 'mock',
+        provider: 'mock',
+      }),
+    }),
+    language: 'roman_ur',
+    message: 'routine settings kholo',
+    contextSlice: {},
+    capabilityResults: [],
+  });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.code, 'AGENT_REPLY_INVALID');
+});
+
+await test('successful care-plan results still reject invented missing-data and refresh claims', async () => {
+  const reply = await generateGroundedAgentReply({
+    provider: createAgentProvider({
+      generateJson: async () => ({
+        json: {
+          messageTemplate:
+            'Verified data nahi mila; refresh karein.',
+        },
+        model: 'mock',
+        provider: 'mock',
+      }),
+    }),
+    language: 'roman_ur',
+    message: 'mere open care gaps list karo',
+    contextSlice: {},
+    capabilityResults: [{
+      name: 'get_care_plans',
+      result: {
+        ok: true,
+        data: {
+          plans: [{
+            title: 'Prescription Care Plan',
+            openGapCount: 1,
+          }],
+        },
+      },
+    }],
+  });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.code, 'AGENT_REPLY_INVALID');
 });
 
 await test('reply language validation fails closed for Urdu and Roman Urdu script mismatches', async () => {
