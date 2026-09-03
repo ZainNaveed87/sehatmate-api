@@ -226,10 +226,14 @@ function countingMockProvider({ plan, replyTemplate }) {
 
 process.env.AGENT_ENABLED = 'true';
 
-await test('Agent Core import registers the Phase B READ capability catalog', async () => {
+await test('Agent Core import registers the Agent capability catalog', async () => {
   const names = listAgentCapabilities().map((capability) => capability.name).sort();
   assert.deepEqual(names, [
     'compare_performance',
+    'confirm_schedule_item_time',
+    'draft_next_task_outcome',
+    'draft_schedule_time',
+    'draft_task_outcome',
     'get_care_gap_detail',
     'get_care_gaps',
     'get_care_plan',
@@ -241,6 +245,7 @@ await test('Agent Core import registers the Phase B READ capability catalog', as
     'get_routine_preferences',
     'get_simulation',
     'get_today_tasks',
+    'set_task_outcome',
   ].sort());
 });
 
@@ -263,7 +268,7 @@ await test('capability registry rejects unknown tools and model-supplied userId'
   assert.equal(invalid.code, 'INVALID_CAPABILITY_ARGS');
 });
 
-await test('planner validation rejects more than three calls and non-READ future tools', async () => {
+await test('planner validation rejects more than three calls and non-executable future tools', async () => {
   const tooMany = validateAgentPlan({
     intent: 'too_many_reads',
     capabilityCalls: [
@@ -278,23 +283,23 @@ await test('planner validation rejects more than three calls and non-READ future
   assert.equal(tooMany.code, 'AGENT_TOO_MANY_CAPABILITY_CALLS');
 
   defineAgentCapability({
-    name: 'draft_future_change_for_test',
-    permissionClass: 'DRAFT',
-    description: 'A test-only future draft capability that must not execute in Phase B.',
+    name: 'sensitive_future_change_for_test',
+    permissionClass: 'SENSITIVE_ACTION',
+    description: 'A test-only sensitive capability that must not execute in a normal turn.',
     inputSchema: { properties: {}, required: [] },
     execute: () => {
-      throw new Error('DRAFT capability must not execute in Phase B');
+      throw new Error('Sensitive capability must not execute in a normal turn');
     },
     resultContract: '{ never: true }',
   });
   const futureTool = validateAgentPlan({
-    intent: 'try_future_draft',
-    capabilityCalls: [{ name: 'draft_future_change_for_test', args: {} }],
+    intent: 'try_future_sensitive_action',
+    capabilityCalls: [{ name: 'sensitive_future_change_for_test', args: {} }],
     navigationIntent: null,
   });
   assert.equal(futureTool.ok, false);
   assert.equal(futureTool.code, 'AGENT_PERMISSION_CLASS_NOT_EXECUTABLE');
-  assert.equal(futureTool.permissionClass, 'DRAFT');
+  assert.equal(futureTool.permissionClass, 'SENSITIVE_ACTION');
 });
 
 await test('planner/provider malformed output and unknown capability plans fail safely', async () => {
@@ -671,7 +676,7 @@ await test('GAP_NOT_FOUND short-circuits to fallback and skips reply generation'
     pool.calls.some((call) =>
       call.sql.startsWith('INSERT INTO agent_action_audit') &&
       call.params.includes('get_care_gap_detail') &&
-      call.params.includes('failed') &&
+      call.params.includes('rejected') &&
       call.params.includes(0) &&
       call.params.includes('GAP_NOT_FOUND')),
   );

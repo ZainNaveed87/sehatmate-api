@@ -1,5 +1,5 @@
 /**
- * Agent Safety Gateway (Phase B).
+ * Agent Safety Gateway (Phase D).
  *
  * The Safety Gateway is the FINAL authority on what the Phase B agent may
  * execute. Nothing reaches a backend service unless this module approves
@@ -7,13 +7,13 @@
  * immediately before every capability execution - not only at planning
  * time, so a planner defect can never bypass the class allowlist.
  *
- * Phase B executable permission classes (closed allowlist):
+ * Normal-turn executable permission classes (closed allowlist):
  *   READ        verified data reads via agent_capability_registry.js
  *   NAVIGATION  semantic screen intents via agent_navigation_registry.js
+ *   DRAFT       server-validated previews that perform zero mutation
  *
  * Rejected classes (fail closed with a stable error code):
- *   DRAFT, REVERSIBLE_USER_ACTION, SENSITIVE_ACTION,
- *   FORBIDDEN_CLINICAL_ACTION
+ *   REVERSIBLE_USER_ACTION, SENSITIVE_ACTION, FORBIDDEN_CLINICAL_ACTION
  *
  * Requests such as "change my dose", "take this medicine twice instead",
  * "move my verified exact 2 PM medicine to 5 PM", or "remove my
@@ -24,9 +24,9 @@
  * so even a hallucinated or injected tool request fails closed.
  *
  * Division of labor with the registry: agent_capability_registry.js may
- * hold definitions of ANY canonical permission class (Phase D will add
- * DRAFT tools without a rebuild); THIS module alone decides which classes
- * are executable in the current phase.
+ * hold definitions of ANY canonical permission class. THIS module alone
+ * decides which classes are executable in an ordinary turn, and which
+ * confirmed-only action can execute after server confirmation is proven.
  *
  * The denial is explainable, not silent: callers surface the stable
  * AGENT_PERMISSION_CLASS_NOT_EXECUTABLE code with the localized
@@ -47,7 +47,11 @@ import { resolveAgentCapability } from './agent_capability_registry.js';
  * this list is a deliberate phase decision (Phase D), never a runtime
  * configuration.
  */
-export const AGENT_EXECUTABLE_PERMISSION_CLASSES = Object.freeze(['READ', 'NAVIGATION']);
+export const AGENT_EXECUTABLE_PERMISSION_CLASSES = Object.freeze([
+  'READ',
+  'NAVIGATION',
+  'DRAFT',
+]);
 
 /**
  * Phase B hard bound on planned capability calls per user message
@@ -98,6 +102,33 @@ export function reviewAgentCapabilityCall({ name }) {
     return gatewayRejection('UNKNOWN_CAPABILITY', 'Unknown agent capability.');
   }
   if (!isExecutableAgentPermissionClass(capability.permissionClass)) {
+    return agentPermissionDeniedResult(capability.permissionClass);
+  }
+  return { ok: true, capability };
+}
+
+/**
+ * Review a confirmed action after the core has already proven an owned
+ * pending confirmation and exact confirmation-id match. This intentionally
+ * approves only REVERSIBLE_USER_ACTION and never broadens ordinary planning.
+ */
+export function reviewAgentConfirmedCapabilityCall({ name, pendingDraft }) {
+  const capability = resolveAgentCapability(name);
+  if (!capability) {
+    return gatewayRejection('UNKNOWN_CAPABILITY', 'Unknown agent capability.');
+  }
+  if (
+    !pendingDraft ||
+    typeof pendingDraft !== 'object' ||
+    pendingDraft.toolName !== name ||
+    !pendingDraft.confirmationId
+  ) {
+    return gatewayRejection(
+      'AGENT_CONFIRMATION_REQUIRED',
+      'A valid pending confirmation is required.',
+    );
+  }
+  if (capability.permissionClass !== 'REVERSIBLE_USER_ACTION') {
     return agentPermissionDeniedResult(capability.permissionClass);
   }
   return { ok: true, capability };

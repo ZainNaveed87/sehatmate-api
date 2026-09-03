@@ -32,7 +32,7 @@
  */
 
 import { normalizePreferredLanguage } from '../language_support.js';
-import { idPattern } from '../services/shared_utils.js';
+import { cleanText, idPattern } from '../services/shared_utils.js';
 import { agentConfig } from './agent_config.js';
 import {
   parseAgentSessionState,
@@ -110,6 +110,18 @@ const sessionNotFoundResult = () => ({
   code: 'AGENT_SESSION_NOT_FOUND',
   message: 'Agent session not found or expired.',
 });
+
+function cloneSessionWithState(row, state) {
+  return {
+    ...sessionForRow(row),
+    state,
+  };
+}
+
+async function rereadActiveSessionOrFallback(db, sessionId, userId, fallbackSession) {
+  const currentRow = await readActiveSessionRow(db, sessionId, userId);
+  return currentRow ? sessionForRow(currentRow) : fallbackSession;
+}
 
 /**
  * Create a new agent session for the authenticated user. The language is
@@ -197,9 +209,17 @@ export async function touchAgentSession({ db, userId, sessionId }) {
 
 /**
  * Replace the state of an active session owned by the authenticated user.
- * The state must pass the agent session state sanitizer first.
+ * The state must pass the agent session state sanitizer first. Callers that
+ * build state from a previously read session should pass expectedState so the
+ * write cannot resurrect or erase a concurrent pending action.
  */
-export async function updateAgentSessionState({ db, userId, sessionId, state }) {
+export async function updateAgentSessionState({
+  db,
+  userId,
+  sessionId,
+  state,
+  expectedState,
+}) {
   if (!idPattern.test(sessionId || '')) return invalidSessionIdResult();
 
   const sanitized = sanitizeAgentSessionState(state, {
@@ -213,11 +233,58 @@ export async function updateAgentSessionState({ db, userId, sessionId, state }) 
     };
   }
 
+  const hasExpectedState = expectedState !== undefined;
+  let expectedStateJson = null;
+  if (hasExpectedState) {
+    const expectedSanitized = sanitizeAgentSessionState(expectedState, {
+      maxStateBytes: agentConfig().sessionStateMaxBytes,
+    });
+    if (!expectedSanitized.ok) {
+      return {
+        ok: false,
+        code: expectedSanitized.code,
+        message: expectedSanitized.message,
+      };
+    }
+    expectedStateJson = serializeAgentSessionState(expectedSanitized.state);
+  }
+
+  const nextStateJson = serializeAgentSessionState(sanitized.state);
+  if (hasExpectedState) {
+    const [result] = await db.execute(
+      `UPDATE agent_sessions
+       SET state_json = ?, last_active_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP
+         AND BINARY state_json = BINARY ?`,
+      [nextStateJson, sessionId, userId, expectedStateJson],
+    );
+
+    if (!result.affectedRows) {
+      const currentRow = await readActiveSessionRow(db, sessionId, userId);
+      if (!currentRow) return sessionNotFoundResult();
+      return {
+        ok: false,
+        code: 'AGENT_SESSION_STATE_CONFLICT',
+        message: 'Agent session state changed concurrently.',
+        data: { session: sessionForRow(currentRow) },
+      };
+    }
+
+    const row = await readActiveSessionRow(db, sessionId, userId);
+    if (!row) return sessionNotFoundResult();
+
+    return {
+      ok: true,
+      message: 'Agent session state updated.',
+      data: { session: sessionForRow(row) },
+    };
+  }
+
   const [result] = await db.execute(
     `UPDATE agent_sessions
      SET state_json = ?, last_active_at = CURRENT_TIMESTAMP
      WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP`,
-    [serializeAgentSessionState(sanitized.state), sessionId, userId],
+    [nextStateJson, sessionId, userId],
   );
   if (!result.affectedRows) return sessionNotFoundResult();
 
@@ -298,5 +365,138 @@ export async function deleteExpiredAgentSessions({ db, maxRows = 500 }) {
     ok: true,
     message: 'Expired agent sessions deleted.',
     data: { deletedCount: Number(result.affectedRows || 0) },
+  };
+}
+
+/**
+ * Atomically consume one exact pending confirmation by comparing the stored
+ * state_json value and clearing pending action state before any mutation can
+ * execute. Concurrent requests racing on the same confirmation id can read
+ * the same state, but only one UPDATE can match the original state_json.
+ */
+export async function claimAgentPendingConfirmation({
+  db,
+  userId,
+  sessionId,
+  confirmationId,
+  now = Date.now(),
+}) {
+  if (!idPattern.test(sessionId || '')) return invalidSessionIdResult();
+  const canonicalConfirmationId = cleanText(confirmationId, 80);
+  if (!canonicalConfirmationId) {
+    return {
+      ok: false,
+      code: 'INVALID_AGENT_CONFIRMATION_REQUEST',
+      message: 'Invalid agent confirmation request.',
+    };
+  }
+
+  const row = await readActiveSessionRow(db, sessionId, userId);
+  if (!row) return sessionNotFoundResult();
+
+  const session = sessionForRow(row);
+  const pendingDraft = session.state.pendingDraft;
+  const pendingConfirmation = session.state.pendingConfirmation;
+  if (!pendingDraft || !pendingConfirmation) {
+    return {
+      ok: false,
+      code: 'AGENT_CONFIRMATION_NOT_FOUND',
+      message: 'Agent confirmation not found.',
+      data: { session },
+    };
+  }
+  if (
+    pendingDraft.confirmationId !== canonicalConfirmationId ||
+    pendingConfirmation.confirmationId !== canonicalConfirmationId
+  ) {
+    return {
+      ok: false,
+      code: 'AGENT_CONFIRMATION_MISMATCH',
+      message: 'Agent confirmation is no longer current.',
+      data: { session },
+    };
+  }
+
+  const expiresAt = Date.parse(pendingDraft.expiresAt || pendingConfirmation.expiresAt || '');
+  const consumedState = {
+    ...session.state,
+    pendingConfirmation: null,
+    pendingDraft: null,
+  };
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    const [result] = await db.execute(
+      `UPDATE agent_sessions
+       SET state_json = ?, last_active_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP
+         AND state_json = ?`,
+      [
+        serializeAgentSessionState(consumedState),
+        sessionId,
+        userId,
+        row.state_json,
+      ],
+    );
+    if (!result.affectedRows) {
+      return {
+        ok: false,
+        code: 'AGENT_CONFIRMATION_ALREADY_CLAIMED',
+        message: 'Agent confirmation was already handled.',
+        data: {
+          session: await rereadActiveSessionOrFallback(db, sessionId, userId, session),
+        },
+      };
+    }
+    return {
+      ok: false,
+      code: 'AGENT_CONFIRMATION_EXPIRED',
+      message: 'Agent confirmation expired.',
+      data: { session: cloneSessionWithState(row, consumedState) },
+    };
+  }
+
+  const sanitized = sanitizeAgentSessionState(consumedState, {
+    maxStateBytes: agentConfig().sessionStateMaxBytes,
+  });
+  if (!sanitized.ok) {
+    return {
+      ok: false,
+      code: sanitized.code,
+      message: sanitized.message,
+      data: { session },
+    };
+  }
+
+  const [result] = await db.execute(
+    `UPDATE agent_sessions
+     SET state_json = ?, last_active_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP
+       AND state_json = ?`,
+    [
+      serializeAgentSessionState(sanitized.state),
+      sessionId,
+      userId,
+      row.state_json,
+    ],
+  );
+
+  if (!result.affectedRows) {
+    return {
+      ok: false,
+      code: 'AGENT_CONFIRMATION_ALREADY_CLAIMED',
+      message: 'Agent confirmation was already handled.',
+      data: {
+        session: await rereadActiveSessionOrFallback(db, sessionId, userId, session),
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    message: 'Agent confirmation claimed.',
+    data: {
+      session: cloneSessionWithState(row, sanitized.state),
+      pendingDraft,
+      pendingConfirmation,
+    },
   };
 }

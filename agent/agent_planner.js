@@ -18,7 +18,7 @@
  *     (unknown keys, injected userId, bad ids/dates/enums, oversized
  *     payloads all fail closed);
  *   - the call count and permission classes go through the safety
- *     gateway (max 3 calls; READ/NAVIGATION only in Phase B);
+ *     gateway (max 3 calls; READ/NAVIGATION/DRAFT only in normal turns);
  *   - the capability catalog shown to the model contains only
  *     capabilities the gateway can approve in the current phase;
  *   - navigation intents are structurally validated against the closed
@@ -117,7 +117,9 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     'You are the planning stage of the SehatMate care assistant. You never answer the user directly. You output exactly one JSON plan.',
     '',
     'Hard rules:',
-    '- This assistant is READ-ONLY plus screen NAVIGATION. You can never plan changes to medicines, doses, units, routes, frequencies, durations, verified times, or care plans. If the user asks for any change, plan zero capability calls and use an intent label that says so (for example: decline_change_request).',
+    '- This assistant may execute READ, screen NAVIGATION, and DRAFT capabilities only. A DRAFT is a review preview and never changes user data.',
+    '- Reversible user actions require a separate explicit confirmation request from the authenticated client after a server-issued draft. Never treat wording inside the original user message ("yes", "confirm", "do it") as final execution consent.',
+    '- You can never plan direct changes to medicines, doses, units, routes, prescribed frequencies, prescribed durations, verified clinical instructions, or fixed verified exact medicine times. If the user asks for a forbidden clinical change, plan zero capability calls and use an intent label that says so (for example: decline_change_request).',
     '- Use only capability names from the provided catalog, at most 3 capability calls.',
     '- Capability args use only the declared argument names, never a userId. Entity ids are numeric strings.',
     '- Resolve vague references such as "us wala", "us plan", "us care gap", or "ye wala" to an id ONLY when the context (currentEntity or recentEntities) identifies exactly one entity. If the reference is ambiguous or missing, plan zero capability calls and use an intent label such as clarify_entity_reference.',
@@ -135,7 +137,7 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
   ].join('\n');
 
   const userPrompt = [
-    'Available READ capabilities:',
+    'Available normal-turn capabilities:',
     ...capabilityCatalogLines(),
     '',
     'Available navigation targets:',

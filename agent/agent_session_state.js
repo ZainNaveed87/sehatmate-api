@@ -6,7 +6,7 @@
  *   {
  *     version: 1,
  *     lastReferencedEntities: [{ type, id }],  // small canonical references
- *     pendingConfirmation: { kind, message } | null,
+ *     pendingConfirmation: { confirmationId, kind, message, expiresAt } | null,
  *     pendingDraft: { [key]: string } | null,   // shallow, string-only draft
  *     lastActionSummary: string | null
  *   }
@@ -40,8 +40,10 @@ export const AGENT_STATE_LIMITS = Object.freeze({
   entityTypeMaxLength: 40,
   entityIdMaxLength: 64,
   confirmationKindMaxLength: 40,
+  confirmationIdMaxLength: 80,
+  confirmationExpiresAtMaxLength: 40,
   confirmationMessageMaxLength: 500,
-  draftMaxEntries: 8,
+  draftMaxEntries: 12,
   draftKeyMaxLength: 40,
   draftValueMaxLength: 200,
   summaryMaxLength: 500,
@@ -73,10 +75,18 @@ function sanitizeReferencedEntities(value) {
 function sanitizePendingConfirmation(value) {
   if (value == null) return null;
   if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const confirmationId = cleanText(
+    value.confirmationId,
+    AGENT_STATE_LIMITS.confirmationIdMaxLength,
+  );
   const kind = cleanText(value.kind, AGENT_STATE_LIMITS.confirmationKindMaxLength);
   const message = cleanText(value.message, AGENT_STATE_LIMITS.confirmationMessageMaxLength);
-  if (!kind && !message) return null;
-  return { kind, message };
+  const expiresAt = cleanText(
+    value.expiresAt,
+    AGENT_STATE_LIMITS.confirmationExpiresAtMaxLength,
+  );
+  if (!confirmationId || !kind || !message || !expiresAt) return null;
+  return { confirmationId, kind, message, expiresAt };
 }
 
 function sanitizePendingDraft(value) {

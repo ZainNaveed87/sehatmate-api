@@ -1577,6 +1577,7 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
       sessionId: req.body?.sessionId ?? null,
       message: req.body?.message,
       clientContext: req.body?.screenContext ?? req.body?.clientContext ?? null,
+      confirmation: req.body?.confirmation ?? null,
     });
 
     if (!result.ok) {
@@ -1595,6 +1596,8 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
         language: result.language,
         reply: result.reply,
         navigation: result.navigation,
+        confirmation: result.confirmation,
+        actionStatus: result.actionStatus,
         referencedEntities: result.referencedEntities,
         ...(result.fallbackCode ? { fallbackCode: result.fallbackCode } : {}),
       },
