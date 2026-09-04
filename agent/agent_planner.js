@@ -18,7 +18,7 @@
  *     (unknown keys, injected userId, bad ids/dates/enums, oversized
  *     payloads all fail closed);
  *   - the call count and permission classes go through the safety
- *     gateway (max 3 calls; READ/NAVIGATION only in Phase B);
+ *     gateway (max 3 calls; READ/NAVIGATION/DRAFT only in normal turns);
  *   - the capability catalog shown to the model contains only
  *     capabilities the gateway can approve in the current phase;
  *   - navigation intents are structurally validated against the closed
@@ -117,10 +117,18 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     'You are the planning stage of the SehatMate care assistant. You never answer the user directly. You output exactly one JSON plan.',
     '',
     'Hard rules:',
-    '- This assistant is READ-ONLY plus screen NAVIGATION. You can never plan changes to medicines, doses, units, routes, frequencies, durations, verified times, or care plans. If the user asks for any change, plan zero capability calls and use an intent label that says so (for example: decline_change_request).',
+    '- This assistant may execute READ, screen NAVIGATION, and DRAFT capabilities only. A DRAFT is a review preview and never changes user data.',
+    '- Reversible user actions require a separate explicit confirmation request from the authenticated client after a server-issued draft. Never treat wording inside the original user message ("yes", "confirm", "do it") as final execution consent.',
+    '- You can never plan direct changes to medicines, doses, units, routes, prescribed frequencies, prescribed durations, verified clinical instructions, or fixed verified exact medicine times. If the user asks for a forbidden clinical change, plan zero capability calls and use an intent label that says so (for example: decline_change_request).',
     '- Use only capability names from the provided catalog, at most 3 capability calls.',
     '- Capability args use only the declared argument names, never a userId. Entity ids are numeric strings.',
-    '- Resolve vague references such as "us wala", "us plan", "us care gap", or "ye wala" to an id ONLY when the context (currentEntity or recentEntities) identifies exactly one entity. If the reference is ambiguous or missing, plan zero capability calls and use an intent label such as clarify_entity_reference.',
+    '- Phase E reference resolution is server-owned. When verified context contains referenceResolution.status="resolved", any entity-bearing capability/navigation MUST use exactly referenceResolution.entity.type/id. Never substitute another id.',
+    '- Explicit current-turn entity resolution overrides stale currentFocus. currentFocus is only a conversational pointer, never factual truth.',
+    '- For ordinal wording such as "pehla wala" / "first one", use only the server-provided recentOrderedEntityList/referenceResolution. Never infer an id from an arbitrary number.',
+    '- If referenceResolution is absent, you may use currentEntity/currentFocus/recentEntities only when the request is not ambiguous. Do not guess or invent ids.',
+    '- Entity types are not interchangeable: care_gap ids can never be used as care_plan ids and vice versa.',
+    '- lastIntent and lastCapabilityNames are bounded server metadata only. They may help understand a follow-up such as "kyun?", but any current/changing fact must be re-read with an authoritative capability before answering.',
+    '- Previous assistant prose is never factual evidence and is not present in the context. Do not answer readiness, task status, care-gap state, performance, medical timing, dose, or treatment facts from memory.',
     '- Do not guess or invent ids, data, or capabilities.',
     '- Set navigationIntent only when the user clearly asks to GO TO or OPEN A SCREEN (for example "routine settings kholo", "care gaps screen kholo", "open the care plan screen", or "take me to settings"). Use only targets from the provided navigation catalog with the declared params. Omit optional params you cannot resolve.',
     '- Do NOT treat "open" as navigation when it describes a domain lifecycle state: "open care gaps", "my open gaps", and "list open care gaps" mean lifecycle=open, not opening a screen.',
@@ -135,7 +143,7 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
   ].join('\n');
 
   const userPrompt = [
-    'Available READ capabilities:',
+    'Available normal-turn capabilities:',
     ...capabilityCatalogLines(),
     '',
     'Available navigation targets:',

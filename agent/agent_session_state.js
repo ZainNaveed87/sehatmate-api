@@ -6,7 +6,14 @@
  *   {
  *     version: 1,
  *     lastReferencedEntities: [{ type, id }],  // small canonical references
- *     pendingConfirmation: { kind, message } | null,
+ *     currentFocus: { type, id } | null,        // verified entity pointer
+ *     recentOrderedEntityList: {                // immediate ordinal context
+ *       kind,
+ *       entities: [{ type, id }]
+ *     } | null,
+ *     lastIntent: string | null,                // server-normalized only
+ *     lastCapabilityNames: [string],            // server-known tool names
+ *     pendingConfirmation: { confirmationId, kind, message, expiresAt } | null,
  *     pendingDraft: { [key]: string } | null,   // shallow, string-only draft
  *     lastActionSummary: string | null
  *   }
@@ -31,17 +38,26 @@
  * callers (agent_session_store.js) can map failures to stable error codes.
  */
 
-import { cleanText } from '../services/shared_utils.js';
+import { cleanText, idPattern } from '../services/shared_utils.js';
 
 export const AGENT_SESSION_STATE_VERSION = 1;
+const CONVERSATION_ENTITY_TYPES = new Set(['care_plan', 'care_gap']);
+const MEMORY_LABEL_PATTERN = /^[a-z][a-z0-9_]*$/;
 
 export const AGENT_STATE_LIMITS = Object.freeze({
   maxReferencedEntities: 20,
+  maxOrderedEntities: 10,
+  maxCapabilityNames: 5,
   entityTypeMaxLength: 40,
   entityIdMaxLength: 64,
+  orderedListKindMaxLength: 40,
+  intentMaxLength: 80,
+  capabilityNameMaxLength: 60,
   confirmationKindMaxLength: 40,
+  confirmationIdMaxLength: 80,
+  confirmationExpiresAtMaxLength: 40,
   confirmationMessageMaxLength: 500,
-  draftMaxEntries: 8,
+  draftMaxEntries: 12,
   draftKeyMaxLength: 40,
   draftValueMaxLength: 200,
   summaryMaxLength: 500,
@@ -51,10 +67,25 @@ export function emptyAgentSessionState() {
   return {
     version: AGENT_SESSION_STATE_VERSION,
     lastReferencedEntities: [],
+    currentFocus: null,
+    recentOrderedEntityList: null,
+    lastIntent: null,
+    lastCapabilityNames: [],
     pendingConfirmation: null,
     pendingDraft: null,
     lastActionSummary: null,
   };
+}
+
+function sanitizeEntityReference(value) {
+  if (value == null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const type = cleanText(value.type, AGENT_STATE_LIMITS.entityTypeMaxLength);
+  const id = cleanText(value.id, AGENT_STATE_LIMITS.entityIdMaxLength);
+  if (!type || !CONVERSATION_ENTITY_TYPES.has(type) || !id || !idPattern.test(id)) {
+    return null;
+  }
+  return { type, id };
 }
 
 function sanitizeReferencedEntities(value) {
@@ -70,13 +101,47 @@ function sanitizeReferencedEntities(value) {
   return entities;
 }
 
+function sanitizeOrderedEntityList(value) {
+  if (value == null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const kind = cleanText(value.kind, AGENT_STATE_LIMITS.orderedListKindMaxLength);
+  if (!kind || !CONVERSATION_ENTITY_TYPES.has(kind) || !Array.isArray(value.entities)) {
+    return null;
+  }
+  const entities = [];
+  for (const entry of value.entities.slice(0, AGENT_STATE_LIMITS.maxOrderedEntities)) {
+    const entity = sanitizeEntityReference(entry);
+    if (entity) entities.push(entity);
+  }
+  return entities.length ? { kind, entities } : null;
+}
+
+function sanitizeCapabilityNames(value) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) return null;
+  const names = [];
+  for (const rawName of value.slice(0, AGENT_STATE_LIMITS.maxCapabilityNames)) {
+    const name = cleanText(rawName, AGENT_STATE_LIMITS.capabilityNameMaxLength);
+    if (name && MEMORY_LABEL_PATTERN.test(name)) names.push(name);
+  }
+  return names;
+}
+
 function sanitizePendingConfirmation(value) {
   if (value == null) return null;
   if (typeof value !== 'object' || Array.isArray(value)) return null;
+  const confirmationId = cleanText(
+    value.confirmationId,
+    AGENT_STATE_LIMITS.confirmationIdMaxLength,
+  );
   const kind = cleanText(value.kind, AGENT_STATE_LIMITS.confirmationKindMaxLength);
   const message = cleanText(value.message, AGENT_STATE_LIMITS.confirmationMessageMaxLength);
-  if (!kind && !message) return null;
-  return { kind, message };
+  const expiresAt = cleanText(
+    value.expiresAt,
+    AGENT_STATE_LIMITS.confirmationExpiresAtMaxLength,
+  );
+  if (!confirmationId || !kind || !message || !expiresAt) return null;
+  return { confirmationId, kind, message, expiresAt };
 }
 
 function sanitizePendingDraft(value) {
@@ -137,9 +202,25 @@ export function sanitizeAgentSessionState(input, { maxStateBytes = 16384 } = {})
     };
   }
 
+  const capabilityNames = sanitizeCapabilityNames(input.lastCapabilityNames);
+  if (capabilityNames === null) {
+    return {
+      ok: false,
+      code: 'INVALID_AGENT_STATE',
+      message: 'lastCapabilityNames must be a bounded list of strings.',
+    };
+  }
+
   const state = {
     version: AGENT_SESSION_STATE_VERSION,
     lastReferencedEntities: entities,
+    currentFocus: sanitizeEntityReference(input.currentFocus),
+    recentOrderedEntityList: sanitizeOrderedEntityList(input.recentOrderedEntityList),
+    lastIntent: (() => {
+      const value = cleanText(input.lastIntent, AGENT_STATE_LIMITS.intentMaxLength);
+      return value && MEMORY_LABEL_PATTERN.test(value) ? value : null;
+    })(),
+    lastCapabilityNames: capabilityNames,
     pendingConfirmation: sanitizePendingConfirmation(input.pendingConfirmation),
     pendingDraft: sanitizePendingDraft(input.pendingDraft),
     lastActionSummary: cleanText(input.lastActionSummary, AGENT_STATE_LIMITS.summaryMaxLength) || null,

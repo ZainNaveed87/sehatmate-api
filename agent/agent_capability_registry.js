@@ -340,6 +340,23 @@ export function validateAgentCapabilityInput(capability, rawArgs) {
  * capabilities return UNKNOWN_CAPABILITY without any database access.
  * Thrown service errors propagate to the caller (agent_core).
  */
+function permissionDeniedExecution(capability) {
+  return {
+    ok: false,
+    code: 'AGENT_PERMISSION_CLASS_NOT_EXECUTABLE',
+    message: 'The SehatMate assistant cannot perform that change.',
+    permissionClass: capability.permissionClass,
+  };
+}
+
+async function executeRegisteredCapability({ capability, pool, userId, args }) {
+  const validated = validateAgentCapabilityInput(capability, args);
+  if (!validated.ok) {
+    return validated;
+  }
+  return capability.execute({ pool, userId, args: validated.args });
+}
+
 export async function executeAgentCapability({ name, pool, userId, args }) {
   const capability = resolveAgentCapability(name);
   if (!capability) {
@@ -349,9 +366,27 @@ export async function executeAgentCapability({ name, pool, userId, args }) {
       message: 'Unknown agent capability.',
     };
   }
-  const validated = validateAgentCapabilityInput(capability, args);
-  if (!validated.ok) {
-    return validated;
+  if (
+    capability.permissionClass === 'SENSITIVE_ACTION' ||
+    capability.permissionClass === 'FORBIDDEN_CLINICAL_ACTION' ||
+    capability.permissionClass === 'REVERSIBLE_USER_ACTION'
+  ) {
+    return permissionDeniedExecution(capability);
   }
-  return capability.execute({ pool, userId, args: validated.args });
+  return executeRegisteredCapability({ capability, pool, userId, args });
+}
+
+export async function executeConfirmedAgentCapability({ name, pool, userId, args }) {
+  const capability = resolveAgentCapability(name);
+  if (!capability) {
+    return {
+      ok: false,
+      code: 'UNKNOWN_CAPABILITY',
+      message: 'Unknown agent capability.',
+    };
+  }
+  if (capability.permissionClass !== 'REVERSIBLE_USER_ACTION') {
+    return permissionDeniedExecution(capability);
+  }
+  return executeRegisteredCapability({ capability, pool, userId, args });
 }

@@ -56,12 +56,28 @@
  * fails safely instead of erroring out.
  */
 
+import { randomUUID } from 'crypto';
 import { agentConfig } from './agent_config.js';
 import './agent_read_tools.js';
+import './agent_draft_tools.js';
 import {
   buildAgentContextSlice,
+  readAgentConversationStateContext,
   readAgentScreenContext,
 } from './agent_context_engine.js';
+import {
+  deriveServerCapabilityNames,
+  deriveServerNormalizedIntent,
+  deriveVerifiedCurrentFocus,
+  deriveVerifiedOrderedEntityList,
+} from './agent_conversation_state.js';
+import {
+  classifyBareConfirmationDecision,
+  localizedReferenceClarification,
+  referenceResolutionContext,
+  resolveAgentConversationReference,
+  reviewPlanAgainstResolvedReference,
+} from './agent_reference_resolver.js';
 import { authorizeAgentNavigationIntent } from './agent_navigation_registry.js';
 import {
   AGENT_PLANNER_LIMITS,
@@ -69,11 +85,13 @@ import {
 } from './agent_planner.js';
 import { defaultAgentProvider } from './agent_provider.js';
 import {
+  executeConfirmedAgentCapability,
   executeAgentCapability,
   resolveAgentCapability,
 } from './agent_capability_registry.js';
 import {
   reviewAgentCapabilityCall,
+  reviewAgentConfirmedCapabilityCall,
   reviewAgentNavigationPermission,
 } from './agent_safety_gateway.js';
 import {
@@ -82,6 +100,7 @@ import {
 } from './agent_response_grounder.js';
 import {
   canonicalAgentLanguage,
+  claimAgentPendingConfirmation,
   createAgentSession,
   readAgentSession,
   touchAgentSession,
@@ -175,6 +194,169 @@ function navigationReadyText(target, canonicalLanguage) {
   return `Use Open below to open ${label}.`;
 }
 
+function confirmationText(key, canonicalLanguage) {
+  const language = canonicalAgentLanguage(canonicalLanguage);
+  const text = {
+    draftReady: {
+      en: 'I prepared this change for your review. Nothing has been changed yet.',
+      ur: 'میں نے یہ تبدیلی آپ کے جائزے کے لیے تیار کر دی ہے۔ ابھی کچھ تبدیل نہیں ہوا۔',
+      roman_ur: 'Main ne yeh tabdeeli aap ke review ke liye tayyar kar di hai. Abhi kuch change nahi hua.',
+    },
+    alreadyAwaiting: {
+      en: 'Please confirm or cancel the current pending action before creating another change.',
+      ur: 'نئی تبدیلی بنانے سے پہلے موجودہ زیر التوا عمل کو confirm یا cancel کریں۔',
+      roman_ur: 'Nayi tabdeeli banane se pehle current pending action ko confirm ya cancel karein.',
+    },
+    cancelled: {
+      en: 'Cancelled. No change was made.',
+      ur: 'منسوخ کر دیا گیا۔ کوئی تبدیلی نہیں ہوئی۔',
+      roman_ur: 'Cancel kar diya gaya. Koi change nahi hua.',
+    },
+    expired: {
+      en: 'That confirmation expired. No change was made. Please ask me to prepare it again.',
+      ur: 'یہ confirmation expire ہو گئی۔ کوئی تبدیلی نہیں ہوئی۔ براہ کرم دوبارہ draft بنانے کو کہیں۔',
+      roman_ur: 'Yeh confirmation expire ho gayi. Koi change nahi hua. Dobara draft banane ko kahe dein.',
+    },
+    noPending: {
+      en: 'There is no pending action to confirm. No change was made.',
+      ur: 'Confirm کرنے کے لیے کوئی زیر التوا عمل نہیں ہے۔ کوئی تبدیلی نہیں ہوئی۔',
+      roman_ur: 'Confirm karne ke liye koi pending action nahi hai. Koi change nahi hua.',
+    },
+    mismatch: {
+      en: 'That confirmation is no longer current. No change was made.',
+      ur: 'یہ confirmation اب current نہیں ہے۔ کوئی تبدیلی نہیں ہوئی۔',
+      roman_ur: 'Yeh confirmation ab current nahi hai. Koi change nahi hua.',
+    },
+    confirmed: {
+      en: 'Confirmed. The change was saved.',
+      ur: 'Confirm ہو گیا۔ تبدیلی محفوظ کر دی گئی۔',
+      roman_ur: 'Confirm ho gaya. Tabdeeli save ho gayi.',
+    },
+    rejected: {
+      en: 'That change was not saved because server safety checks rejected it.',
+      ur: 'یہ تبدیلی محفوظ نہیں ہوئی کیونکہ server safety checks نے اسے reject کر دیا۔',
+      roman_ur: 'Yeh tabdeeli save nahi hui kyun ke server safety checks ne ise reject kar diya.',
+    },
+  }[key];
+  return text?.[language] || text?.en || '';
+}
+
+function hasActivePendingDraft(state, now = Date.now()) {
+  const draft = state?.pendingDraft;
+  const confirmation = state?.pendingConfirmation;
+  if (!draft || !confirmation) return false;
+  const expiresAt = Date.parse(draft.expiresAt || confirmation.expiresAt || '');
+  return Number.isFinite(expiresAt) && expiresAt > now;
+}
+
+function responseConfirmationFromDraft(draft) {
+  if (!draft || !DRAFT_KINDS.has(draft.kind)) return null;
+  return {
+    confirmationId: draft.confirmationId,
+    kind: draft.kind,
+    message: draft.message,
+    expiresAt: draft.expiresAt,
+  };
+}
+
+function createPendingDraft(draftData) {
+  if (!draftData || typeof draftData !== 'object' || Array.isArray(draftData)) {
+    return null;
+  }
+  const toolName = cleanText(draftData.toolName, 60);
+  const kind = cleanText(draftData.kind, 40);
+  const message = cleanText(draftData.message, 500);
+  if (!toolName || !DRAFT_KINDS.has(kind) || !message) return null;
+  const confirmationId = randomUUID();
+  const expiresAt = new Date(Date.now() + CONFIRMATION_TTL_MS).toISOString();
+  const base = {
+    confirmationId,
+    toolName,
+    kind,
+    message,
+    expiresAt,
+  };
+  if (kind === 'task_outcome') {
+    if (
+      !idPattern.test(String(draftData.occurrenceId || '')) ||
+      !['completed', 'skipped'].includes(draftData.outcome) ||
+      !['pending', 'completed', 'skipped', 'missed'].includes(draftData.baseStatus)
+    ) {
+      return null;
+    }
+    return {
+      ...base,
+      occurrenceId: String(draftData.occurrenceId),
+      outcome: draftData.outcome,
+      note: cleanText(draftData.note, 200) || '',
+      baseStatus: draftData.baseStatus,
+      targetLabel: cleanText(draftData.targetLabel, 120) || 'Care task',
+    };
+  }
+  if (
+    kind === 'schedule_time' &&
+    idPattern.test(String(draftData.itemId || '')) &&
+    /^([01]\d|2[0-3]):[0-5]\d$/.test(draftData.scheduleTime || '')
+  ) {
+    return {
+      ...base,
+      itemId: String(draftData.itemId),
+      displayTime: cleanText(draftData.displayTime, 80) || `Reminder at ${draftData.scheduleTime}`,
+      scheduleTime: draftData.scheduleTime,
+      learningSource: 'ai_suggestion_accept',
+      targetLabel: cleanText(draftData.targetLabel, 120) || 'Reminder',
+    };
+  }
+  return null;
+}
+
+function confirmationRequestFromInput(input) {
+  if (input == null) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, code: 'INVALID_AGENT_CONFIRMATION_REQUEST' };
+  }
+  const keys = Object.keys(input);
+  if (
+    keys.length !== 2 ||
+    !keys.includes('confirmationId') ||
+    !keys.includes('decision')
+  ) {
+    return { ok: false, code: 'INVALID_AGENT_CONFIRMATION_REQUEST' };
+  }
+  const confirmationId = cleanText(input.confirmationId, 80);
+  const decision = cleanText(input.decision, 20);
+  if (!confirmationId || !CONFIRMATION_DECISIONS.has(decision)) {
+    return { ok: false, code: 'INVALID_AGENT_CONFIRMATION_REQUEST' };
+  }
+  return { ok: true, confirmationId, decision };
+}
+
+function actionArgsFromPendingDraft(draft) {
+  if (draft?.kind === 'task_outcome') {
+    const args = {
+      occurrenceId: draft.occurrenceId,
+      outcome: draft.outcome,
+      baseStatus: draft.baseStatus,
+      operationKey: `agent-confirmation:${draft.confirmationId}`,
+    };
+    if (draft.note) args.note = draft.note;
+    return args;
+  }
+  if (draft?.kind === 'schedule_time') {
+    return {
+      itemId: draft.itemId,
+      scheduleTime: draft.scheduleTime,
+      learningSource: 'ai_suggestion_accept',
+    };
+  }
+  return null;
+}
+
+function capabilityAuditStatus(result) {
+  if (result?.ok) return 'succeeded';
+  return result?.unexpectedFailure ? 'failed' : 'rejected';
+}
+
 /**
  * Intent labels the planner produces for refused change requests (for
  * example decline_change_request). The label only routes the reply to the
@@ -190,6 +372,10 @@ const ENTITY_TITLE_MAX_LENGTH = 200;
 /** Server-side language authority: the stored patient profile language. */
 const PROFILE_LANGUAGE_SQL =
   'SELECT preferred_language FROM patient_profiles WHERE user_id = ? LIMIT 1';
+
+const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+const CONFIRMATION_DECISIONS = new Set(['confirm', 'cancel']);
+const DRAFT_KINDS = new Set(['task_outcome', 'schedule_time']);
 
 async function readProfileLanguage(pool, userId) {
   const [rows] = await pool.execute(PROFILE_LANGUAGE_SQL, [userId]);
@@ -274,9 +460,13 @@ function buildNextSessionState({
   sessionState,
   intent,
   capabilityCalls,
+  successfulCapabilityCalls = [],
+  capabilityResults = [],
   navigation,
   navigationEntity,
   screenEntity,
+  pendingConfirmation,
+  pendingDraft,
 }) {
   const previous = Array.isArray(sessionState?.lastReferencedEntities)
     ? sessionState.lastReferencedEntities
@@ -311,10 +501,44 @@ function buildNextSessionState({
     AGENT_STATE_LIMITS.summaryMaxLength,
   );
 
+  const verifiedFocus = deriveVerifiedCurrentFocus({
+    successfulCapabilityCalls,
+    navigationEntity,
+  });
+  const verifiedOrderedList = deriveVerifiedOrderedEntityList(capabilityResults);
+  const hasVerifiedOperation = successfulCapabilityCalls.length > 0 || Boolean(navigation);
+  const normalizedIntent = deriveServerNormalizedIntent({
+    successfulCapabilityCalls,
+    navigation,
+  });
+  const capabilityNames = deriveServerCapabilityNames(successfulCapabilityCalls);
+
   return {
     lastReferencedEntities,
-    pendingConfirmation: sessionState?.pendingConfirmation ?? null,
-    pendingDraft: sessionState?.pendingDraft ?? null,
+    currentFocus:
+      verifiedFocus === undefined
+        ? sessionState?.currentFocus ?? null
+        : verifiedFocus,
+    recentOrderedEntityList:
+      verifiedOrderedList !== undefined
+        ? verifiedOrderedList
+        : hasVerifiedOperation
+          ? null
+          : sessionState?.recentOrderedEntityList ?? null,
+    lastIntent:
+      hasVerifiedOperation
+        ? normalizedIntent
+        : sessionState?.lastIntent ?? null,
+    lastCapabilityNames:
+      hasVerifiedOperation
+        ? capabilityNames
+        : sessionState?.lastCapabilityNames ?? [],
+    pendingConfirmation:
+      pendingConfirmation === undefined
+        ? sessionState?.pendingConfirmation ?? null
+        : pendingConfirmation,
+    pendingDraft:
+      pendingDraft === undefined ? sessionState?.pendingDraft ?? null : pendingDraft,
     lastActionSummary: summary || null,
   };
 }
@@ -363,28 +587,66 @@ async function finishAgentTurn({
   fallbackCode,
   intent,
   capabilityCalls,
+  successfulCapabilityCalls = [],
+  capabilityResults = [],
   navigation,
   navigationEntity,
   screenEntity,
+  pendingConfirmation,
+  pendingDraft,
+  confirmation = null,
+  actionStatus = null,
 }) {
   const nextState = buildNextSessionState({
     sessionState: session.state,
     intent,
     capabilityCalls,
+    successfulCapabilityCalls,
+    capabilityResults,
     navigation,
     navigationEntity,
     screenEntity,
+    pendingConfirmation,
+    pendingDraft,
   });
 
+  let stateUpdate = null;
   try {
-    await updateAgentSessionState({
+    stateUpdate = await updateAgentSessionState({
       db: pool,
       userId,
       sessionId: session.id,
       state: nextState,
+      expectedState: session.state,
     });
   } catch {
     // intentionally ignored - see docblock
+  }
+
+  if (actionStatus === 'awaiting_confirmation' && confirmation && stateUpdate?.ok !== true) {
+    const currentSession = stateUpdate?.data?.session || session;
+    const currentConfirmation = hasActivePendingDraft(currentSession.state)
+      ? responseConfirmationFromDraft(currentSession.state?.pendingDraft)
+      : null;
+    return {
+      ok: true,
+      sessionId: session.id,
+      language: session.language,
+      reply: currentConfirmation
+        ? confirmationText('alreadyAwaiting', session.language)
+        : localizedAgentText('agentUnavailable', session.language),
+      navigation: null,
+      confirmation: currentConfirmation,
+      actionStatus: currentConfirmation ? 'awaiting_confirmation' : 'rejected',
+      referencedEntities: buildReferencedEntities({
+        screenEntity,
+        navigationEntity,
+        capabilityCalls,
+      }),
+      fallbackCode: currentConfirmation
+        ? 'AGENT_CONFIRMATION_ALREADY_PENDING'
+        : stateUpdate?.code || 'AGENT_SESSION_STATE_CONFLICT',
+    };
   }
 
   return {
@@ -393,6 +655,8 @@ async function finishAgentTurn({
     language: session.language,
     reply,
     navigation,
+    confirmation,
+    actionStatus,
     referencedEntities: buildReferencedEntities({
       screenEntity,
       navigationEntity,
@@ -400,6 +664,192 @@ async function finishAgentTurn({
     }),
     ...(fallbackCode ? { fallbackCode } : {}),
   };
+}
+
+function finishAgentConfirmationTurn({
+  session,
+  reply,
+  fallbackCode,
+  confirmation = null,
+  actionStatus = null,
+}) {
+  return {
+    ok: true,
+    sessionId: session.id,
+    language: session.language,
+    reply,
+    navigation: null,
+    confirmation,
+    actionStatus,
+    referencedEntities: [],
+    ...(fallbackCode ? { fallbackCode } : {}),
+  };
+}
+
+async function handleAgentConfirmation({
+  pool,
+  userId,
+  session,
+  confirmationRequest,
+  screenEntity = null,
+}) {
+  const deniedTurn = async ({
+    finishSession = session,
+    key,
+    fallbackCode,
+    errorCode,
+    actionStatus = 'rejected',
+    pendingDraft = null,
+    clear = false,
+  }) => {
+    const toolName = pendingDraft?.toolName || 'agent_confirmation';
+    const permissionClass =
+      resolveAgentCapability(toolName)?.permissionClass || 'REVERSIBLE_USER_ACTION';
+    await auditBestEffort({
+      db: pool,
+      userId,
+      sessionId: session.id,
+      toolName,
+      permissionClass,
+      input: pendingDraft
+        ? {
+            confirmationId: pendingDraft.confirmationId,
+            kind: pendingDraft.kind,
+            decision: confirmationRequest.decision,
+          }
+        : null,
+      resultStatus: 'rejected',
+      backendConfirmed: false,
+      errorCode,
+    });
+    return finishAgentConfirmationTurn({
+      session: finishSession,
+      reply: confirmationText(key, finishSession.language),
+      fallbackCode,
+      confirmation: clear ? null : responseConfirmationFromDraft(pendingDraft),
+      actionStatus,
+    });
+  };
+
+  if (!confirmationRequest?.ok) {
+    return deniedTurn({
+      key: 'noPending',
+      fallbackCode: confirmationRequest?.code || 'INVALID_AGENT_CONFIRMATION_REQUEST',
+      errorCode: confirmationRequest?.code || 'INVALID_AGENT_CONFIRMATION_REQUEST',
+    });
+  }
+
+  const claimed = await claimAgentPendingConfirmation({
+    db: pool,
+    userId,
+    sessionId: session.id,
+    confirmationId: confirmationRequest.confirmationId,
+  });
+  if (!claimed.ok) {
+    const finishSession = claimed.data?.session || session;
+    const code = claimed.code || 'AGENT_CONFIRMATION_NOT_FOUND';
+    const key =
+      code === 'AGENT_CONFIRMATION_EXPIRED'
+        ? 'expired'
+        : code === 'AGENT_CONFIRMATION_MISMATCH'
+          ? 'mismatch'
+          : 'noPending';
+    return deniedTurn({
+      finishSession,
+      key,
+      fallbackCode: code,
+      errorCode: code,
+      pendingDraft: null,
+      clear: code !== 'AGENT_CONFIRMATION_MISMATCH',
+    });
+  }
+
+  const pendingDraft = claimed.data.pendingDraft;
+  const claimedSession = claimed.data.session;
+
+  if (confirmationRequest.decision === 'cancel') {
+    return deniedTurn({
+      finishSession: claimedSession,
+      key: 'cancelled',
+      fallbackCode: null,
+      actionStatus: 'cancelled',
+      pendingDraft,
+      clear: true,
+      errorCode: 'AGENT_CONFIRMATION_CANCELLED',
+    });
+  }
+
+  const reviewed = reviewAgentConfirmedCapabilityCall({
+    name: pendingDraft.toolName,
+    pendingDraft,
+  });
+  if (!reviewed.ok) {
+    return deniedTurn({
+      finishSession: claimedSession,
+      key: 'rejected',
+      fallbackCode: reviewed.code || 'AGENT_CONFIRMED_ACTION_REJECTED',
+      pendingDraft,
+      clear: true,
+      errorCode: reviewed.code || 'AGENT_CONFIRMED_ACTION_REJECTED',
+    });
+  }
+
+  const args = actionArgsFromPendingDraft(pendingDraft);
+  if (!args) {
+    return deniedTurn({
+      finishSession: claimedSession,
+      key: 'rejected',
+      fallbackCode: 'INVALID_AGENT_DRAFT',
+      pendingDraft,
+      clear: true,
+      errorCode: 'INVALID_AGENT_DRAFT',
+    });
+  }
+
+  let result;
+  try {
+    result = await executeConfirmedAgentCapability({
+      name: pendingDraft.toolName,
+      pool,
+      userId,
+      args,
+    });
+  } catch {
+    result = {
+      ok: false,
+      code: 'AGENT_CAPABILITY_FAILED',
+      message: 'The confirmed capability failed.',
+      unexpectedFailure: true,
+    };
+  }
+
+  await auditBestEffort({
+    db: pool,
+    userId,
+    sessionId: session.id,
+    toolName: pendingDraft.toolName,
+    permissionClass: 'REVERSIBLE_USER_ACTION',
+    input: {
+      confirmationId: pendingDraft.confirmationId,
+      kind: pendingDraft.kind,
+      targetId: pendingDraft.occurrenceId || pendingDraft.itemId || null,
+    },
+    resultStatus: capabilityAuditStatus(result),
+    backendConfirmed: result.ok === true,
+    targetType: pendingDraft.kind === 'task_outcome' ? 'task_occurrence' : 'schedule_item',
+    targetId: pendingDraft.occurrenceId || pendingDraft.itemId || null,
+    errorCode: result.ok ? null : result.code || 'AGENT_CAPABILITY_FAILED',
+  });
+
+  return finishAgentConfirmationTurn({
+    session: claimedSession,
+    reply: result.ok
+      ? confirmationText('confirmed', claimedSession.language)
+      : confirmationText('rejected', claimedSession.language),
+    fallbackCode: result.ok ? null : result.code || 'AGENT_CAPABILITY_FAILED',
+    confirmation: null,
+    actionStatus: result.ok ? 'confirmed' : 'rejected',
+  });
 }
 
 /**
@@ -421,18 +871,18 @@ export async function handleAgentMessage({
   sessionId = null,
   message,
   clientContext = null,
+  confirmation = null,
   provider = defaultAgentProvider,
 }) {
   let language = 'en';
   try {
-    // Cheapest validation first: an empty or whitespace-only message is
-    // rejected before ANY database side effect (no session is created for
-    // an unusable request).
-    const boundedMessage = cleanText(
-      message,
-      AGENT_PLANNER_LIMITS.messageMaxChars,
-    );
-    if (!boundedMessage) {
+    const confirmationRequest = confirmationRequestFromInput(confirmation);
+    const isConfirmationTurn = confirmation != null;
+    const boundedMessage = isConfirmationTurn
+      ? ''
+      : cleanText(message, AGENT_PLANNER_LIMITS.messageMaxChars);
+
+    if (!isConfirmationTurn && !boundedMessage) {
       return {
         ok: false,
         code: 'AGENT_MESSAGE_EMPTY',
@@ -454,6 +904,13 @@ export async function handleAgentMessage({
     // --- owned session: create when omitted, verify when given ---
     let session;
     let sessionCreated = false;
+    if (isConfirmationTurn && sessionId == null) {
+      return {
+        ok: false,
+        code: 'INVALID_AGENT_SESSION_ID',
+        message: 'Invalid agent session ID.',
+      };
+    }
     if (sessionId == null) {
       const created = await createAgentSession({ db: pool, userId, language });
       if (!created.ok) return created;
@@ -486,6 +943,43 @@ export async function handleAgentMessage({
       session = touched.data.session;
     }
 
+    if (isConfirmationTurn) {
+      return handleAgentConfirmation({
+        pool,
+        userId,
+        session,
+        confirmationRequest,
+      });
+    }
+
+    // Phase E conversational confirmation/cancellation is deterministic and
+    // bypasses planner/provider completely. It can only consume the exact
+    // server-stored Phase D pending confirmation in this owned session.
+    const conversationalDecision = classifyBareConfirmationDecision(boundedMessage);
+    if (conversationalDecision) {
+      const pendingConfirmation = session.state?.pendingConfirmation;
+      const confirmationId = pendingConfirmation?.confirmationId;
+      if (!confirmationId) {
+        return finishAgentConfirmationTurn({
+          session,
+          reply: confirmationText('noPending', session.language),
+          fallbackCode: 'AGENT_CONFIRMATION_NOT_FOUND',
+          confirmation: null,
+          actionStatus: 'rejected',
+        });
+      }
+      return handleAgentConfirmation({
+        pool,
+        userId,
+        session,
+        confirmationRequest: {
+          ok: true,
+          confirmationId,
+          decision: conversationalDecision,
+        },
+      });
+    }
+
     // --- bounded verified context (fail-safe drops, ownership first) ---
     const context = await readAgentScreenContext({
       pool,
@@ -494,10 +988,52 @@ export async function handleAgentMessage({
     });
     const screenEntity = context.screenContext?.entity || null;
 
+    const conversationContext = await readAgentConversationStateContext({
+      pool,
+      userId,
+      sessionState: session.state,
+    });
+
+    const referenceResolution = await resolveAgentConversationReference({
+      pool,
+      userId,
+      message: boundedMessage,
+      screenEntity,
+      currentFocus: conversationContext.currentFocus,
+      recentEntities: conversationContext.recentEntities,
+      recentOrderedEntityList: conversationContext.recentOrderedEntityList,
+    });
+
+    if (
+      referenceResolution.status === 'ambiguous' ||
+      referenceResolution.status === 'missing'
+    ) {
+      return finishAgentTurn({
+        pool,
+        userId,
+        session,
+        reply: localizedReferenceClarification({
+          language: session.language,
+          resolution: referenceResolution,
+        }),
+        fallbackCode:
+          referenceResolution.status === 'ambiguous'
+            ? 'AGENT_REFERENCE_AMBIGUOUS'
+            : 'AGENT_REFERENCE_NOT_FOUND',
+        intent: 'clarify_entity_reference',
+        capabilityCalls: [],
+        navigation: null,
+        navigationEntity: null,
+        screenEntity,
+      });
+    }
+
     const contextSlice = buildAgentContextSlice({
       language: session.language,
       screenContext: context.screenContext,
       sessionState: session.state,
+      conversationContext,
+      referenceResolution: referenceResolutionContext(referenceResolution),
     });
 
     // --- one bounded planning turn ---
@@ -539,12 +1075,56 @@ export async function handleAgentMessage({
     }
 
     const plan = planned.plan;
+    const referenceBinding = reviewPlanAgainstResolvedReference({
+      plan,
+      resolution: referenceResolution,
+    });
+    if (!referenceBinding.ok) {
+      return finishAgentTurn({
+        pool,
+        userId,
+        session,
+        reply: localizedReferenceClarification({
+          language: session.language,
+          resolution: referenceResolution,
+          code: referenceBinding.code,
+        }),
+        fallbackCode: referenceBinding.code,
+        intent: 'clarify_entity_reference',
+        capabilityCalls: [],
+        navigation: null,
+        navigationEntity: null,
+        screenEntity,
+      });
+    }
     const declined =
       plan.capabilityCalls.length === 0 && DECLINE_INTENT_PATTERN.test(plan.intent);
+    const plannedDraftCall = plan.capabilityCalls.find(
+      (call) => resolveAgentCapability(call.name)?.permissionClass === 'DRAFT',
+    );
+    if (plannedDraftCall && hasActivePendingDraft(session.state)) {
+      const pending = responseConfirmationFromDraft(session.state.pendingDraft);
+      return finishAgentTurn({
+        pool,
+        userId,
+        session,
+        reply: confirmationText('alreadyAwaiting', session.language),
+        fallbackCode: 'AGENT_CONFIRMATION_ALREADY_PENDING',
+        intent: 'confirmation_already_pending',
+        capabilityCalls: [],
+        navigation: null,
+        navigationEntity: null,
+        screenEntity,
+        confirmation: pending,
+        actionStatus: 'awaiting_confirmation',
+      });
+    }
 
-    // --- execute validated READ calls (bounded by the gateway) ---
+    // --- execute validated READ/DRAFT calls (bounded by the gateway) ---
     const capabilityResults = [];
+    const successfulCapabilityCalls = [];
     let capabilityFailureCode = null;
+    let pendingDraft = null;
     for (const call of plan.capabilityCalls) {
       const capability = resolveAgentCapability(call.name);
       const approved = reviewAgentCapabilityCall({ name: call.name });
@@ -577,6 +1157,7 @@ export async function handleAgentMessage({
           ok: false,
           code: 'AGENT_CAPABILITY_FAILED',
           message: 'The capability call failed.',
+          unexpectedFailure: true,
         };
       }
       const target = entityFromCallArgs(call.args);
@@ -587,13 +1168,26 @@ export async function handleAgentMessage({
         toolName: call.name,
         permissionClass: capability ? capability.permissionClass : 'READ',
         input: call.args,
-        resultStatus: result.ok ? 'succeeded' : 'failed',
-        backendConfirmed: result.ok === true,
+        resultStatus: capabilityAuditStatus(result),
+        backendConfirmed:
+          result.ok === true && capability?.permissionClass !== 'DRAFT',
         ...(target ? { targetType: target.type, targetId: target.id } : {}),
         errorCode: result.ok ? null : result.code || 'AGENT_CAPABILITY_FAILED',
       });
       if (result.ok) {
-        capabilityResults.push({ name: call.name, result });
+        successfulCapabilityCalls.push({ name: call.name, args: call.args });
+        if (capability?.permissionClass === 'DRAFT') {
+          if (pendingDraft) {
+            capabilityFailureCode = 'AGENT_MULTIPLE_DRAFTS_NOT_ALLOWED';
+          } else {
+            pendingDraft = createPendingDraft(result.data?.draft);
+            if (!pendingDraft) {
+              capabilityFailureCode = 'INVALID_AGENT_DRAFT';
+            }
+          }
+        } else {
+          capabilityResults.push({ name: call.name, args: call.args, result });
+        }
       } else {
         capabilityFailureCode = result.code || 'AGENT_CAPABILITY_FAILED';
       }
@@ -611,6 +1205,27 @@ export async function handleAgentMessage({
         navigation: null,
         navigationEntity: null,
         screenEntity,
+      });
+    }
+
+    if (pendingDraft) {
+      return finishAgentTurn({
+        pool,
+        userId,
+        session,
+        reply: confirmationText('draftReady', session.language),
+        fallbackCode: null,
+        intent: 'draft_awaiting_confirmation',
+        capabilityCalls: plan.capabilityCalls,
+        successfulCapabilityCalls,
+        capabilityResults,
+        navigation: null,
+        navigationEntity: null,
+        screenEntity,
+        pendingConfirmation: responseConfirmationFromDraft(pendingDraft),
+        pendingDraft,
+        confirmation: responseConfirmationFromDraft(pendingDraft),
+        actionStatus: 'awaiting_confirmation',
       });
     }
 
@@ -696,6 +1311,8 @@ export async function handleAgentMessage({
       fallbackCode,
       intent: plan.intent,
       capabilityCalls: plan.capabilityCalls,
+      successfulCapabilityCalls,
+      capabilityResults,
       navigation,
       navigationEntity,
       screenEntity,

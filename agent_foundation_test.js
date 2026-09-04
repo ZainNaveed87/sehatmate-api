@@ -28,6 +28,7 @@ import {
 } from './agent/agent_config.js';
 
 import {
+  AGENT_STATE_LIMITS,
   AGENT_SESSION_STATE_VERSION,
   emptyAgentSessionState,
   sanitizeAgentSessionState,
@@ -321,7 +322,7 @@ await test('readAgentSession: stored state is re-sanitized on read so unknown an
   assert.equal(state.version, AGENT_SESSION_STATE_VERSION);
   // Read-side bounds match the write-side bounds exactly.
   assert.equal(state.lastReferencedEntities.length, 20);
-  assert.equal(Object.keys(state.pendingDraft).length, 8);
+  assert.equal(Object.keys(state.pendingDraft).length, AGENT_STATE_LIMITS.draftMaxEntries);
   assert.equal(state.lastActionSummary.length, 500);
 });
 
@@ -329,7 +330,19 @@ await test('readAgentSession: approved canonical stored state fields survive rea
   const stored = {
     version: 1,
     lastReferencedEntities: [{ type: 'care_plan', id: '7' }],
-    pendingConfirmation: { kind: 'confirm', message: 'Confirm this reminder?' },
+    currentFocus: { type: 'care_plan', id: '7' },
+    recentOrderedEntityList: {
+      kind: 'care_plan',
+      entities: [{ type: 'care_plan', id: '7' }],
+    },
+    lastIntent: 'get_care_plan',
+    lastCapabilityNames: ['get_care_plan'],
+    pendingConfirmation: {
+      confirmationId: 'confirm-state-1',
+      kind: 'task_outcome',
+      message: 'Confirm this reminder?',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+    },
     pendingDraft: { title: 'Metformin' },
     lastActionSummary: 'Reminder confirmed',
   };
@@ -468,7 +481,23 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
       'junk-entry',
       { type: 'document', id: '9' },
     ],
-    pendingConfirmation: { kind: 'confirm', message: 'Confirm this reminder?' },
+    currentFocus: { type: 'care_plan', id: '7' },
+    recentOrderedEntityList: {
+      kind: 'care_plan',
+      entities: [
+        { type: 'care_plan', id: '7' },
+        { type: 'care_gap', id: '5' },
+        { type: 'document', id: '9' },
+      ],
+    },
+    lastIntent: 'get_care_plan',
+    lastCapabilityNames: ['get_care_plan', 'get_simulation'],
+    pendingConfirmation: {
+      confirmationId: 'confirm-state-2',
+      kind: 'task_outcome',
+      message: 'Confirm this reminder?',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+    },
     pendingDraft: { title: 'Metformin', nestedObject: { deep: 'dropped' }, count: 3 },
     lastActionSummary: 'Reminder confirmed',
   });
@@ -480,10 +509,28 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
   );
   assert.deepEqual(
     sanitized.state.pendingConfirmation,
-    { kind: 'confirm', message: 'Confirm this reminder?' },
+    {
+      confirmationId: 'confirm-state-2',
+      kind: 'task_outcome',
+      message: 'Confirm this reminder?',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+    },
   );
   assert.deepEqual(sanitized.state.pendingDraft, { title: 'Metformin' });
   assert.equal(sanitized.state.lastActionSummary, 'Reminder confirmed');
+  assert.deepEqual(sanitized.state.currentFocus, { type: 'care_plan', id: '7' });
+  assert.deepEqual(sanitized.state.recentOrderedEntityList, {
+    kind: 'care_plan',
+    entities: [
+      { type: 'care_plan', id: '7' },
+      { type: 'care_gap', id: '5' },
+    ],
+  });
+  assert.equal(sanitized.state.lastIntent, 'get_care_plan');
+  assert.deepEqual(sanitized.state.lastCapabilityNames, [
+    'get_care_plan',
+    'get_simulation',
+  ]);
   assert.equal('evilKey' in sanitized.state, false);
 });
 

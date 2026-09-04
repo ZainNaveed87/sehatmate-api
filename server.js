@@ -34,6 +34,11 @@ import {
 } from './agent/agent_core.js';
 
 import {
+  defaultAgentVoiceProvider,
+  VOICE_PROVIDER_LIMITS,
+} from './agent/agent_voice_provider.js';
+
+import {
   careGapJson,
   careGapSummary,
   refreshCareGaps,
@@ -1569,6 +1574,90 @@ const agentErrorStatusByCode = {
   AGENT_INTERNAL_ERROR: 500,
 };
 
+const agentVoiceErrorStatusByCode = {
+  VOICE_AGENT_DISABLED: 503,
+  VOICE_PROVIDER_UNCONFIGURED: 503,
+  VOICE_AUDIO_MODEL_MISSING: 503,
+  VOICE_TTS_MODEL_MISSING: 503,
+  VOICE_EMPTY_AUDIO: 422,
+  VOICE_UNSUPPORTED_AUDIO: 415,
+  VOICE_AUDIO_TOO_LARGE: 413,
+  VOICE_AUDIO_TOO_LONG: 413,
+  VOICE_INVALID_DURATION: 422,
+  VOICE_NO_SPEECH: 422,
+  VOICE_TRANSCRIPT_TOO_LONG: 422,
+  VOICE_TRANSCRIPT_MALFORMED: 502,
+  VOICE_PROVIDER_TIMEOUT: 504,
+  VOICE_PROVIDER_RATE_LIMITED: 429,
+  VOICE_MODEL_UNAVAILABLE: 502,
+  VOICE_PROVIDER_REJECTED: 502,
+  VOICE_PROVIDER_NETWORK: 502,
+  VOICE_PROVIDER_MALFORMED: 502,
+  VOICE_PROVIDER_FAILED: 502,
+  VOICE_TTS_EMPTY_REPLY: 422,
+  VOICE_TTS_REPLY_TOO_LONG: 422,
+  VOICE_TTS_EMPTY_AUDIO: 502,
+  VOICE_TTS_TOO_LARGE: 502,
+  VOICE_TTS_FAILED: 502,
+};
+
+function voiceDurationFromHeader(req) {
+  const raw = req.get('x-sehatmate-recording-duration-ms');
+  if (raw == null || raw === '') return null;
+  return Number(raw);
+}
+
+async function readAgentVoiceLanguage(userId) {
+  try {
+    const language = await readPreferredLanguageForUser(pool, userId);
+    const normalized = String(language || '').trim().toLowerCase();
+    if (normalized === 'urdu') return 'ur';
+    if (normalized === 'roman urdu' || normalized === 'roman_ur') return 'roman_ur';
+    return 'en';
+  } catch {
+    return null;
+  }
+}
+
+app.post(
+  '/api/agent/voice/transcribe',
+  authenticate,
+  agentLimiter,
+  express.raw({
+    type: ['audio/mp4'],
+    limit: VOICE_PROVIDER_LIMITS.maxAudioBytes,
+  }),
+  async (req, res) => {
+    const language = await readAgentVoiceLanguage(req.auth.userId);
+    const result = await defaultAgentVoiceProvider.transcribeAudio({
+      audioBuffer: req.body,
+      contentType: req.get('content-type'),
+      durationMs: voiceDurationFromHeader(req),
+      language,
+    });
+
+    if (!result.ok) {
+      res
+        .status(agentVoiceErrorStatusByCode[result.code] || result.statusCode || 502)
+        .json({
+          success: false,
+          code: result.code,
+          message: result.message,
+        });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        transcript: result.transcript,
+        model: result.model,
+        contract: result.contract,
+      },
+    });
+  },
+);
+
 app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next) => {
   try {
     const result = await handleAgentMessage({
@@ -1577,6 +1666,7 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
       sessionId: req.body?.sessionId ?? null,
       message: req.body?.message,
       clientContext: req.body?.screenContext ?? req.body?.clientContext ?? null,
+      confirmation: req.body?.confirmation ?? null,
     });
 
     if (!result.ok) {
@@ -1588,6 +1678,26 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
       return;
     }
 
+    let speech = null;
+    if (req.body?.voice?.requestSpeech === true && result.reply) {
+      const speechResult = await defaultAgentVoiceProvider.synthesizeApprovedReply({
+        reply: result.reply,
+      });
+      if (speechResult.ok) {
+        speech = {
+          contentType: speechResult.contentType,
+          format: speechResult.format,
+          audioBase64: speechResult.audioBase64,
+          model: speechResult.model,
+        };
+      } else {
+        speech = {
+          failed: true,
+          code: speechResult.code,
+        };
+      }
+    }
+
     res.json({
       success: true,
       data: {
@@ -1595,7 +1705,10 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
         language: result.language,
         reply: result.reply,
         navigation: result.navigation,
+        confirmation: result.confirmation,
+        actionStatus: result.actionStatus,
         referencedEntities: result.referencedEntities,
+        ...(speech ? { speech } : {}),
         ...(result.fallbackCode ? { fallbackCode: result.fallbackCode } : {}),
       },
     });

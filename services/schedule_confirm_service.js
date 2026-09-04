@@ -84,7 +84,7 @@ function verifiedTimingConstraint(row) {
 }
 
 /**
- * Confirm an exact reminder time for one schedule item.
+ * Validate an exact reminder time for one schedule item without mutating.
  *
  * Returns a structured domain result:
  *   { ok: false, code: 'INVALID_SCHEDULE_ITEM_ID', message }
@@ -95,19 +95,17 @@ function verifiedTimingConstraint(row) {
  *   { ok: false, code: 'MEDICAL_TIMING_CONFLICT', message, data }
  *   { ok: false, code: 'DUPLICATE_REMINDER_TIME', message }
  *   { ok: false, code: 'DUPLICATE_REMINDER_PERIOD', message }
- *   { ok: true, message, data: { scheduleTime } }
+ *   { ok: true, message, data: { row, displayTime, scheduleTime, selectedPeriod } }
  */
-export async function confirmScheduleItem({
+export async function validateScheduleItemConfirmation({
   pool,
   userId,
   itemId,
   displayTime,
   scheduleTime,
-  learningSource,
 }) {
   const canonicalDisplayTime = cleanText(displayTime, 160);
   const canonicalScheduleTime = cleanText(scheduleTime, 5);
-  const canonicalLearningSource = cleanText(learningSource, 60);
   const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 
   if (!idPattern.test(itemId)) {
@@ -260,12 +258,51 @@ export async function confirmScheduleItem({
     }
   }
 
+  return {
+    ok: true,
+    message: 'Exact reminder time validated.',
+    data: {
+      row: rows[0],
+      displayTime:
+        canonicalDisplayTime ||
+        cleanText(rows[0].display_time, 160) ||
+        `Confirmed reminder at ${canonicalScheduleTime}`,
+      scheduleTime: canonicalScheduleTime,
+      selectedPeriod,
+    },
+  };
+}
+
+/**
+ * Confirm an exact reminder time for one schedule item.
+ */
+export async function confirmScheduleItem({
+  pool,
+  userId,
+  itemId,
+  displayTime,
+  scheduleTime,
+  learningSource,
+}) {
+  const canonicalLearningSource = cleanText(learningSource, 60);
+  const validated = await validateScheduleItemConfirmation({
+    pool,
+    userId,
+    itemId,
+    displayTime,
+    scheduleTime,
+  });
+  if (!validated.ok) return validated;
+
+  const { row, displayTime: canonicalDisplayTime, scheduleTime: canonicalScheduleTime, selectedPeriod } =
+    validated.data;
+
   await pool.execute(
     `UPDATE care_schedule_items
      SET schedule_time = ?, display_time = ?, requires_confirmation = 0,
          confirmation_status = 'ready', updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND user_id = ?`,
-    [canonicalScheduleTime, canonicalDisplayTime || `Confirmed reminder at ${canonicalScheduleTime}`, itemId, userId],
+    [canonicalScheduleTime, canonicalDisplayTime, itemId, userId],
   );
 
   await pool.execute(
@@ -276,30 +313,30 @@ export async function confirmScheduleItem({
     [canonicalScheduleTime, itemId, userId],
   );
 
-  const oldTime = String(rows[0].schedule_time || '').slice(0, 5);
+  const oldTime = String(row.schedule_time || '').slice(0, 5);
   if (oldTime !== canonicalScheduleTime) {
     await recordRoutineLearningEvent({
       db: pool,
       userId,
-      carePlanId: String(rows[0].care_plan_id),
+      carePlanId: String(row.care_plan_id),
       eventType:
         canonicalLearningSource === 'ai_suggestion_accept'
           ? 'suggestion_accepted'
           : 'manual_schedule_edit',
       period: selectedPeriod,
       scheduleTime: canonicalScheduleTime,
-      signalValue: rows[0].title || canonicalDisplayTime,
+      signalValue: row.title || canonicalDisplayTime,
       metadata: {
         taskId: String(itemId),
         previousTime: oldTime || null,
-        grounding: rows[0].grounding || null,
+        grounding: row.grounding || null,
       },
     });
   }
 
   await refreshCareGaps({
     db: pool,
-    planId: String(rows[0].care_plan_id),
+    planId: String(row.care_plan_id),
     userId,
     realityQuestionTemplates,
   });
