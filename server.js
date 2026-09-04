@@ -1636,16 +1636,26 @@ app.post(
       language,
     });
 
-    if (!result.ok) {
-      res
-        .status(agentVoiceErrorStatusByCode[result.code] || result.statusCode || 502)
-        .json({
-          success: false,
-          code: result.code,
-          message: result.message,
-        });
-      return;
-    }
+   if (!result.ok) {
+  const status =
+    agentVoiceErrorStatusByCode[result.code] ||
+    result.statusCode ||
+    502;
+
+  console.error('[AgentVoice] transcription failed:', {
+    code: result.code,
+    status,
+    message: result.message,
+    model: defaultAgentVoiceProvider.health().audioModel,
+  });
+
+  res.status(status).json({
+    success: false,
+    code: result.code,
+    message: result.message,
+  });
+  return;
+}
 
     res.json({
       success: true,
