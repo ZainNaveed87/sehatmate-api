@@ -156,6 +156,31 @@ const NAVIGATION_TARGET_LABELS = Object.freeze({
     ur: 'دیکھ بھال کا خلا',
     roman_ur: 'Care gap',
   }),
+  family_care: Object.freeze({
+    en: 'Family Care',
+    ur: 'فیملی کیئر',
+    roman_ur: 'Family Care',
+  }),
+  family_member_detail: Object.freeze({
+    en: 'Family member',
+    ur: 'فیملی ممبر',
+    roman_ur: 'Family member',
+  }),
+  family_member_care_plans: Object.freeze({
+    en: 'family care plans',
+    ur: 'فیملی care plans',
+    roman_ur: 'family care plans',
+  }),
+  family_member_care_gaps: Object.freeze({
+    en: 'family care gaps',
+    ur: 'فیملی care gaps',
+    roman_ur: 'family care gaps',
+  }),
+  family_member_simulation: Object.freeze({
+    en: 'family simulation',
+    ur: 'فیملی simulation',
+    roman_ur: 'family simulation',
+  }),
   routine_settings: Object.freeze({
     en: 'Routine settings',
     ur: 'روٹین سیٹنگز',
@@ -1002,6 +1027,7 @@ export async function handleAgentMessage({
       currentFocus: conversationContext.currentFocus,
       recentEntities: conversationContext.recentEntities,
       recentOrderedEntityList: conversationContext.recentOrderedEntityList,
+      familyMembers: conversationContext.familyMembers,
     });
 
     if (

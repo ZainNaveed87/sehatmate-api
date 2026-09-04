@@ -41,7 +41,7 @@
 import { cleanText, idPattern } from '../services/shared_utils.js';
 
 export const AGENT_SESSION_STATE_VERSION = 1;
-const CONVERSATION_ENTITY_TYPES = new Set(['care_plan', 'care_gap']);
+const CONVERSATION_ENTITY_TYPES = new Set(['care_plan', 'care_gap', 'family_member']);
 const MEMORY_LABEL_PATTERN = /^[a-z][a-z0-9_]*$/;
 
 export const AGENT_STATE_LIMITS = Object.freeze({
@@ -94,9 +94,8 @@ function sanitizeReferencedEntities(value) {
   const entities = [];
   for (const entry of value.slice(0, AGENT_STATE_LIMITS.maxReferencedEntities)) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-    const type = cleanText(entry.type, AGENT_STATE_LIMITS.entityTypeMaxLength);
-    const id = cleanText(entry.id, AGENT_STATE_LIMITS.entityIdMaxLength);
-    if (type && id) entities.push({ type, id });
+    const entity = sanitizeEntityReference(entry);
+    if (entity) entities.push(entity);
   }
   return entities;
 }

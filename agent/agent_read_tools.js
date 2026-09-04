@@ -61,6 +61,16 @@ import {
   readTodayTasksState,
 } from '../services/performance_summary_service.js';
 
+import {
+  listFamilyHome,
+  readFamilyCareGaps,
+  readFamilyCarePlans,
+  readFamilyMemberSummary,
+  readFamilyPerformance,
+  readFamilySimulation,
+  readFamilyTodayTasks,
+} from '../services/family_care_service.js';
+
 import { readRoutineProfile } from '../routine_learning.js';
 
 export const AGENT_READ_CAPABILITY_NAMES = Object.freeze([
@@ -76,6 +86,13 @@ export const AGENT_READ_CAPABILITY_NAMES = Object.freeze([
   'get_care_gaps',
   'get_care_gap_detail',
   'get_routine_preferences',
+  'family_members_list',
+  'family_member_summary',
+  'family_member_care_plans',
+  'family_member_today_tasks',
+  'family_member_care_gaps',
+  'family_member_simulation',
+  'family_member_performance',
 ]);
 
 defineAgentCapability({
@@ -370,4 +387,167 @@ defineAgentCapability({
   },
   resultContract:
     '{ routinePreferences: { learningEnabled, preferredReminderStyle, notes: { morning, afternoon, evening, night }, learned: { ... }, totalSignals } }',
+});
+
+defineAgentCapability({
+  name: 'family_members_list',
+  permissionClass: 'READ',
+  description:
+    'List active Family Care relationships and pending invitations for the authenticated user. Relationship ids are server-owned references for later family_member_* capabilities.',
+  inputSchema: {
+    properties: {},
+    required: [],
+  },
+  execute: async ({ pool, userId }) => {
+    const result = await listFamilyHome({ pool, actorUserId: userId });
+    if (!result.ok) return result;
+    return {
+      ok: true,
+      data: {
+        familyMembers: result.data.relationships.map((relationship) => ({
+          id: relationship.id,
+          title: relationship.member.name,
+          relationshipLabel: relationship.relationshipLabel,
+          role: relationship.role,
+          status: relationship.status,
+          summary: relationship.summary || null,
+        })),
+        pendingInvitations: result.data.pendingInvitations,
+      },
+    };
+  },
+  resultContract:
+    '{ familyMembers: [{ id, title, relationshipLabel, role, status, summary }], pendingInvitations }',
+});
+
+defineAgentCapability({
+  name: 'family_member_summary',
+  permissionClass: 'READ',
+  description:
+    'Read the authorized Family Care summary for one verified family relationship, with each section filtered by explicit server-side permissions.',
+  inputSchema: {
+    properties: {
+      relationshipId: { type: 'id' },
+    },
+    required: ['relationshipId'],
+  },
+  execute: ({ pool, userId, args }) =>
+    readFamilyMemberSummary({
+      pool,
+      actorUserId: userId,
+      relationshipId: args.relationshipId,
+    }),
+  resultContract:
+    '{ relationship, summary: { statusText, carePlans?, today?, careGaps?, simulation?, performance? } } or FAMILY_PERMISSION_DENIED',
+});
+
+defineAgentCapability({
+  name: 'family_member_care_plans',
+  permissionClass: 'READ',
+  description:
+    'Read care plans for one verified family member through Family Care. Data comes from the care recipient’s existing care_plans records and requires care_plan.read.',
+  inputSchema: {
+    properties: {
+      relationshipId: { type: 'id' },
+    },
+    required: ['relationshipId'],
+  },
+  execute: ({ pool, userId, args }) =>
+    readFamilyCarePlans({
+      pool,
+      actorUserId: userId,
+      relationshipId: args.relationshipId,
+    }),
+  resultContract: '{ plans: [carePlanJson...] } or FAMILY_PERMISSION_DENIED',
+});
+
+defineAgentCapability({
+  name: 'family_member_today_tasks',
+  permissionClass: 'READ',
+  description:
+    'Read today’s existing task occurrences for one verified family member. Requires task.read and never changes task ownership.',
+  inputSchema: {
+    properties: {
+      relationshipId: { type: 'id' },
+      date: {
+        type: 'date',
+        description: 'Optional YYYY-MM-DD day to read; defaults to today.',
+      },
+    },
+    required: ['relationshipId'],
+  },
+  execute: ({ pool, userId, args }) =>
+    readFamilyTodayTasks({
+      pool,
+      actorUserId: userId,
+      relationshipId: args.relationshipId,
+      date: args.date ?? null,
+    }),
+  resultContract:
+    '{ date, occurrences, summary } from existing task occurrence service or FAMILY_PERMISSION_DENIED',
+});
+
+defineAgentCapability({
+  name: 'family_member_care_gaps',
+  permissionClass: 'READ',
+  description:
+    'Read authoritative open/in-progress/resolved care gaps across the verified family member’s existing care plans. Requires care_gap.read.',
+  inputSchema: {
+    properties: {
+      relationshipId: { type: 'id' },
+    },
+    required: ['relationshipId'],
+  },
+  execute: ({ pool, userId, args }) =>
+    readFamilyCareGaps({
+      pool,
+      actorUserId: userId,
+      relationshipId: args.relationshipId,
+    }),
+  resultContract:
+    '{ summary, gaps } from existing care-gap service or FAMILY_PERMISSION_DENIED',
+});
+
+defineAgentCapability({
+  name: 'family_member_simulation',
+  permissionClass: 'READ',
+  description:
+    'Read the authoritative Simulation state for one verified family member’s primary or specified care plan. Requires simulation.read.',
+  inputSchema: {
+    properties: {
+      relationshipId: { type: 'id' },
+      planId: { type: 'id' },
+    },
+    required: ['relationshipId'],
+  },
+  execute: ({ pool, userId, args }) =>
+    readFamilySimulation({
+      pool,
+      actorUserId: userId,
+      relationshipId: args.relationshipId,
+      planId: args.planId ?? null,
+    }),
+  resultContract:
+    '{ planId, simulation } from existing simulation service or FAMILY_PERMISSION_DENIED',
+});
+
+defineAgentCapability({
+  name: 'family_member_performance',
+  permissionClass: 'READ',
+  description:
+    'Read the deterministic performance summary for one verified family member using the existing performance summary service. Requires performance.read.',
+  inputSchema: {
+    properties: {
+      relationshipId: { type: 'id' },
+    },
+    required: ['relationshipId'],
+  },
+  execute: ({ pool, userId, args }) =>
+    readFamilyPerformance({
+      pool,
+      actorUserId: userId,
+      relationshipId: args.relationshipId,
+    }),
+  resultContract:
+    '{ date, today, periods, primaryPlan, realityCheck, simulation } or FAMILY_PERMISSION_DENIED',
 });

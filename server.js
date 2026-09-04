@@ -124,6 +124,28 @@ import {
   readTodayTasksState,
 } from './services/performance_summary_service.js';
 
+import {
+  acceptFamilyInvitation,
+  createFamilyInvitation,
+  declineFamilyInvitation,
+  ensureFamilyCareSchema,
+  listFamilyHome,
+  readFamilyCareGaps,
+  readFamilyCarePlans,
+  readFamilyMemberSummary,
+  readFamilyPerformance,
+  readFamilySimulation,
+  readFamilyTodayTasks,
+  revokeFamilyRelationship,
+  updateFamilyPermissions,
+} from './services/family_care_service.js';
+
+import {
+  completePasswordReset,
+  requestPasswordReset,
+  verifyPasswordResetCode,
+} from './services/password_reset_service.js';
+
 /*
  * HTTP status mapping for structured service results. The services return
  * stable domain error codes; this table (and only this table) decides which
@@ -155,6 +177,21 @@ const serviceErrorStatusByCode = {
   DUPLICATE_REMINDER_TIME: 409,
   DUPLICATE_REMINDER_PERIOD: 409,
   AUTO_MANAGED_GAP_NOT_RESOLVED: 409,
+  INVALID_FAMILY_INVITATION: 422,
+  INVALID_FAMILY_INVITATION_ID: 422,
+  INVALID_FAMILY_RELATIONSHIP_ID: 422,
+  INVALID_FAMILY_PERMISSION_SCOPE: 422,
+  FAMILY_SELF_INVITATION: 422,
+  FAMILY_INVITEE_NOT_FOUND: 404,
+  FAMILY_INVITATION_NOT_FOUND: 404,
+  FAMILY_RELATIONSHIP_NOT_FOUND: 404,
+  FAMILY_MEMBER_NOT_FOUND: 404,
+  FAMILY_INVITATION_NOT_PENDING: 409,
+  FAMILY_INVITATION_ALREADY_PENDING: 409,
+  FAMILY_RELATIONSHIP_ALREADY_ACTIVE: 409,
+  FAMILY_RELATIONSHIP_NOT_ACTIVE: 403,
+  FAMILY_PERMISSION_DENIED: 403,
+  FAMILY_PERMISSION_MANAGE_DENIED: 403,
 };
 
 function sendServiceError(res, result) {
@@ -244,6 +281,18 @@ const authLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many attempts. Please try again later.',
+  },
+});
+
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 12,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message:
+      'Too many password reset attempts. Please try again later.',
   },
 });
 
@@ -437,6 +486,31 @@ function validateLogin(body) {
       password,
     },
   };
+}
+
+function authProviderForUser(row) {
+  if (!row) return null;
+
+  const hasPassword =
+    typeof row.password_hash === 'string' &&
+    row.password_hash.trim().length > 0;
+
+  const hasGoogle =
+    typeof row.google_sub === 'string' &&
+    row.google_sub.trim().length > 0;
+
+  if (hasPassword && !hasGoogle) {
+    return 'password';
+  }
+
+  if (hasGoogle && !hasPassword) {
+    return 'google';
+  }
+
+  // Both present (or both absent) is deliberately not accepted.
+  // This prevents a legacy/malformed row from authenticating through two
+  // independent methods.
+  return null;
 }
 
 function validateGoogleName(name, email) {
@@ -1742,14 +1816,24 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
 
   try {
     const [existing] = await pool.execute(
-      'SELECT id FROM users WHERE email = ? LIMIT 1',
+      `SELECT id, password_hash, google_sub
+       FROM users
+       WHERE email = ?
+       LIMIT 1`,
       [email],
     );
 
     if (existing.length > 0) {
+      const provider = authProviderForUser(existing[0]);
+
       res.status(409).json({
         success: false,
-        message: 'An account with this email already exists.',
+        message:
+          provider === 'google'
+            ? 'An account with this email already exists and uses Google Sign-In. Please continue with Google.'
+            : provider === 'password'
+              ? 'An account with this email already exists. Please sign in using your password.'
+              : 'This account has an invalid sign-in configuration. Please contact support.',
       });
       return;
     }
@@ -1757,7 +1841,12 @@ app.post('/api/auth/register', authLimiter, async (req, res, next) => {
     const passwordHash = await bcrypt.hash(password, 12);
 
     const [result] = await pool.execute(
-      'INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)',
+      `INSERT INTO users (
+        name,
+        email,
+        password_hash,
+        google_sub
+      ) VALUES (?, ?, ?, NULL)`,
       [name, email, passwordHash],
     );
 
@@ -1804,23 +1893,60 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
 
   try {
     const [rows] = await pool.execute(
-      `SELECT id, name, email, password_hash,
+      `SELECT
+        id,
+        name,
+        email,
+        password_hash,
+        google_sub,
         EXISTS(
-          SELECT 1 FROM patient_profiles
+          SELECT 1
+          FROM patient_profiles
           WHERE patient_profiles.user_id = users.id
             AND patient_profiles.onboarding_completed = 1
         ) AS onboarding_completed
-       FROM users WHERE email = ? LIMIT 1`,
+       FROM users
+       WHERE email = ?
+       LIMIT 1`,
       [email],
     );
 
     const user = rows[0];
 
-    const passwordMatches = user?.password_hash
-      ? await bcrypt.compare(password, user.password_hash)
-      : false;
+    if (!user) {
+      res.status(401).json({
+        success: false,
+        message: 'Incorrect email or password.',
+      });
+      return;
+    }
 
-    if (!user || !passwordMatches) {
+    const provider = authProviderForUser(user);
+
+    if (provider === 'google') {
+      res.status(409).json({
+        success: false,
+        message:
+          'This account uses Google Sign-In. Please continue with Google.',
+      });
+      return;
+    }
+
+    if (provider !== 'password') {
+      res.status(409).json({
+        success: false,
+        message:
+          'This account has an invalid sign-in configuration. Please contact support.',
+      });
+      return;
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      password,
+      user.password_hash,
+    );
+
+    if (!passwordMatches) {
       res.status(401).json({
         success: false,
         message: 'Incorrect email or password.',
@@ -1903,19 +2029,40 @@ app.post('/api/auth/google', authLimiter, async (req, res, next) => {
   const name = validateGoogleName(googlePayload?.name, email);
 
   try {
+    // google_sub is the authoritative identity for an existing Google account.
     const [googleUsers] = await pool.execute(
-      `SELECT id, name, email, google_sub,
+      `SELECT
+        id,
+        name,
+        email,
+        password_hash,
+        google_sub,
         EXISTS(
-          SELECT 1 FROM patient_profiles
+          SELECT 1
+          FROM patient_profiles
           WHERE patient_profiles.user_id = users.id
             AND patient_profiles.onboarding_completed = 1
         ) AS onboarding_completed
-       FROM users WHERE google_sub = ? LIMIT 1`,
+       FROM users
+       WHERE google_sub = ?
+       LIMIT 1`,
       [googleSub],
     );
 
     if (googleUsers.length > 0) {
       const user = googleUsers[0];
+      const provider = authProviderForUser(user);
+
+      // A legacy/malformed row containing both a password and google_sub must
+      // not gain two authentication methods.
+      if (provider !== 'google') {
+        res.status(409).json({
+          success: false,
+          message:
+            'This account has an invalid sign-in configuration. Please contact support.',
+        });
+        return;
+      }
 
       res.json({
         success: true,
@@ -1930,16 +2077,48 @@ app.post('/api/auth/google', authLimiter, async (req, res, next) => {
       return;
     }
 
+    // Email matching alone NEVER links authentication providers.
     const [emailUsers] = await pool.execute(
-      'SELECT id, name, email, google_sub FROM users WHERE email = ? LIMIT 1',
+      `SELECT
+        id,
+        name,
+        email,
+        password_hash,
+        google_sub
+       FROM users
+       WHERE email = ?
+       LIMIT 1`,
       [email],
     );
 
     if (emailUsers.length > 0) {
+      const existingUser = emailUsers[0];
+      const provider = authProviderForUser(existingUser);
+
+      if (provider === 'password') {
+        res.status(409).json({
+          success: false,
+          message:
+            'This account uses email and password. Please sign in using your password.',
+        });
+        return;
+      }
+
+      if (provider === 'google') {
+        // The email belongs to an existing Google account but the verified
+        // google_sub differs, so never silently relink it.
+        res.status(409).json({
+          success: false,
+          message:
+            'This email is already linked to a different Google account.',
+        });
+        return;
+      }
+
       res.status(409).json({
         success: false,
         message:
-          'An account with this email already exists. Please sign in using your password.',
+          'This account has an invalid sign-in configuration. Please contact support.',
       });
       return;
     }
@@ -1950,8 +2129,8 @@ app.post('/api/auth/google', authLimiter, async (req, res, next) => {
         email,
         password_hash,
         google_sub
-      ) VALUES (?, ?, ?, ?)`,
-      [name, email, null, googleSub],
+      ) VALUES (?, ?, NULL, ?)`,
+      [name, email, googleSub],
     );
 
     const user = {
@@ -1974,7 +2153,8 @@ app.post('/api/auth/google', authLimiter, async (req, res, next) => {
     if (error?.code === 'ER_DUP_ENTRY') {
       res.status(409).json({
         success: false,
-        message: 'An account with this Google account or email already exists.',
+        message:
+          'An account with this Google account or email already exists.',
       });
       return;
     }
@@ -1982,6 +2162,100 @@ app.post('/api/auth/google', authLimiter, async (req, res, next) => {
     next(error);
   }
 });
+app.post(
+  '/api/auth/forgot-password',
+  passwordResetLimiter,
+  async (req, res, next) => {
+    try {
+      const result = await requestPasswordReset({
+        db: pool,
+        email: req.body?.email,
+      });
+
+      if (!result.ok) {
+        res.status(result.statusCode || 422).json({
+          success: false,
+          code: result.code,
+          message: result.message,
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: result.message,
+        data: result.data || {},
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  '/api/auth/verify-reset-code',
+  passwordResetLimiter,
+  async (req, res, next) => {
+    try {
+      const result =
+        await verifyPasswordResetCode({
+          db: pool,
+          email: req.body?.email,
+          code: req.body?.code,
+        });
+
+      if (!result.ok) {
+        res.status(result.statusCode || 422).json({
+          success: false,
+          code: result.code,
+          message: result.message,
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: result.message,
+        data: result.data || {},
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  '/api/auth/reset-password',
+  passwordResetLimiter,
+  async (req, res, next) => {
+    try {
+      const result =
+        await completePasswordReset({
+          db: pool,
+          email: req.body?.email,
+          resetToken: req.body?.resetToken,
+          newPassword: req.body?.newPassword,
+        });
+
+      if (!result.ok) {
+        res.status(result.statusCode || 422).json({
+          success: false,
+          code: result.code,
+          message: result.message,
+        });
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: result.message,
+        data: result.data || {},
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 app.get('/api/auth/me', authenticate, async (req, res, next) => {
   try {
@@ -2076,6 +2350,246 @@ app.post('/api/onboarding/complete', authenticate, async (req, res, next) => {
       message: 'Onboarding completed successfully.',
       data: { profile, onboardingCompleted: true },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family', authenticate, async (req, res, next) => {
+  try {
+    const result = await listFamilyHome({
+      pool,
+      actorUserId: req.auth.userId,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/family/invitations', authenticate, async (req, res, next) => {
+  try {
+    const result = await createFamilyInvitation({
+      pool,
+      actorUserId: req.auth.userId,
+      caregiverEmail: req.body?.email,
+      relationshipLabel: req.body?.relationshipLabel,
+      scopes: req.body?.scopes ?? null,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.status(201).json({
+      success: true,
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/family/invitations/:id/accept', authenticate, async (req, res, next) => {
+  try {
+    const result = await acceptFamilyInvitation({
+      pool,
+      actorUserId: req.auth.userId,
+      invitationId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/family/invitations/:id/decline', authenticate, async (req, res, next) => {
+  try {
+    const result = await declineFamilyInvitation({
+      pool,
+      actorUserId: req.auth.userId,
+      invitationId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/family/relationships/:id/permissions', authenticate, async (req, res, next) => {
+  try {
+    const result = await updateFamilyPermissions({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+      scopes: req.body?.scopes,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/family/relationships/:id/revoke', authenticate, async (req, res, next) => {
+  try {
+    const result = await revokeFamilyRelationship({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({
+      success: true,
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family/:id/summary', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilyMemberSummary({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family/:id/care-plans', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilyCarePlans({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family/:id/tasks/today', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilyTodayTasks({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+      date: req.query?.date,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family/:id/care-gaps', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilyCareGaps({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family/:id/simulation', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilySimulation({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+      planId: req.query?.planId,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/family/:id/performance', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilyPerformance({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -5007,6 +5521,7 @@ await ensureRealityCheckPersistenceSchema(pool);
 await ensureMedicalSafetySchema();
 await ensureAdvancedTaskLifecycleSchema();
 await ensureCareContextSchema(pool);
+await ensureFamilyCareSchema(pool);
 
   /*
    * Clean duplicate pending Doctor Questions created by older builds

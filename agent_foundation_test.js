@@ -305,7 +305,7 @@ await test('readAgentSession: stored state is re-sanitized on read so unknown an
     nestedPayload: { deep: { deeper: { blob: 'x'.repeat(5000) } } },
     lastReferencedEntities: Array.from({ length: 60 }, (_, i) => ({
       type: 'care_plan',
-      id: String(i),
+      id: String(i + 1),
     })),
     pendingDraft: Object.fromEntries(
       Array.from({ length: 40 }, (_, i) => [`key${i}`, `value-${i}`]),
@@ -371,7 +371,7 @@ await test('readAgentSession: an oversized stored state fails safe to the empty 
       version: 1,
       lastReferencedEntities: Array.from({ length: 20 }, (_, i) => ({
         type: 'care_plan',
-        id: `plan-${i}-${'a'.repeat(50)}`,
+        id: `${i + 1}${'1'.repeat(50)}`,
       })),
     };
     const pool = sessionPool({ ...sessionRow, state_json: JSON.stringify(oversized) });
@@ -394,7 +394,7 @@ await test('createAgentSession: oversized state is rejected before any database 
       state: {
         lastReferencedEntities: Array.from({ length: 20 }, (_, i) => ({
           type: 'care_plan',
-          id: `plan-${i}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+          id: `${i + 1}${'1'.repeat(50)}`,
         })),
       },
     });
@@ -505,7 +505,7 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
   assert.equal(sanitized.ok, true);
   assert.deepEqual(
     sanitized.state.lastReferencedEntities,
-    [{ type: 'care_plan', id: '7' }, { type: 'document', id: '9' }],
+    [{ type: 'care_plan', id: '7' }],
   );
   assert.deepEqual(
     sanitized.state.pendingConfirmation,

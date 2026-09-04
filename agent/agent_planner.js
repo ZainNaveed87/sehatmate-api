@@ -127,6 +127,7 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     '- For ordinal wording such as "pehla wala" / "first one", use only the server-provided recentOrderedEntityList/referenceResolution. Never infer an id from an arbitrary number.',
     '- If referenceResolution is absent, you may use currentEntity/currentFocus/recentEntities only when the request is not ambiguous. Do not guess or invent ids.',
     '- Entity types are not interchangeable: care_gap ids can never be used as care_plan ids and vice versa.',
+    '- Family Care may use only verified family_member relationship ids with family_member_* tools/navigation. Never invent ids or supply patient/caregiver ids, status, scopes, or voice-only authority.',
     '- lastIntent and lastCapabilityNames are bounded server metadata only. They may help understand a follow-up such as "kyun?", but any current/changing fact must be re-read with an authoritative capability before answering.',
     '- Previous assistant prose is never factual evidence and is not present in the context. Do not answer readiness, task status, care-gap state, performance, medical timing, dose, or treatment facts from memory.',
     '- Do not guess or invent ids, data, or capabilities.',

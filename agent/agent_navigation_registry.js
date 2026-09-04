@@ -40,6 +40,7 @@
 
 import { verifyCarePlanOwnership } from '../services/plan_query_service.js';
 import { verifyCareGapOwnership } from '../services/care_gap_service.js';
+import { verifyFamilyRelationshipReference } from '../services/family_care_service.js';
 import { cleanText, idPattern } from '../services/shared_utils.js';
 
 const ENTITY_TITLE_MAX_LENGTH = 200;
@@ -67,6 +68,19 @@ export const AGENT_NAVIGATION_TARGETS = Object.freeze({
   }),
   care_gap_detail: Object.freeze({
     params: Object.freeze({ careGapId: 'required' }),
+  }),
+  family_care: Object.freeze({ params: Object.freeze({}) }),
+  family_member_detail: Object.freeze({
+    params: Object.freeze({ relationshipId: 'required' }),
+  }),
+  family_member_care_plans: Object.freeze({
+    params: Object.freeze({ relationshipId: 'required' }),
+  }),
+  family_member_care_gaps: Object.freeze({
+    params: Object.freeze({ relationshipId: 'required' }),
+  }),
+  family_member_simulation: Object.freeze({
+    params: Object.freeze({ relationshipId: 'required' }),
   }),
   routine_settings: Object.freeze({ params: Object.freeze({}) }),
   profile: Object.freeze({ params: Object.freeze({}) }),
@@ -249,6 +263,20 @@ export async function authorizeAgentNavigationIntent({ intent, pool, userId }) {
       id: params.careGapId,
       planId: owned.data.planId,
       title: boundedEntityTitle(owned.data.title),
+    };
+  }
+
+  if (params.relationshipId !== undefined) {
+    const verified = await verifyFamilyRelationshipReference({
+      pool,
+      userId,
+      relationshipId: params.relationshipId,
+    });
+    if (!verified.ok) return verified;
+    entity = {
+      type: 'family_member',
+      id: params.relationshipId,
+      title: boundedEntityTitle(verified.data.title),
     };
   }
 

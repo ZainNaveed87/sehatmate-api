@@ -44,6 +44,10 @@
 import { AGENT_NAVIGATION_TARGETS } from './agent_navigation_registry.js';
 import { verifyCarePlanOwnership } from '../services/plan_query_service.js';
 import { verifyCareGapOwnership } from '../services/care_gap_service.js';
+import {
+  listFamilyMemberReferences,
+  verifyFamilyRelationshipReference,
+} from '../services/family_care_service.js';
 import { cleanText, idPattern } from '../services/shared_utils.js';
 import { canonicalAgentLanguage } from './agent_session_store.js';
 
@@ -59,7 +63,7 @@ const AGENT_SCREEN_IDS = Object.freeze(Object.keys(AGENT_NAVIGATION_TARGETS));
  * are intentionally absent: there is no authoritative appointment source
  * yet, so no appointment context may exist either.
  */
-const AGENT_CONTEXT_ENTITY_TYPES = Object.freeze(['care_plan', 'care_gap']);
+const AGENT_CONTEXT_ENTITY_TYPES = Object.freeze(['care_plan', 'care_gap', 'family_member']);
 
 /**
  * Session state may keep up to 20 references (agent_session_state.js),
@@ -172,24 +176,47 @@ export async function verifyAgentEntityOwnership({ pool, userId, entity }) {
     };
   }
 
-  const owned = await verifyCareGapOwnership({
+  if (validated.entity.type === 'care_gap') {
+    const owned = await verifyCareGapOwnership({
+      pool,
+      userId,
+      gapId: validated.entity.id,
+    });
+    if (!owned.ok) {
+      return {
+        ok: false,
+        code: 'ENTITY_NOT_FOUND',
+        message: 'Referenced care gap is not available for this user.',
+      };
+    }
+    return {
+      ok: true,
+      entity: {
+        type: 'care_gap',
+        id: validated.entity.id,
+        planId: owned.data.planId,
+        title: cleanText(owned.data.title, ENTITY_TITLE_MAX_LENGTH),
+      },
+    };
+  }
+
+  const owned = await verifyFamilyRelationshipReference({
     pool,
     userId,
-    gapId: validated.entity.id,
+    relationshipId: validated.entity.id,
   });
   if (!owned.ok) {
     return {
       ok: false,
       code: 'ENTITY_NOT_FOUND',
-      message: 'Referenced care gap is not available for this user.',
+      message: 'Referenced family member is not available for this user.',
     };
   }
   return {
     ok: true,
     entity: {
-      type: 'care_gap',
+      type: 'family_member',
       id: validated.entity.id,
-      planId: owned.data.planId,
       title: cleanText(owned.data.title, ENTITY_TITLE_MAX_LENGTH),
     },
   };
@@ -309,11 +336,19 @@ export async function readAgentConversationStateContext({
     }
   }
 
+  let familyMembers = [];
+  try {
+    familyMembers = await listFamilyMemberReferences({ pool, userId });
+  } catch {
+    familyMembers = [];
+  }
+
   return {
     ok: true,
     currentFocus,
     recentEntities,
     recentOrderedEntityList,
+    familyMembers,
     lastIntent:
       typeof state.lastIntent === 'string' ? cleanText(state.lastIntent, 80) || null : null,
     lastCapabilityNames: Array.isArray(state.lastCapabilityNames)
@@ -363,6 +398,9 @@ export function buildAgentContextSlice({
 
   const currentFocus = conversationContext?.currentFocus || null;
   const ordered = conversationContext?.recentOrderedEntityList || null;
+  const familyMembers = Array.isArray(conversationContext?.familyMembers)
+    ? conversationContext.familyMembers.slice(0, MAX_ORDERED_ENTITIES_IN_SLICE)
+    : [];
 
   return Object.freeze({
     language: canonicalAgentLanguage(language),
@@ -382,6 +420,13 @@ export function buildAgentContextSlice({
           ),
         })
       : null,
+    familyMembers: Object.freeze(
+      familyMembers.map((item) => Object.freeze({
+        type: 'family_member',
+        id: item.id,
+        title: cleanText(item.title, ENTITY_TITLE_MAX_LENGTH),
+      })),
+    ),
     lastIntent: conversationContext?.lastIntent || null,
     lastCapabilityNames: Object.freeze([
       ...(conversationContext?.lastCapabilityNames || []),

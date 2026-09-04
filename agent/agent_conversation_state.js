@@ -8,7 +8,7 @@
 import { AGENT_STATE_LIMITS } from './agent_session_state.js';
 import { cleanText, idPattern } from '../services/shared_utils.js';
 
-const SUPPORTED_ENTITY_TYPES = new Set(['care_plan', 'care_gap']);
+const SUPPORTED_ENTITY_TYPES = new Set(['care_plan', 'care_gap', 'family_member']);
 const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,59}$/;
 
 function canonicalEntityRef(entity) {
@@ -26,6 +26,9 @@ function entityFromArgs(args) {
   }
   if (args.gapId !== undefined) {
     return canonicalEntityRef({ type: 'care_gap', id: args.gapId });
+  }
+  if (args.relationshipId !== undefined) {
+    return canonicalEntityRef({ type: 'family_member', id: args.relationshipId });
   }
   return null;
 }
@@ -67,6 +70,10 @@ export function deriveVerifiedOrderedEntityList(capabilityResults = []) {
       kind = 'care_gap';
       type = 'care_gap';
       rows = result.data.gaps;
+    } else if (entry.name === 'family_members_list' && Array.isArray(result.data?.familyMembers)) {
+      kind = 'family_member';
+      type = 'family_member';
+      rows = result.data.familyMembers;
     }
     if (!rows) continue;
 

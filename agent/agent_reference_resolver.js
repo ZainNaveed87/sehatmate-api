@@ -29,11 +29,13 @@ const URDU_ORDINALS = Object.freeze([
 const LATIN_REFERENCE_PATTERNS = [
   /\biska\b/i, /\biski\b/i, /\biske\b/i, /\bus wala\b/i, /\bus wali\b/i,
   /\bye wala\b/i, /\byeh wala\b/i, /\bye wali\b/i, /\byeh wali\b/i,
+  /\bunke\b/i, /\bunki\b/i, /\bunka\b/i, /\btheir\b/i,
   /\bthis one\b/i, /\bthat one\b/i, /\bsame plan\b/i, /\bsame gap\b/i,
   /\bthis plan\b/i, /\bthat plan\b/i, /\bthis gap\b/i, /\bthat gap\b/i,
 ];
 const URDU_REFERENCE_PHRASES = [
   'اس کا', 'اس کی', 'اس کے', 'یہ والا', 'یہ والی', 'وہ والا', 'وہ والی',
+  'ان کا', 'ان کی', 'ان کے',
   'اسی پلان', 'اسی منصوبے', 'اسی گیپ', 'اسی خلا',
 ];
 
@@ -91,6 +93,9 @@ function hasPronounReference(message) {
 
 function referenceEntityTypeHint(message) {
   const normalized = normalizeSearchText(message);
+  if (/\b(?:family|member|ammi|abu|ami|abba|mother|father|patient)\b/.test(normalized)) {
+    return 'family_member';
+  }
   if (/\b(?:same|this|that)\s+plan\b/.test(normalized) || normalized.includes('care plan')) {
     return 'care_plan';
   }
@@ -111,9 +116,11 @@ function titleMatches(message, entity) {
   return haystack.includes(title);
 }
 
-function explicitCarePlanMatches({ message, existingEntities }) {
+function explicitEntityMatches({ message, existingEntities }) {
   return dedupeEntities(existingEntities).filter(
-    (entity) => entity.type === 'care_plan' && titleMatches(message, entity),
+    (entity) =>
+      (entity.type === 'care_plan' || entity.type === 'family_member') &&
+      titleMatches(message, entity),
   );
 }
 
@@ -129,6 +136,7 @@ export async function resolveAgentConversationReference({
   currentFocus = null,
   recentEntities = [],
   recentOrderedEntityList = null,
+  familyMembers = [],
 }) {
   const orderedEntities = Array.isArray(recentOrderedEntityList?.entities)
     ? recentOrderedEntityList.entities
@@ -138,9 +146,10 @@ export async function resolveAgentConversationReference({
     ...(currentFocus ? [currentFocus] : []),
     ...recentEntities,
     ...orderedEntities,
+    ...familyMembers,
   ]);
 
-  const explicitMatches = explicitCarePlanMatches({
+  const explicitMatches = explicitEntityMatches({
     message,
     existingEntities: allKnown,
   });
@@ -196,6 +205,9 @@ function plannedEntityReferences(plan) {
     if (call?.args?.gapId !== undefined) {
       refs.push({ type: 'care_gap', id: String(call.args.gapId), source: `capability:${call.name}` });
     }
+    if (call?.args?.relationshipId !== undefined) {
+      refs.push({ type: 'family_member', id: String(call.args.relationshipId), source: `capability:${call.name}` });
+    }
   }
   const params = plan?.navigationIntent?.params || {};
   if (params.carePlanId !== undefined) {
@@ -203,6 +215,9 @@ function plannedEntityReferences(plan) {
   }
   if (params.careGapId !== undefined) {
     refs.push({ type: 'care_gap', id: String(params.careGapId), source: `navigation:${plan.navigationIntent.target}` });
+  }
+  if (params.relationshipId !== undefined) {
+    refs.push({ type: 'family_member', id: String(params.relationshipId), source: `navigation:${plan.navigationIntent.target}` });
   }
   return refs;
 }
@@ -256,9 +271,9 @@ export function localizedReferenceClarification({ language, resolution, code = n
     .slice(0, 3);
 
   if (code === 'AGENT_REFERENCE_TYPE_MISMATCH') {
-    if (lang === 'ur') return 'یہ حوالہ اس درخواست کے لیے درست قسم کا نہیں ہے۔ براہ کرم متعلقہ care plan یا care gap واضح کریں۔';
-    if (lang === 'roman_ur') return 'Yeh reference is request ke liye sahi type ka nahi hai. Relevant care plan ya care gap clear karein.';
-    return 'That reference is not the right type for this request. Please specify the relevant care plan or care gap.';
+    if (lang === 'ur') return 'یہ حوالہ اس درخواست کے لیے درست قسم کا نہیں ہے۔ براہ کرم متعلقہ family member، care plan یا care gap واضح کریں۔';
+    if (lang === 'roman_ur') return 'Yeh reference is request ke liye sahi type ka nahi hai. Relevant family member, care plan ya care gap clear karein.';
+    return 'That reference is not the right type for this request. Please specify the relevant family member, care plan, or care gap.';
   }
 
   if (resolution?.status === 'ambiguous') {
@@ -268,7 +283,7 @@ export function localizedReferenceClarification({ language, resolution, code = n
     return `Which one do you mean?${suffix}`;
   }
 
-  if (lang === 'ur') return 'براہ کرم واضح کریں کہ آپ کس care plan یا care gap کی بات کر رہے ہیں۔';
-  if (lang === 'roman_ur') return 'Please clear karein ke aap kis care plan ya care gap ki baat kar rahe hain.';
-  return 'Please specify which care plan or care gap you mean.';
+  if (lang === 'ur') return 'براہ کرم واضح کریں کہ آپ کس family member، care plan یا care gap کی بات کر رہے ہیں۔';
+  if (lang === 'roman_ur') return 'Please clear karein ke aap kis family member, care plan ya care gap ki baat kar rahe hain.';
+  return 'Please specify which family member, care plan, or care gap you mean.';
 }
