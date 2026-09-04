@@ -383,7 +383,7 @@ export function createAgentVoiceProvider(overrides = {}) {
             max_tokens: 700,
             reasoning: { effort: 'none', exclude: true },
             response_format: { type: 'json_object' },
-            provider: { data_collection: 'deny' },
+            provider: { data_collection: 'allow' },
           },
           config,
           timeoutMs,
