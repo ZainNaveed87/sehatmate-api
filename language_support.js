@@ -115,6 +115,8 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'The SehatMate assistant is currently unavailable.',
     agentPermissionDenied:
       'I cannot make changes to your medicines, doses, times, or care plan. Nothing was changed, and your verified plan stays exactly as it is.',
+    teachBackCannotAssess:
+      'I cannot safely assess this answer from the current verified plan information. Nothing was changed.',
   }),
   Urdu: Object.freeze({
     noActiveIngredientReadable:
@@ -165,6 +167,8 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'SehatMate اسسٹنٹ فی الحال دستیاب نہیں ہے۔',
     agentPermissionDenied:
       'میں آپ کی دواؤں، خوراک، اوقات یا دیکھ بھال کے منصوبے میں تبدیلی نہیں کر سکتا۔ کچھ بھی تبدیل نہیں ہوا، اور آپ کا تصدیق شدہ منصوبہ بالکل ویسا ہی ہے۔',
+    teachBackCannotAssess:
+      'موجودہ تصدیق شدہ منصوبے کی معلومات سے اس جواب کو محفوظ طور پر جانچا نہیں جا سکتا۔ کچھ بھی تبدیل نہیں ہوا۔',
   }),
   'Roman Urdu': Object.freeze({
     noActiveIngredientReadable:
@@ -215,6 +219,8 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'SehatMate assistant filhal available nahi hai.',
     agentPermissionDenied:
       'Main aap ki medicines, dose, timings ya care plan mein change nahi kar sakta. Kuch bhi change nahi hua, aur aap ka verified plan bilkul waisa hi hai.',
+    teachBackCannotAssess:
+      'Current verified plan information se is jawab ko safely assess nahi kiya ja sakta. Kuch bhi change nahi hua.',
   }),
 });
 

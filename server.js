@@ -107,6 +107,14 @@ import {
 } from './services/plan_query_service.js';
 
 import {
+  assessTeachBackAnswer,
+  ensureTeachBackSchema,
+  listTeachBackTargets,
+  readTeachBackHistory,
+  readTeachBackSession,
+} from './services/teach_back_service.js';
+
+import {
   listCareGaps,
   readCareGapDetail,
   updateCareGapLifecycle,
@@ -192,6 +200,15 @@ const serviceErrorStatusByCode = {
   FAMILY_RELATIONSHIP_NOT_ACTIVE: 403,
   FAMILY_PERMISSION_DENIED: 403,
   FAMILY_PERMISSION_MANAGE_DENIED: 403,
+  INVALID_TEACH_BACK_TARGET_TYPE: 422,
+  INVALID_TEACH_BACK_TARGET_ID: 422,
+  INVALID_TEACH_BACK_QUESTION: 422,
+  INVALID_TEACH_BACK_ANSWER: 422,
+  TEACH_BACK_CLIENT_USER_ID_REJECTED: 422,
+  TEACH_BACK_ANSWER_TOO_LARGE: 413,
+  TEACH_BACK_TARGET_NOT_FOUND: 404,
+  TEACH_BACK_PROVIDER_MALFORMED: 502,
+  TEACH_BACK_PROVIDER_FAILED: 502,
 };
 
 function sendServiceError(res, result) {
@@ -333,6 +350,17 @@ const agentLimiter = rateLimit({
   message: {
     success: false,
     message: 'Too many agent requests. Please try again later.',
+  },
+});
+
+const teachBackLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many Teach Back requests. Please try again later.',
   },
 });
 
@@ -2285,6 +2313,96 @@ app.get('/api/auth/me', authenticate, async (req, res, next) => {
         onboardingCompleted: Boolean(rows[0].onboarding_completed),
       },
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/teach-back/targets', authenticate, async (req, res, next) => {
+  try {
+    const result = await listTeachBackTargets({
+      pool,
+      userId: req.auth.userId,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/teach-back/session/:targetType/:targetId', authenticate, async (req, res, next) => {
+  try {
+    const result = await readTeachBackSession({
+      pool,
+      userId: req.auth.userId,
+      targetType: req.params.targetType,
+      targetId: req.params.targetId,
+      preferredLanguage: await preferredLanguageForRequest(req),
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/teach-back/assess', authenticate, teachBackLimiter, async (req, res, next) => {
+  try {
+    const result = await assessTeachBackAnswer({
+      pool,
+      userId: req.auth.userId,
+      targetType: req.body?.targetType,
+      targetId: req.body?.targetId,
+      questionId: req.body?.questionId,
+      answer: req.body?.answer,
+      clientUserId: req.body?.userId ?? req.body?.user_id,
+      preferredLanguage: await preferredLanguageForRequest(req),
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    if (result.data?.aiUsage) {
+      await logAiUsage({
+        userId: req.auth.userId,
+        carePlanId: result.data.target?.carePlanId || null,
+        result: result.data.aiUsage,
+        status: 'success',
+        featureName: 'teach_back_assessment',
+      });
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/teach-back/history', authenticate, async (req, res, next) => {
+  try {
+    const result = await readTeachBackHistory({
+      pool,
+      userId: req.auth.userId,
+      targetType: req.query?.targetType,
+      targetId: req.query?.targetId,
+      limit: req.query?.limit,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
   } catch (error) {
     next(error);
   }
@@ -5522,6 +5640,7 @@ await ensureMedicalSafetySchema();
 await ensureAdvancedTaskLifecycleSchema();
 await ensureCareContextSchema(pool);
 await ensureFamilyCareSchema(pool);
+await ensureTeachBackSchema(pool);
 
   /*
    * Clean duplicate pending Doctor Questions created by older builds

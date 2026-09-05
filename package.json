@@ -20,7 +20,8 @@
     "test:services": "node services_boundary_test.js",
     "test:performance": "node performance_summary_test.js",
     "test:agent-phase-b": "node agent_phase_b_test.js",
-    "test:agent-foundation": "node agent_foundation_test.js"
+    "test:agent-foundation": "node agent_foundation_test.js",
+    "test:teach-back": "node teach_back_test.js"
   },
   "engines": {
     "node": ">=20"
