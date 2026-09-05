@@ -128,7 +128,14 @@ import {
 } from './services/simulation_service.js';
 
 import {
+  deleteDocument,
+  listDocuments,
+  readDocumentFile,
+} from './services/document_service.js';
+
+import {
   readTaskOutcomeSummary,
+  readProgressSummary,
   readTodayTasksState,
 } from './services/performance_summary_service.js';
 
@@ -204,9 +211,12 @@ const serviceErrorStatusByCode = {
   INVALID_TEACH_BACK_TARGET_ID: 422,
   INVALID_TEACH_BACK_QUESTION: 422,
   INVALID_TEACH_BACK_ANSWER: 422,
+  INVALID_DOCUMENT_ID: 422,
+  PROGRESS_INVALID_WINDOW: 422,
   TEACH_BACK_CLIENT_USER_ID_REJECTED: 422,
   TEACH_BACK_ANSWER_TOO_LARGE: 413,
   TEACH_BACK_TARGET_NOT_FOUND: 404,
+  DOCUMENT_NOT_FOUND: 404,
   TEACH_BACK_PROVIDER_MALFORMED: 502,
   TEACH_BACK_PROVIDER_FAILED: 502,
 };
@@ -3069,78 +3079,65 @@ app.post(
   },
 );
 
-app.get('/api/documents/:id/file', authenticate, async (req, res, next) => {
-  const documentId = req.params.id;
-  if (!idPattern.test(documentId)) {
-    res.status(422).json({ success: false, message: 'Invalid document ID.' });
-    return;
-  }
-
+app.get('/api/documents', authenticate, async (req, res, next) => {
   try {
-    const [rows] = await pool.execute(
-      `SELECT original_name, mime_type, file_size_bytes, file_data
-       FROM care_documents WHERE id = ? AND user_id = ? LIMIT 1`,
-      [documentId, req.auth.userId],
-    );
-    const document = rows[0];
-    if (!document || !document.file_data) {
-      res.status(404).json({ success: false, message: 'Document file not found.' });
+    const result = await listDocuments({
+      pool,
+      userId: req.auth.userId,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
       return;
     }
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
 
-    const fallbackName = safeDocumentName(document.original_name)
+app.get('/api/documents/:id/file', authenticate, async (req, res, next) => {
+  try {
+    const result = await readDocumentFile({
+      pool,
+      userId: req.auth.userId,
+      documentId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+    const document = result.data.document;
+
+    const fallbackName = safeDocumentName(document.originalName)
       .replace(/[^A-Za-z0-9._-]/g, '_');
-    res.setHeader('Content-Type', document.mime_type);
-    res.setHeader('Content-Length', String(document.file_size_bytes));
+    res.setHeader('Content-Type', document.mimeType);
+    res.setHeader('Content-Length', String(document.fileSizeBytes));
     res.setHeader(
       'Content-Disposition',
-      `inline; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(document.original_name)}`,
+      `inline; filename="${fallbackName}"; filename*=UTF-8''${encodeURIComponent(document.originalName)}`,
     );
     res.setHeader('Cache-Control', 'private, no-store');
-    res.send(document.file_data);
+    res.send(document.fileData);
   } catch (error) {
     next(error);
   }
 });
 
 app.delete('/api/documents/:id', authenticate, async (req, res, next) => {
-  const documentId = req.params.id;
-  if (!idPattern.test(documentId)) {
-    res.status(422).json({ success: false, message: 'Invalid document ID.' });
-    return;
-  }
-
   try {
-    const [documents] = await pool.execute(
-      `SELECT id, care_plan_id FROM care_documents
-       WHERE id = ? AND user_id = ? LIMIT 1`,
-      [documentId, req.auth.userId],
-    );
-    const document = documents[0];
-    if (!document) {
-      res.status(404).json({ success: false, message: 'Document not found.' });
+    const result = await deleteDocument({
+      pool,
+      userId: req.auth.userId,
+      documentId: req.params.id,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
       return;
-    }
-
-    await pool.execute(
-      'DELETE FROM care_documents WHERE id = ? AND user_id = ?',
-      [documentId, req.auth.userId],
-    );
-    const [[counts]] = await pool.execute(
-      'SELECT COUNT(*) AS document_count FROM care_documents WHERE care_plan_id = ?',
-      [document.care_plan_id],
-    );
-    if (Number(counts.document_count || 0) === 0) {
-      await pool.execute(
-        `UPDATE care_plans SET status = 'draft'
-         WHERE id = ? AND user_id = ? AND status = 'processing'`,
-        [document.care_plan_id, req.auth.userId],
-      );
     }
 
     await refreshCareGaps({
       db: pool,
-      planId: String(document.care_plan_id),
+      planId: result.data.carePlanId,
       userId: req.auth.userId,
       realityQuestionTemplates,
     });
@@ -5060,6 +5057,23 @@ app.get('/api/task-outcomes/summary', authenticate, async (req, res, next) => {
       userId: req.auth.userId,
       endDate: req.query?.endDate,
       today: req.query?.today,
+      days: req.query?.days,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/progress/summary', authenticate, async (req, res, next) => {
+  try {
+    const result = await readProgressSummary({
+      pool,
+      userId: req.auth.userId,
       days: req.query?.days,
     });
     if (!result.ok) {

@@ -615,6 +615,106 @@ export async function readTeachBackSession({
   };
 }
 
+export async function readCurrentPlanUnderstanding({
+  pool,
+  userId,
+  planId,
+  preferredLanguage = 'English',
+}) {
+  if (!idPattern.test(cleanText(planId, 20))) {
+    return serviceFailure(
+      'INVALID_PLAN_ID',
+      'Invalid care plan ID.',
+    );
+  }
+
+  const [plans] = await pool.execute(
+    'SELECT id, title FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
+    [planId, userId],
+  );
+  const plan = plans[0];
+  if (!plan) {
+    return serviceFailure(
+      'PLAN_NOT_FOUND',
+      'Care plan not found.',
+    );
+  }
+
+  const [instructions] = await pool.execute(
+    `SELECT i.id, i.care_plan_id, i.title, i.instruction, i.timing,
+      i.verified_at, p.title AS plan_title, p.updated_at AS plan_updated_at
+     FROM extracted_instructions i
+     JOIN care_plans p ON p.id = i.care_plan_id
+     WHERE i.care_plan_id = ?
+       AND p.user_id = ?
+       AND i.review_status = 'verified'
+       AND NULLIF(TRIM(i.title), '') IS NOT NULL
+       AND NULLIF(TRIM(i.instruction), '') IS NOT NULL
+     ORDER BY i.id
+     LIMIT ${TEACH_BACK_LIMITS.maxTargets}`,
+    [planId, userId],
+  );
+
+  const [scheduleItems] = await pool.execute(
+    `SELECT s.id, s.care_plan_id, s.instruction_id, s.title,
+      s.schedule_date, TIME_FORMAT(s.schedule_time, '%H:%i') AS schedule_time,
+      s.display_time, s.recurrence_text, s.reason, s.grounding,
+      i.title AS instruction_title, i.instruction, i.timing AS instruction_timing,
+      i.review_status, i.verified_at,
+      p.title AS plan_title, p.updated_at AS plan_updated_at
+     FROM care_schedule_items s
+     JOIN care_plans p ON p.id = s.care_plan_id
+     LEFT JOIN extracted_instructions i ON i.id = s.instruction_id
+     WHERE s.care_plan_id = ?
+       AND s.user_id = ?
+       AND p.user_id = ?
+       AND (s.instruction_id IS NULL OR i.review_status = 'verified')
+       AND NULLIF(TRIM(s.title), '') IS NOT NULL
+     ORDER BY s.id
+     LIMIT ${TEACH_BACK_LIMITS.maxTargets}`,
+    [planId, userId, userId],
+  );
+
+  const contexts = [
+    ...instructions.map(instructionContext),
+    ...scheduleItems.map(scheduleContext),
+  ]
+    .filter(contextHasEnoughInformation)
+    .slice(0, TEACH_BACK_LIMITS.maxTargets);
+
+  const completedResults = [];
+  for (const context of contexts) {
+    const questions = buildTeachBackQuestions(context, preferredLanguage);
+    const attemptsByQuestion = await latestAttemptsForQuestions({
+      pool,
+      userId,
+      context,
+      questions,
+    });
+    const finalResult = finalResultFromAttempts(questions, attemptsByQuestion);
+    if (finalResult.completed) {
+      completedResults.push(finalResult);
+    }
+  }
+
+  const score = completedResults.length
+    ? Math.round(
+        completedResults.reduce((sum, result) => sum + Number(result.score || 0), 0) /
+          completedResults.length,
+      )
+    : null;
+
+  return {
+    ok: true,
+    data: {
+      available: score !== null,
+      score,
+      planId: String(plan.id),
+      planTitle: displayText(plan.title, 160) || 'Care plan',
+    },
+  };
+}
+
 function normalizeAssessmentFocus(value) {
   const normalized = cleanText(value, 60).toLowerCase();
   return ASSESSMENT_FOCUS_ALIASES[normalized] || null;

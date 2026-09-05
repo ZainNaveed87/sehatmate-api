@@ -69,6 +69,14 @@ import {
 
 import { readSimulationState } from './simulation_service.js';
 
+import {
+  careGapSummary,
+} from '../care_gap_engine.js';
+
+import {
+  readCurrentPlanUnderstanding,
+} from './teach_back_service.js';
+
 /**
  * Verbatim extraction of the GET /api/task-occurrences handler.
  *
@@ -317,6 +325,34 @@ function completionRateFor(summary) {
   return Math.round((completed / scheduled) * 100);
 }
 
+function normalizeProgressWindowDays(value) {
+  if (value === null || value === undefined || value === '') {
+    return { ok: true, days: 7 };
+  }
+  const text = String(value).trim();
+  if (!/^\d+$/.test(text)) {
+    return {
+      ok: false,
+      code: 'PROGRESS_INVALID_WINDOW',
+      message: 'Choose a progress window between 1 and 31 days.',
+    };
+  }
+  const parsed = Number.parseInt(text, 10);
+  return {
+    ok: true,
+    days: Math.max(1, Math.min(31, parsed)),
+  };
+}
+
+function trendPointFor(day) {
+  return {
+    date: day.date,
+    scheduled: Number(day.scheduled || 0),
+    completed: Number(day.completed || 0),
+    value: completionRateFor(day),
+  };
+}
+
 /**
  * Deterministic next-task derivation shared by the performance summary and
  * the future get_next_task capability: the first pending occurrence in the
@@ -525,6 +561,111 @@ export async function readPerformanceSummary({
       primaryPlan,
       realityCheck,
       simulation,
+    },
+  };
+}
+
+export async function readProgressSummary({
+  pool,
+  userId,
+  today = null,
+  days = null,
+}) {
+  const window = normalizeProgressWindowDays(days);
+  if (!window.ok) return window;
+
+  const clientToday = taskOutcomeDate(today) || serverDateKey();
+  const performance = await readPerformanceSummary({
+    pool,
+    userId,
+    today: clientToday,
+    periodDays: window.days,
+  });
+  if (!performance.ok) return performance;
+
+  const taskOutcomes = await readTaskOutcomeSummary({
+    pool,
+    userId,
+    endDate: clientToday,
+    today: clientToday,
+    days: window.days,
+  });
+  if (!taskOutcomes.ok) return taskOutcomes;
+
+  const [activePlans] = await pool.execute(
+    `SELECT id, title
+     FROM care_plans
+     WHERE user_id = ? AND status = 'active'
+     ORDER BY activated_at DESC, id DESC`,
+    [userId],
+  );
+
+  const [gapRows] = await pool.execute(
+    `SELECT g.lifecycle_status, g.severity
+     FROM care_gaps g
+     JOIN care_plans p ON p.id = g.care_plan_id
+     WHERE p.user_id = ?
+       AND p.status = 'active'`,
+    [userId],
+  );
+
+  const primaryPlan = performance.data.primaryPlan;
+  let understanding = {
+    available: false,
+    score: null,
+    planId: primaryPlan?.id || null,
+    planTitle: primaryPlan?.title || null,
+  };
+  if (primaryPlan) {
+    const currentUnderstanding = await readCurrentPlanUnderstanding({
+      pool,
+      userId,
+      planId: primaryPlan.id,
+    });
+    if (currentUnderstanding.ok) {
+      understanding = currentUnderstanding.data;
+    }
+  }
+
+  const summary = taskOutcomes.data.summary;
+  const activePlanCount = Number(activePlans.length || 0);
+  const readinessScore = Number(performance.data.today?.summary?.careReadiness);
+  const readinessAvailable =
+    activePlanCount > 0 && Number.isFinite(readinessScore);
+
+  return {
+    ok: true,
+    data: {
+      date: clientToday,
+      windowDays: window.days,
+      activePlanCount,
+      primaryPlan,
+      readiness: {
+        available: readinessAvailable,
+        score: readinessAvailable ? readinessScore : null,
+      },
+      tasks: {
+        scheduled: Number(summary.scheduled || 0),
+        completed: Number(summary.completed || 0),
+        skipped: Number(summary.skipped || 0),
+        missed: Number(summary.missed || 0),
+        pending: Number(summary.pending || 0),
+        completionRate: completionRateFor(summary),
+      },
+      gaps: (() => {
+        const summaryValue = careGapSummary(gapRows);
+        return {
+          total: summaryValue.total,
+          open: summaryValue.open,
+          inProgress: summaryValue.inProgress,
+          resolved: summaryValue.resolved,
+        };
+      })(),
+      understanding,
+      trend: {
+        metric: 'task_completion_rate',
+        points: taskOutcomes.data.daily.map(trendPointFor),
+      },
     },
   };
 }
