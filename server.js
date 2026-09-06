@@ -4724,6 +4724,18 @@ app.patch('/api/doctor-questions/:id', authenticate, async (req, res, next) => {
 app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => {
   const planId = req.params.id;
   const nextStatus = cleanText(req.body?.status, 30);
+  const rawToday = cleanText(req.body?.today, 10);
+  const clientToday = rawToday ? taskOutcomeDate(rawToday) : null;
+
+  if (rawToday && !clientToday) {
+    res.status(422).json({
+      success: false,
+      message: 'Enter a valid local date.',
+    });
+    return;
+  }
+
+  const lifecycleToday = clientToday || serverDateKey();
   if (!idPattern.test(planId) || !carePlanStatuses.has(nextStatus)) {
     res.status(422).json({
       success: false,
@@ -4749,34 +4761,27 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
         message: `Care plan cannot move from ${plan.status} to ${nextStatus}.`,
       });
       return;
-    }
-
-    if (nextStatus === 'active') {
-      if (plan.duration_mode !== 'ongoing' && !plan.planned_end_date) {
-        res.status(409).json({ success: false, message: 'Choose the plan duration before activation.' });
-        return;
-      }
-
-      // A completed finite plan can only be reactivated while its selected
-      // plan end date is still valid. This prevents an expired plan from being
-      // silently restarted by an accidental Reactivate tap.
-      if (
-        plan.status === 'completed' &&
-        plan.duration_mode !== 'ongoing'
-      ) {
+}   if (nextStatus === 'active') {
+      if (plan.duration_mode !== 'ongoing') {
         const plannedEnd = dbDateKey(plan.planned_end_date);
-        const today = serverDateKey();
-        if (plannedEnd && plannedEnd < today) {
+
+        if (!plannedEnd) {
           res.status(409).json({
             success: false,
-            message:
-              'This care plan has already reached its selected end date. Review the plan duration before reactivating it.',
+            message: 'Choose the plan duration before activation.',
+          });
+          return;
+        }
+
+        if (plannedEnd < lifecycleToday) {
+          res.status(409).json({
+            success: false,
+            message:  'This care plan has already reached its selected end date. Review the plan duration before activating it.',
           });
           return;
         }
       }
-      const [instructionRows] = await pool.execute(
-        `SELECT review_status
+      const [instructionRows] = await pool.execute( `SELECT review_status
          FROM extracted_instructions WHERE care_plan_id = ?`,
         [planId],
       );
