@@ -15,7 +15,7 @@
  *   - No stale model slug: the model comes from the existing
  *     environment-controlled OPENROUTER_MODEL configuration through
  *     aiConfiguration(); this module never names a model.
- *   - Bounded: exactly ONE attempt per turn (zero retries by design), the
+ *   - Bounded: exactly ONE transport attempt per provider call, the
  *     existing 45-second abort timeout of ai_service.js, deterministic
  *     temperature 0, and fixed per-purpose output-token caps that callers
  *     cannot raise.
@@ -199,7 +199,7 @@ export function createAgentProvider(overrides = {}) {
 
     /**
      * One structured planning completion. Language-neutral and bounded to
-     * the planning token cap; single attempt, no retries.
+     * the planning token cap; single transport attempt.
      */
     async planAgentTurn({ systemPrompt, userPrompt }) {
       return structuredCompletion({

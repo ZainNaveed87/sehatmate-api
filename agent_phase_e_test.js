@@ -416,6 +416,22 @@ await test('explicit current-turn title overrides stale currentFocus', async () 
   assert.equal(result.entity.id, '21');
 });
 
+await test('explicit duplicate care-plan title is ambiguous', async () => {
+  const result = await resolveAgentConversationReference({
+    pool: createPool(),
+    userId: USER,
+    message: 'Morning Plan dikhao',
+    recentEntities: [
+      { type: 'care_plan', id: '17', title: 'Morning Plan' },
+      { type: 'care_plan', id: '21', title: 'Morning Plan' },
+    ],
+  });
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(result.source, 'explicit_current_turn');
+  assert.equal(result.entity, null);
+  assert.deepEqual(result.candidates.map((entity) => entity.id), ['17', '21']);
+});
+
 await test('resolved reference rejects planner id invention', async () => {
   const reviewed = reviewPlanAgainstResolvedReference({
     resolution: { status: 'resolved', entity: { type: 'care_plan', id: '17' } },
@@ -621,18 +637,13 @@ await test('core resolves pehla wala from verified ordered list and navigates ex
       },
     },
   });
-  const provider = plannedProvider({
-    intent: 'open_first_plan',
-    capabilityCalls: [],
-    navigationIntent: { target: 'care_plan_detail', params: { carePlanId: '17' } },
-  });
+  const provider = zeroCallProvider();
   const result = await handleAgentMessage({
     pool, userId: USER, sessionId: SESSION_ID, message: 'pehla wala kholo', provider: provider.provider,
   });
   assert.equal(result.ok, true);
   assert.deepEqual(result.navigation, { target: 'care_plan_detail', params: { carePlanId: '17' } });
-  assert.equal(provider.calls.plan, 1);
-  assert.equal(provider.calls.reply, 0);
+  assert.equal(provider.calls, 0);
   assert.deepEqual(pool.state.currentFocus, { type: 'care_plan', id: '17' });
 });
 
@@ -675,12 +686,7 @@ await test('real two-turn ordinal reference stores list then opens first care pl
   });
   assert.equal(pool.sessionLanguage, 'roman_ur');
 
-  const capture = { planPrompts: [] };
-  const openProvider = plannedProvider({
-    intent: 'open_resolved_care_plan',
-    capabilityCalls: [],
-    navigationIntent: { target: 'care_plan_detail', params: {} },
-  }, { capture });
+  const openProvider = zeroCallProvider();
 
   const second = await handleAgentMessage({
     pool,
@@ -700,12 +706,7 @@ await test('real two-turn ordinal reference stores list then opens first care pl
   assert.deepEqual(second.referencedEntities, [
     { type: 'care_plan', id: '17', title: 'Prescription Plan' },
   ]);
-  assert.match(
-    capture.planPrompts[0],
-    /"referenceResolution":\{"status":"resolved","source":"ordinal","entity":\{"type":"care_plan","id":"17"\}\}/,
-  );
-  assert.equal(openProvider.calls.plan, 1);
-  assert.equal(openProvider.calls.reply, 0);
+  assert.equal(openProvider.calls, 0);
 });
 
 await test('real two-turn ordinal reference opens second care plan', async () => {
@@ -739,12 +740,7 @@ await test('real two-turn ordinal reference opens second care plan', async () =>
     '21',
   ]);
 
-  const capture = { planPrompts: [] };
-  const openProvider = plannedProvider({
-    intent: 'open_resolved_care_plan',
-    capabilityCalls: [],
-    navigationIntent: { target: 'care_plan_detail', params: {} },
-  }, { capture });
+  const openProvider = zeroCallProvider();
 
   const second = await handleAgentMessage({
     pool,
@@ -764,10 +760,7 @@ await test('real two-turn ordinal reference opens second care plan', async () =>
   assert.deepEqual(second.referencedEntities, [
     { type: 'care_plan', id: '21', title: 'Exercise Plan' },
   ]);
-  assert.match(
-    capture.planPrompts[0],
-    /"referenceResolution":\{"status":"resolved","source":"ordinal","entity":\{"type":"care_plan","id":"21"\}\}/,
-  );
+  assert.equal(openProvider.calls, 0);
 });
 
 await test('real two-turn pronoun reference with two care plans asks clarification', async () => {
@@ -817,7 +810,7 @@ await test('real two-turn pronoun reference with two care plans asks clarificati
   assert.equal(provider.calls, 0);
 });
 
-await test('two-turn ordinal reference rejects planner substitution of another plan', async () => {
+await test('two-turn ordinal read rejects planner substitution of another plan', async () => {
   const pool = createPool({
     plans: [
       { id: '17', title: 'Prescription Plan' },
@@ -857,7 +850,7 @@ await test('two-turn ordinal reference rejects planner substitution of another p
     pool,
     userId: USER,
     sessionId: SESSION_ID,
-    message: 'pehla wala dikhao',
+    message: 'pehla wala batao',
     provider: badProvider.provider,
   });
 
@@ -869,7 +862,7 @@ await test('two-turn ordinal reference rejects planner substitution of another p
   assert.equal(badProvider.calls.reply, 0);
 });
 
-await test('care-plan list keeps ordered list through first and second detail reads', async () => {
+await test('care-plan list keeps ordered list through first and second navigation opens', async () => {
   const pool = createPool({
     plans: [
       { id: '17', title: 'Prescription Plan' },
@@ -888,7 +881,7 @@ await test('care-plan list keeps ordered list through first and second detail re
   assert.equal(first.fallbackCode, undefined);
   assertOrderedIds(pool, 'care_plan', ['17', '21']);
 
-  const secondProvider = readResolvedCarePlanProvider();
+  const secondProvider = zeroCallProvider();
   const second = await handleAgentMessage({
     pool,
     userId: USER,
@@ -899,11 +892,17 @@ await test('care-plan list keeps ordered list through first and second detail re
   assert.equal(second.ok, true);
   assert.equal(second.language, 'roman_ur');
   assert.equal(second.fallbackCode, undefined);
-  assert.equal(second.navigation, null);
-  assert.deepEqual(second.referencedEntities, [{ type: 'care_plan', id: '17' }]);
+  assert.deepEqual(second.navigation, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '17' },
+  });
+  assert.deepEqual(second.referencedEntities, [
+    { type: 'care_plan', id: '17', title: 'Prescription Plan' },
+  ]);
+  assert.equal(secondProvider.calls, 0);
   assertOrderedIds(pool, 'care_plan', ['17', '21']);
 
-  const thirdProvider = readResolvedCarePlanProvider();
+  const thirdProvider = zeroCallProvider();
   const third = await handleAgentMessage({
     pool,
     userId: USER,
@@ -914,13 +913,19 @@ await test('care-plan list keeps ordered list through first and second detail re
   assert.equal(third.ok, true);
   assert.equal(third.language, 'roman_ur');
   assert.equal(third.fallbackCode, undefined);
-  assert.equal(third.navigation, null);
-  assert.deepEqual(third.referencedEntities, [{ type: 'care_plan', id: '21' }]);
+  assert.deepEqual(third.navigation, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '21' },
+  });
+  assert.deepEqual(third.referencedEntities, [
+    { type: 'care_plan', id: '21', title: 'Exercise Plan' },
+  ]);
   assert.doesNotMatch(third.reply, /clear karein|complete nahi kar saka/i);
+  assert.equal(thirdProvider.calls, 0);
   assertOrderedIds(pool, 'care_plan', ['17', '21']);
 });
 
-await test('care-gap list keeps ordered list through first and second detail reads', async () => {
+await test('care-gap list keeps ordered list through first and second navigation opens', async () => {
   const pool = createPool({
     plans: [{ id: '17', title: 'Prescription Plan' }],
     gaps: [
@@ -947,7 +952,7 @@ await test('care-gap list keeps ordered list through first and second detail rea
   assert.equal(first.fallbackCode, undefined);
   assertOrderedIds(pool, 'care_gap', ['301', '302']);
 
-  const secondProvider = readResolvedCareGapProvider();
+  const secondProvider = zeroCallProvider();
   const second = await handleAgentMessage({
     pool,
     userId: USER,
@@ -957,10 +962,17 @@ await test('care-gap list keeps ordered list through first and second detail rea
   });
   assert.equal(second.ok, true);
   assert.equal(second.fallbackCode, undefined);
-  assert.deepEqual(second.referencedEntities, [{ type: 'care_gap', id: '301' }]);
+  assert.deepEqual(second.navigation, {
+    target: 'care_gap_detail',
+    params: { careGapId: '301' },
+  });
+  assert.deepEqual(second.referencedEntities, [
+    { type: 'care_gap', id: '301', title: 'Morning dose needs a time' },
+  ]);
+  assert.equal(secondProvider.calls, 0);
   assertOrderedIds(pool, 'care_gap', ['301', '302']);
 
-  const thirdProvider = readResolvedCareGapProvider();
+  const thirdProvider = zeroCallProvider();
   const third = await handleAgentMessage({
     pool,
     userId: USER,
@@ -971,8 +983,15 @@ await test('care-gap list keeps ordered list through first and second detail rea
   assert.equal(third.ok, true);
   assert.equal(third.language, 'roman_ur');
   assert.equal(third.fallbackCode, undefined);
-  assert.deepEqual(third.referencedEntities, [{ type: 'care_gap', id: '302' }]);
+  assert.deepEqual(third.navigation, {
+    target: 'care_gap_detail',
+    params: { careGapId: '302' },
+  });
+  assert.deepEqual(third.referencedEntities, [
+    { type: 'care_gap', id: '302', title: 'Reality answer missing' },
+  ]);
   assert.doesNotMatch(third.reply, /clear karein|complete nahi kar saka/i);
+  assert.equal(thirdProvider.calls, 0);
   assertOrderedIds(pool, 'care_gap', ['301', '302']);
 });
 
@@ -1132,6 +1151,61 @@ await test('core ambiguous us wala asks clarification with zero provider calls',
   assert.equal(result.ok, true);
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(result.navigation, null);
+  assert.equal(provider.calls, 0);
+});
+
+await test('core resolves explicit care-plan title navigation without provider calls', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Morning Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+    initialState: {
+      ...emptyAgentSessionState(),
+      lastReferencedEntities: [
+        { type: 'care_plan', id: '17' },
+        { type: 'care_plan', id: '21' },
+      ],
+    },
+  });
+  const provider = zeroCallProvider();
+  const result = await handleAgentMessage({
+    pool, userId: USER, sessionId: SESSION_ID, message: 'Morning Plan dikhao', provider: provider.provider,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, undefined);
+  assert.deepEqual(result.navigation, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '17' },
+  });
+  assert.deepEqual(result.referencedEntities, [
+    { type: 'care_plan', id: '17', title: 'Morning Plan' },
+  ]);
+  assert.equal(provider.calls, 0);
+});
+
+await test('core duplicate explicit care-plan title asks clarification without provider calls', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Morning Plan' },
+      { id: '21', title: 'Morning Plan' },
+    ],
+    initialState: {
+      ...emptyAgentSessionState(),
+      lastReferencedEntities: [
+        { type: 'care_plan', id: '17' },
+        { type: 'care_plan', id: '21' },
+      ],
+    },
+  });
+  const provider = zeroCallProvider();
+  const result = await handleAgentMessage({
+    pool, userId: USER, sessionId: SESSION_ID, message: 'Morning Plan dikhao', provider: provider.provider,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
+  assert.equal(result.navigation, null);
+  assert.match(result.reply, /kis wale/i);
   assert.equal(provider.calls, 0);
 });
 

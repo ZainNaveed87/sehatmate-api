@@ -112,6 +112,12 @@ import {
 } from './services/plan_query_service.js';
 
 import {
+  createCarePlan,
+  ensureCarePlanTitleSchema,
+  renameCarePlan,
+} from './services/care_plan_title_service.js';
+
+import {
   assessTeachBackAnswer,
   ensureTeachBackSchema,
   listTeachBackTargets,
@@ -181,6 +187,7 @@ const serviceErrorStatusByCode = {
   INVALID_SCHEDULE_ITEM_ID: 422,
   INVALID_SCHEDULE_TIME: 422,
   INVALID_PLAN_ID: 422,
+  INVALID_CARE_PLAN_TITLE: 422,
   INVALID_GAP_ID: 422,
   INVALID_CARE_GAP_STATUS: 422,
   TIME_OUTSIDE_PERIOD_WINDOW: 422,
@@ -191,6 +198,7 @@ const serviceErrorStatusByCode = {
   PAST_OCCURRENCE_PENDING_CONFLICT: 409,
   TASK_BASE_STATUS_CONFLICT: 409,
   QUESTION_SET_VERSION_CONFLICT: 409,
+  CARE_PLAN_TITLE_EXISTS: 409,
   SCHEDULE_NOT_GENERATED: 409,
   EXACT_TIME_LOCKED: 409,
   MEDICAL_TIMING_CONFLICT: 409,
@@ -230,6 +238,7 @@ function sendServiceError(res, result) {
   const status = serviceErrorStatusByCode[result.code] || 422;
   res.status(status).json({
     success: false,
+    code: result.code,
     message: result.message,
     ...(result.data === undefined ? {} : { data: result.data }),
   });
@@ -2704,30 +2713,38 @@ app.patch('/api/care-plans/:id/duration', authenticate, async (req, res, next) =
 });
 
 app.post('/api/care-plans', authenticate, async (req, res, next) => {
-  const title = cleanText(req.body?.title, 120);
-  if (title.length < 2) {
-    res.status(422).json({
-      success: false,
-      message: 'Care plan title must contain at least 2 characters.',
-    });
-    return;
-  }
-
   try {
-    const [result] = await pool.execute(
-      `INSERT INTO care_plans (user_id, title, status, setup_step)
-       VALUES (?, ?, 'draft', 'upload')`,
-      [req.auth.userId, title],
-    );
-    const [rows] = await pool.execute(
-      'SELECT * FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1',
-      [result.insertId, req.auth.userId],
-    );
+    const result = await createCarePlan({
+      db: pool,
+      userId: req.auth.userId,
+      title: req.body?.title,
+    });
+    if (!result.ok) return sendServiceError(res, result);
 
     res.status(201).json({
       success: true,
       message: 'Care plan created successfully.',
-      data: { plan: carePlanJson(rows[0]) },
+      data: { plan: carePlanJson(result.data.plan) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/care-plans/:id/title', authenticate, async (req, res, next) => {
+  try {
+    const result = await renameCarePlan({
+      db: pool,
+      userId: req.auth.userId,
+      planId: req.params.id,
+      title: req.body?.title,
+    });
+    if (!result.ok) return sendServiceError(res, result);
+
+    res.json({
+      success: true,
+      message: 'Care plan renamed successfully.',
+      data: { plan: carePlanJson(result.data.plan) },
     });
   } catch (error) {
     next(error);
@@ -2845,7 +2862,7 @@ app.post(
   uploadLimiter,
   async (req, res, next) => {
     const planId = req.params.id;
-    const documentType = cleanText(req.body?.documentType, 40);
+    const documentType = cleanText(req.body?.documentType, 40) || 'other';
     const originalName = safeDocumentName(req.body?.originalName);
     const mimeType = cleanText(req.body?.mimeType, 100).toLowerCase();
     const contentBase64 = typeof req.body?.contentBase64 === 'string'
@@ -5532,7 +5549,17 @@ let lifecycleInterval;
 async function startServer() {
   await pool.query('SELECT 1');
 
- await ensureSetupProgressSchema();
+  const titleSchema = await ensureCarePlanTitleSchema({ db: pool });
+  if (!titleSchema.ok) {
+    console.warn(titleSchema.message);
+    for (const group of titleSchema.duplicateGroups || []) {
+      console.warn(
+        `Duplicate care-plan title key for user ${group.userId}: ${group.titleKey} (${group.plans})`,
+      );
+    }
+  }
+
+await ensureSetupProgressSchema();
 await ensureRoutineLearningSchema(pool);
 await ensureRealityCheckPersistenceSchema(pool);
 await ensureMedicalSafetySchema();

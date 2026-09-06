@@ -39,6 +39,38 @@ const URDU_REFERENCE_PHRASES = [
   'اسی پلان', 'اسی منصوبے', 'اسی گیپ', 'اسی خلا',
 ];
 
+const LATIN_NAVIGATION_REQUEST_PATTERNS = [
+  /\bopen\b/i,
+  /\bshow\b/i,
+  /\bkholo\b/i,
+  /\bkholain\b/i,
+  /\bkholen\b/i,
+  /\bdikhao\b/i,
+  /\bdikhain\b/i,
+  /\bdikhaen\b/i,
+];
+const URDU_NAVIGATION_REQUEST_PHRASES = [
+  'کھولو',
+  'کھولیں',
+  'دکھاؤ',
+  'دکھائیں',
+];
+
+const RESOLVED_REFERENCE_NAVIGATION_BY_TYPE = Object.freeze({
+  care_plan: Object.freeze({
+    target: 'care_plan_detail',
+    param: 'carePlanId',
+  }),
+  care_gap: Object.freeze({
+    target: 'care_gap_detail',
+    param: 'careGapId',
+  }),
+  family_member: Object.freeze({
+    target: 'family_member_detail',
+    param: 'relationshipId',
+  }),
+});
+
 function normalizeBarePhrase(message) {
   return String(message || '')
     .trim()
@@ -89,6 +121,12 @@ function hasPronounReference(message) {
   const raw = String(message || '');
   return LATIN_REFERENCE_PATTERNS.some((pattern) => pattern.test(raw)) ||
     URDU_REFERENCE_PHRASES.some((phrase) => raw.includes(phrase));
+}
+
+function hasNavigationRequest(message) {
+  const raw = String(message || '');
+  return LATIN_NAVIGATION_REQUEST_PATTERNS.some((pattern) => pattern.test(raw)) ||
+    URDU_NAVIGATION_REQUEST_PHRASES.some((phrase) => raw.includes(phrase));
 }
 
 function referenceEntityTypeHint(message) {
@@ -250,6 +288,29 @@ export function reviewPlanAgainstResolvedReference({ plan, resolution }) {
     }
   }
   return { ok: true };
+}
+
+export function resolvedReferenceNavigationPlan({ message, resolution }) {
+  if (!resolution || resolution.status !== 'resolved' || !resolution.entity) {
+    return null;
+  }
+  if (!hasNavigationRequest(message)) return null;
+
+  const mapping = RESOLVED_REFERENCE_NAVIGATION_BY_TYPE[resolution.entity.type];
+  if (!mapping) return null;
+  const id = cleanText(String(resolution.entity.id ?? ''), 64);
+  if (!id) return null;
+
+  return {
+    intent: `open_resolved_${resolution.entity.type}`,
+    capabilityCalls: [],
+    navigationIntent: {
+      target: mapping.target,
+      params: {
+        [mapping.param]: id,
+      },
+    },
+  };
 }
 
 export function referenceResolutionContext(resolution) {

@@ -8,7 +8,7 @@
  *        then patient_profiles.preferred_language as the UI/default fallback)
  *     -> owned agent session (created when omitted, verified when given)
  *     -> bounded verified screen context (ownership BEFORE data load)
- *     -> ONE bounded planning turn (agent_planner.js)
+ *     -> bounded planning, with at most one repair attempt
  *     -> validated capability executions (registry + safety gateway, max 3)
  *     -> audited READ results from authoritative backend services
  *     -> navigation authorization (ownership BEFORE emit)
@@ -21,9 +21,10 @@
  *     planner returns a decline_* plan (the instructed refusal shape) and
  *     when the safety gateway rejects a non-executable permission class
  *     outright. Nothing ever executes in either case.
- *   - The provider is called at most twice per message (one planning turn,
- *     one reply turn) through the injectable provider seam. Every provider
- *     or model-output failure maps to the localized deterministic
+ *   - The provider is called at most three times per message (up to two
+ *     planning turns, one reply turn) through the injectable provider seam.
+ *     Every unrepaired provider or model-output failure maps to the
+ *     localized deterministic
  *     agentUnavailable fallback: the agent never claims an action happened,
  *     never invents stats, medication facts, care gaps, or navigation
  *     (spec 22).
@@ -76,6 +77,7 @@ import {
   classifyBareConfirmationDecision,
   localizedReferenceClarification,
   referenceResolutionContext,
+  resolvedReferenceNavigationPlan,
   resolveAgentConversationReference,
   reviewPlanAgainstResolvedReference,
 } from './agent_reference_resolver.js';
@@ -83,6 +85,7 @@ import { authorizeAgentNavigationIntent } from './agent_navigation_registry.js';
 import {
   AGENT_PLANNER_LIMITS,
   planAgentMessage,
+  validateAgentPlan,
 } from './agent_planner.js';
 import { defaultAgentProvider } from './agent_provider.js';
 import {
@@ -1093,12 +1096,18 @@ export async function handleAgentMessage({
       referenceResolution: referenceResolutionContext(referenceResolution),
     });
 
-    // --- one bounded planning turn ---
-    const planned = await planAgentMessage({
-      provider,
+    // --- deterministic resolved-reference navigation or bounded planning ---
+    const fastNavigationPlan = resolvedReferenceNavigationPlan({
       message: boundedMessage,
-      contextSlice,
+      resolution: referenceResolution,
     });
+    const planned = fastNavigationPlan
+      ? validateAgentPlan(fastNavigationPlan)
+      : await planAgentMessage({
+          provider,
+          message: boundedMessage,
+          contextSlice,
+        });
     if (!planned.ok) {
       if (planned.code === 'AGENT_MESSAGE_EMPTY') {
         return {

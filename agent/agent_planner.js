@@ -1,7 +1,7 @@
 /**
  * Agent Planner (Phase B).
  *
- * Turns one user message into ONE strictly validated structured plan:
+ * Turns one user message into one strictly validated structured plan:
  *
  *   {
  *     intent: 'short_snake_case_label',          descriptive only
@@ -10,8 +10,8 @@
  *   }
  *
  * The planner NEVER executes anything and never trusts model text:
- *   - the provider (agent_provider.js) is asked for JSON only, once per
- *     message, with temperature 0 and bounded output;
+ *   - the provider (agent_provider.js) is asked for JSON only, with
+ *     temperature 0 and bounded output;
  *   - every capability name is resolved against the closed capability
  *     registry (unknown names fail closed);
  *   - every argument list is validated and canonicalized by the registry
@@ -39,10 +39,10 @@
  * short clarification question instead of acting on a guess.
  *
  * Failure contract: provider failures pass through with their stable
- * codes (agent_core maps them to the localized agentUnavailable
- * fallback); a provider answer that fails plan validation returns
- * { ok: false, code: 'AGENT_PLAN_INVALID' } - there is no retry loop by
- * design.
+ * codes (agent_core maps unrepaired failures to the localized
+ * agentUnavailable fallback); recoverable provider/model-output
+ * failures get at most one bounded repair attempt, and nothing from a
+ * rejected attempt is executed.
  */
 
 import {
@@ -79,6 +79,17 @@ const RESOLVED_REFERENCE_NAV_PARAM_BY_TYPE = Object.freeze({
   care_gap: 'careGapId',
   family_member: 'relationshipId',
 });
+
+const RECOVERABLE_PLANNING_FAILURES = new Set([
+  'AGENT_PROVIDER_FAILED',
+  'AGENT_PLAN_INVALID',
+  'UNKNOWN_CAPABILITY',
+  'INVALID_AGENT_CAPABILITY_CALLS',
+  'INVALID_CAPABILITY_ARGS',
+  'INVALID_NAVIGATION_INTENT',
+]);
+
+const SAFE_FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{1,80}$/;
 
 function invalidPlan(message) {
   return {
@@ -252,6 +263,63 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
   return { systemPrompt, userPrompt };
 }
 
+function safeFailureCode(code) {
+  return SAFE_FAILURE_CODE_PATTERN.test(String(code || ''))
+    ? String(code)
+    : 'AGENT_PLAN_INVALID';
+}
+
+function plannerNameList() {
+  return listAgentCapabilities()
+    .filter((capability) => isExecutableAgentPermissionClass(capability.permissionClass))
+    .map((capability) => capability.name)
+    .join(', ');
+}
+
+function navigationNameList() {
+  return listAgentNavigationTargets()
+    .map((target) => target.target)
+    .join(', ');
+}
+
+function compactReferenceResolution(contextSlice) {
+  const resolution = contextSlice?.referenceResolution;
+  if (!resolution || typeof resolution !== 'object' || Array.isArray(resolution)) {
+    return null;
+  }
+  const status = cleanText(resolution.status, 40);
+  const type = cleanText(resolution.entity?.type, 40);
+  const id = cleanText(String(resolution.entity?.id ?? ''), 64);
+  return {
+    status: status || null,
+    entity: type && idPattern.test(id) ? { type, id } : null,
+  };
+}
+
+export function buildAgentPlannerRepairPrompt({
+  message,
+  contextSlice = null,
+  failureCode,
+}) {
+  return [
+    'The previous planning attempt was rejected by server validation.',
+    'Return corrected JSON only.',
+    `Failure code: ${safeFailureCode(failureCode)}.`,
+    'Do not invent IDs.',
+    'Do not include userId or user_id.',
+    'Do not plan mutations or safety-sensitive changes.',
+    'Allowed capability names:',
+    plannerNameList(),
+    'Allowed navigation target names:',
+    navigationNameList(),
+    'Reference resolution:',
+    JSON.stringify(compactReferenceResolution(contextSlice)),
+    'Original user message:',
+    cleanText(message, 500),
+    'If referenceResolution.status=resolved, use exactly the server-provided entity type/id.',
+  ].join('\n');
+}
+
 /**
  * Strictly validate a raw plan (typically provider output) without any
  * database access. Unknown fields at any level are rejected; missing
@@ -335,9 +403,45 @@ export function validateAgentPlan(rawPlan) {
   };
 }
 
+async function requestAndValidatePlan({ provider, systemPrompt, userPrompt, contextSlice }) {
+  const completion = await provider.planAgentTurn({ systemPrompt, userPrompt });
+  if (!completion.ok) {
+    return completion;
+  }
+
+  const planForValidation = bindRawPlanToResolvedReference(
+    completion.data.json,
+    contextSlice,
+  );
+  const validated = validateAgentPlan(planForValidation);
+  if (!validated.ok) {
+    return validated;
+  }
+
+  return {
+    ok: true,
+    plan: validated.plan,
+    model: completion.data.model,
+  };
+}
+
+function isRecoverablePlanningFailure(result) {
+  if (!result || result.ok) return false;
+  if (!RECOVERABLE_PLANNING_FAILURES.has(result.code)) return false;
+  if (
+    result.code === 'INVALID_CAPABILITY_ARGS' &&
+    /user\s*id/i.test(result.message || '')
+  ) {
+    return false;
+  }
+  return true;
+}
+
 /**
- * Plan one user message: build the bounded prompts, make exactly one
- * provider planning turn, and strictly validate the answer.
+ * Plan one user message: build the bounded prompts, make one provider
+ * planning turn, and strictly validate the answer. For recoverable
+ * provider/model-output problems, make at most one extra bounded repair
+ * attempt. Nothing from a failed attempt is ever executed.
  *
  * Returns:
  *   { ok: true, plan, model }
@@ -365,23 +469,23 @@ export async function planAgentMessage({
     contextSlice,
   });
 
-  const completion = await provider.planAgentTurn({ systemPrompt, userPrompt });
-  if (!completion.ok) {
-    return completion;
-  }
-
-  const planForValidation = bindRawPlanToResolvedReference(
-    completion.data.json,
+  const first = await requestAndValidatePlan({
+    provider,
+    systemPrompt,
+    userPrompt,
     contextSlice,
-  );
-  const validated = validateAgentPlan(planForValidation);
-  if (!validated.ok) {
-    return validated;
-  }
+  });
+  if (first.ok || !isRecoverablePlanningFailure(first)) return first;
 
-  return {
-    ok: true,
-    plan: validated.plan,
-    model: completion.data.model,
-  };
+  const repairPrompt = buildAgentPlannerRepairPrompt({
+    message: boundedMessage,
+    contextSlice,
+    failureCode: first.code,
+  });
+  return requestAndValidatePlan({
+    provider,
+    systemPrompt,
+    userPrompt: repairPrompt,
+    contextSlice,
+  });
 }

@@ -23,6 +23,7 @@ import { handleAgentMessage } from './agent/agent_core.js';
 import { createAgentProvider } from './agent/agent_provider.js';
 import {
   buildAgentPlannerPrompts,
+  buildAgentPlannerRepairPrompt,
   planAgentMessage,
   validateAgentPlan,
 } from './agent/agent_planner.js';
@@ -224,6 +225,31 @@ function countingMockProvider({ plan, replyTemplate }) {
   return { provider, calls };
 }
 
+function sequencedPlanningProvider(steps) {
+  const calls = [];
+  const provider = createAgentProvider({
+    generateJson: async ({ systemPrompt, userPrompt }) => {
+      calls.push({ systemPrompt, userPrompt });
+      const step = steps[Math.min(calls.length - 1, steps.length - 1)];
+      if (step.error) throw new Error(step.error);
+      return {
+        json: step.json,
+        model: 'mock-planner',
+        provider: 'mock',
+        inputTokens: 0,
+        outputTokens: 0,
+      };
+    },
+    configuration: () => ({
+      configured: true,
+      provider: 'mock',
+      model: 'mock',
+      message: null,
+    }),
+  });
+  return { provider, calls };
+}
+
 process.env.AGENT_ENABLED = 'true';
 
 await test('Agent Core import registers the Agent capability catalog', async () => {
@@ -347,6 +373,183 @@ await test('planner/provider malformed output and unknown capability plans fail 
   });
   assert.equal(unknown.ok, false);
   assert.equal(unknown.code, 'UNKNOWN_CAPABILITY');
+});
+
+await test('planner retries a recoverable provider failure once and returns repaired plan', async () => {
+  const { provider, calls } = sequencedPlanningProvider([
+    { error: 'temporary provider failure with raw transport detail' },
+    {
+      json: {
+        intent: 'read_today_tasks',
+        capabilityCalls: [{ name: 'get_today_tasks', args: { date: TODAY } }],
+        navigationIntent: null,
+      },
+    },
+  ]);
+
+  const planned = await planAgentMessage({
+    provider,
+    message: 'Aaj mera next task kya hai?',
+    contextSlice: {},
+  });
+
+  assert.equal(planned.ok, true);
+  assert.deepEqual(planned.plan.capabilityCalls, [
+    { name: 'get_today_tasks', args: { date: TODAY } },
+  ]);
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].userPrompt, /Failure code: AGENT_PROVIDER_FAILED/);
+  assert.doesNotMatch(calls[1].userPrompt, /raw transport detail/);
+});
+
+await test('planner repair prompt is compact and omits rejected model output', async () => {
+  const repair = buildAgentPlannerRepairPrompt({
+    message: 'pehla wala dikhao',
+    failureCode: 'UNKNOWN_CAPABILITY',
+    contextSlice: {
+      referenceResolution: {
+        status: 'resolved',
+        entity: { type: 'care_plan', id: '17', title: 'Secret Plan Title' },
+      },
+    },
+  });
+
+  assert.match(repair, /Failure code: UNKNOWN_CAPABILITY/);
+  assert.match(repair, /Allowed capability names:/);
+  assert.match(repair, /\bget_care_plans\b/);
+  assert.match(repair, /\bcare_plan_detail\b/);
+  assert.match(repair, /"entity":\{"type":"care_plan","id":"17"\}/);
+  assert.doesNotMatch(repair, /Secret Plan Title/);
+  assert.doesNotMatch(repair, /made_up_tool|raw rejected marker|999/);
+});
+
+await test('planner retries invalid model output with repair prompt and no raw rejected fields', async () => {
+  const { provider, calls } = sequencedPlanningProvider([
+    {
+      json: {
+        intent: 'invented',
+        capabilityCalls: [{
+          name: 'made_up_tool',
+          args: { note: 'raw rejected marker', userId: '999' },
+        }],
+        navigationIntent: null,
+      },
+    },
+    {
+      json: {
+        intent: 'open_resolved_care_plan',
+        capabilityCalls: [],
+        navigationIntent: { target: 'care_plan_detail', params: { carePlanId: '17' } },
+      },
+    },
+  ]);
+
+  const planned = await planAgentMessage({
+    provider,
+    message: 'pehla wala dikhao',
+    contextSlice: {
+      referenceResolution: {
+        status: 'resolved',
+        entity: { type: 'care_plan', id: '17', title: 'Secret Plan Title' },
+      },
+    },
+  });
+
+  assert.equal(planned.ok, true);
+  assert.deepEqual(planned.plan.navigationIntent, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '17' },
+  });
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].userPrompt, /Failure code: UNKNOWN_CAPABILITY/);
+  assert.doesNotMatch(calls[1].userPrompt, /made_up_tool|raw rejected marker|999|Secret Plan Title/);
+});
+
+await test('planner returns the second safe failure after one repair attempt', async () => {
+  const { provider, calls } = sequencedPlanningProvider([
+    {
+      json: {
+        capabilityCalls: [],
+        navigationIntent: null,
+      },
+    },
+    {
+      json: {
+        intent: 'still_invalid',
+        capabilityCalls: [],
+        navigationIntent: null,
+        extra: 'not allowed',
+      },
+    },
+  ]);
+
+  const planned = await planAgentMessage({
+    provider,
+    message: 'Meri performance kesi hai?',
+    contextSlice: {},
+  });
+
+  assert.equal(planned.ok, false);
+  assert.equal(planned.code, 'AGENT_PLAN_INVALID');
+  assert.equal(calls.length, 2);
+});
+
+await test('planner does not retry forbidden mutation capability into execution', async () => {
+  const { provider, calls } = sequencedPlanningProvider([
+    {
+      json: {
+        intent: 'try_future_sensitive_action',
+        capabilityCalls: [{ name: 'sensitive_future_change_for_test', args: {} }],
+        navigationIntent: null,
+      },
+    },
+    {
+      json: {
+        intent: 'read_today_tasks',
+        capabilityCalls: [{ name: 'get_today_tasks', args: { date: TODAY } }],
+        navigationIntent: null,
+      },
+    },
+  ]);
+
+  const planned = await planAgentMessage({
+    provider,
+    message: 'Mark this task complete.',
+    contextSlice: {},
+  });
+
+  assert.equal(planned.ok, false);
+  assert.equal(planned.code, 'AGENT_PERMISSION_CLASS_NOT_EXECUTABLE');
+  assert.equal(calls.length, 1);
+});
+
+await test('planner does not retry model-supplied userId arguments', async () => {
+  const { provider, calls } = sequencedPlanningProvider([
+    {
+      json: {
+        intent: 'read_today_tasks',
+        capabilityCalls: [{ name: 'get_today_tasks', args: { date: TODAY, userId: '999' } }],
+        navigationIntent: null,
+      },
+    },
+    {
+      json: {
+        intent: 'read_today_tasks',
+        capabilityCalls: [{ name: 'get_today_tasks', args: { date: TODAY } }],
+        navigationIntent: null,
+      },
+    },
+  ]);
+
+  const planned = await planAgentMessage({
+    provider,
+    message: 'Aaj mera next task kya hai?',
+    contextSlice: {},
+  });
+
+  assert.equal(planned.ok, false);
+  assert.equal(planned.code, 'INVALID_CAPABILITY_ARGS');
+  assert.equal(calls.length, 1);
 });
 
 await test('planner prompt distinguishes open care gaps from screen navigation', async () => {
