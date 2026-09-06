@@ -300,11 +300,11 @@ export async function updateAgentSessionState({
 
 /**
  * Update the persisted language of an active session owned by the
- * authenticated user. This is the smallest safe user-scoped
- * session-language update: when the user changes their profile language
- * between two agent messages, the session follows the profile instead of
- * answering in a stale language. Only the language column (and
- * last_active_at) is touched; the session state is preserved.
+ * authenticated user. The language column tracks the latest verified Agent
+ * turn language for compatibility with existing session reads. The user's
+ * patient profile language remains the app/UI/default fallback and is never
+ * changed here. Only the language column (and last_active_at) is touched;
+ * the session state is preserved.
  */
 export async function updateAgentSessionLanguage({ db, userId, sessionId, language }) {
   if (!idPattern.test(sessionId || '')) return invalidSessionIdResult();

@@ -53,6 +53,7 @@ import {
   defaultAgentProvider,
 } from './agent_provider.js';
 import { canonicalAgentLanguage } from './agent_session_store.js';
+import { detectAgentTurnLanguage } from './agent_turn_language.js';
 import { cleanText } from '../services/shared_utils.js';
 
 /** Hard bounds for grounding. Safety properties, not tuning knobs. */
@@ -679,6 +680,18 @@ function validateAgentReplyLanguage({ language, template }) {
   const canonical = canonicalAgentLanguage(language);
   const prose = templateProseText(template);
   if (!LETTER_PATTERN.test(prose)) return { ok: true };
+  const detected = detectAgentTurnLanguage(prose).language;
+
+  if (
+    canonical === 'en' &&
+    (URDU_SCRIPT_PATTERN.test(prose) || detected === 'roman_ur')
+  ) {
+    return {
+      ok: false,
+      code: 'AGENT_REPLY_LANGUAGE_MISMATCH',
+      message: 'Agent reply did not contain English explanatory prose.',
+    };
+  }
 
   if (canonical === 'ur' && !URDU_SCRIPT_PATTERN.test(prose)) {
     return {
@@ -693,6 +706,14 @@ function validateAgentReplyLanguage({ language, template }) {
       ok: false,
       code: 'AGENT_REPLY_LANGUAGE_MISMATCH',
       message: 'Agent reply used Urdu script for a Roman Urdu response.',
+    };
+  }
+
+  if (canonical === 'roman_ur' && detected === 'en') {
+    return {
+      ok: false,
+      code: 'AGENT_REPLY_LANGUAGE_MISMATCH',
+      message: 'Agent reply did not contain Roman Urdu explanatory prose.',
     };
   }
 

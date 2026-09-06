@@ -640,12 +640,13 @@ await test('READ capability execution is audited and exact 14:00 facts are backe
         navigationIntent: null,
       },
       replyTemplate: () =>
-        'Your verified task is {{fact:c1_occurrences_1_title}} at {{fact:c1_occurrences_1_scheduledTime}}.',
+        'Aap ke verified task {{fact:c1_occurrences_1_title}} ka time {{fact:c1_occurrences_1_scheduledTime}} hai.',
     }),
   });
 
   assert.equal(result.ok, true);
-  assert.equal(result.reply, 'Your verified task is DemoMed Beta at 14:00.');
+  assert.equal(result.language, 'roman_ur');
+  assert.equal(result.reply, 'Aap ke verified task DemoMed Beta ka time 14:00 hai.');
   assert.equal(result.fallbackCode, undefined);
   assert.ok(
     pool.calls.some((call) =>
@@ -676,7 +677,7 @@ await test('GAP_NOT_FOUND short-circuits to fallback and skips reply generation'
 
   assert.equal(result.ok, true);
   assert.equal(result.fallbackCode, 'GAP_NOT_FOUND');
-  assert.match(result.reply, /could not complete/i);
+  assert.match(result.reply, /could not complete|complete nahi kar saka/i);
   assert.equal(calls.plan, 1);
   assert.equal(calls.reply, 0);
   assert.ok(

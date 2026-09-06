@@ -15,6 +15,7 @@
  *     lastCapabilityNames: [string],            // server-known tool names
  *     pendingConfirmation: { confirmationId, kind, message, expiresAt } | null,
  *     pendingDraft: { [key]: string } | null,   // shallow, string-only draft
+ *     lastTurnLanguage: en | ur | roman_ur | null, // bounded reply-language memory
  *     lastActionSummary: string | null
  *   }
  *
@@ -43,6 +44,7 @@ import { cleanText, idPattern } from '../services/shared_utils.js';
 export const AGENT_SESSION_STATE_VERSION = 1;
 const CONVERSATION_ENTITY_TYPES = new Set(['care_plan', 'care_gap', 'family_member']);
 const MEMORY_LABEL_PATTERN = /^[a-z][a-z0-9_]*$/;
+const AGENT_LANGUAGE_CODES = new Set(['en', 'ur', 'roman_ur']);
 
 export const AGENT_STATE_LIMITS = Object.freeze({
   maxReferencedEntities: 20,
@@ -73,6 +75,7 @@ export function emptyAgentSessionState() {
     lastCapabilityNames: [],
     pendingConfirmation: null,
     pendingDraft: null,
+    lastTurnLanguage: null,
     lastActionSummary: null,
   };
 }
@@ -160,6 +163,11 @@ function sanitizePendingDraft(value) {
   return count > 0 ? draft : null;
 }
 
+function sanitizeLastTurnLanguage(value) {
+  const language = cleanText(value, 20);
+  return AGENT_LANGUAGE_CODES.has(language) ? language : null;
+}
+
 /**
  * Validate and normalize caller-supplied session state.
  *
@@ -222,6 +230,7 @@ export function sanitizeAgentSessionState(input, { maxStateBytes = 16384 } = {})
     lastCapabilityNames: capabilityNames,
     pendingConfirmation: sanitizePendingConfirmation(input.pendingConfirmation),
     pendingDraft: sanitizePendingDraft(input.pendingDraft),
+    lastTurnLanguage: sanitizeLastTurnLanguage(input.lastTurnLanguage),
     lastActionSummary: cleanText(input.lastActionSummary, AGENT_STATE_LIMITS.summaryMaxLength) || null,
   };
 

@@ -344,6 +344,7 @@ await test('readAgentSession: approved canonical stored state fields survive rea
       expiresAt: '2999-01-01T00:00:00.000Z',
     },
     pendingDraft: { title: 'Metformin' },
+    lastTurnLanguage: 'roman_ur',
     lastActionSummary: 'Reminder confirmed',
   };
   const pool = sessionPool({ ...sessionRow, state_json: JSON.stringify(stored) });
@@ -499,6 +500,7 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
       expiresAt: '2999-01-01T00:00:00.000Z',
     },
     pendingDraft: { title: 'Metformin', nestedObject: { deep: 'dropped' }, count: 3 },
+    lastTurnLanguage: 'pirate',
     lastActionSummary: 'Reminder confirmed',
   });
 
@@ -531,6 +533,7 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
     'get_care_plan',
     'get_simulation',
   ]);
+  assert.equal(sanitized.state.lastTurnLanguage, null);
   assert.equal('evilKey' in sanitized.state, false);
 });
 

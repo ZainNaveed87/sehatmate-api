@@ -4,7 +4,8 @@
  * One authenticated user message flows through the full Phase B pipeline:
  *
  *   authenticated userId (from the auth token, never the request body)
- *     -> server-side language authority (patient_profiles.preferred_language)
+ *     -> server-side turn-language resolution (message, then bounded memory,
+ *        then patient_profiles.preferred_language as the UI/default fallback)
  *     -> owned agent session (created when omitted, verified when given)
  *     -> bounded verified screen context (ownership BEFORE data load)
  *     -> ONE bounded planning turn (agent_planner.js)
@@ -41,11 +42,11 @@
  *     deterministic lastActionSummary built from server-known facts
  *     (intent label, executed tool names, navigation target). No
  *     conversation transcripts are stored.
- *   - The language authority is the user's stored profile language; the
- *     request body can never set it (spec 11). When the profile language
- *     changes between two messages of an existing session, the session
- *     follows through the smallest safe user-scoped update
- *     (updateAgentSessionLanguage) - there is no second language system.
+ *   - The request body can never set reply language authority. The user's
+ *     stored profile language remains the app/UI/default language only.
+ *     Each Agent turn resolves a closed canonical reply language from the
+ *     current message, falling back to the last verified turn language and
+ *     then the profile default.
  *
  * Failure contract: handleAgentMessage never throws. Transport-level input
  * problems (empty message, unknown/foreign/expired session id, disabled
@@ -109,6 +110,7 @@ import {
 } from './agent_session_store.js';
 import { AGENT_STATE_LIMITS } from './agent_session_state.js';
 import { recordAgentAction } from './agent_action_audit.js';
+import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
 import { cleanText, idPattern } from '../services/shared_utils.js';
 
@@ -394,7 +396,7 @@ const DECLINE_INTENT_PATTERN = /^decline/;
 /** Length bound for entity titles surfaced in referencedEntities. */
 const ENTITY_TITLE_MAX_LENGTH = 200;
 
-/** Server-side language authority: the stored patient profile language. */
+/** Server-side app/UI/default language source. */
 const PROFILE_LANGUAGE_SQL =
   'SELECT preferred_language FROM patient_profiles WHERE user_id = ? LIMIT 1';
 
@@ -405,6 +407,14 @@ const DRAFT_KINDS = new Set(['task_outcome', 'schedule_time']);
 async function readProfileLanguage(pool, userId) {
   const [rows] = await pool.execute(PROFILE_LANGUAGE_SQL, [userId]);
   return canonicalAgentLanguage(rows[0]?.preferred_language);
+}
+
+function lastVerifiedTurnLanguage(session, profileLanguage) {
+  return canonicalAgentLanguage(
+    session?.state?.lastTurnLanguage ||
+      session?.language ||
+      profileLanguage,
+  );
 }
 
 /**
@@ -492,6 +502,7 @@ function buildNextSessionState({
   screenEntity,
   pendingConfirmation,
   pendingDraft,
+  language,
 }) {
   const previous = Array.isArray(sessionState?.lastReferencedEntities)
     ? sessionState.lastReferencedEntities
@@ -564,6 +575,7 @@ function buildNextSessionState({
         : pendingConfirmation,
     pendingDraft:
       pendingDraft === undefined ? sessionState?.pendingDraft ?? null : pendingDraft,
+    lastTurnLanguage: canonicalAgentLanguage(language),
     lastActionSummary: summary || null,
   };
 }
@@ -621,6 +633,7 @@ async function finishAgentTurn({
   pendingDraft,
   confirmation = null,
   actionStatus = null,
+  language = session.language,
 }) {
   const nextState = buildNextSessionState({
     sessionState: session.state,
@@ -633,6 +646,7 @@ async function finishAgentTurn({
     screenEntity,
     pendingConfirmation,
     pendingDraft,
+    language,
   });
 
   let stateUpdate = null;
@@ -656,10 +670,10 @@ async function finishAgentTurn({
     return {
       ok: true,
       sessionId: session.id,
-      language: session.language,
+      language,
       reply: currentConfirmation
-        ? confirmationText('alreadyAwaiting', session.language)
-        : localizedAgentText('agentUnavailable', session.language),
+        ? confirmationText('alreadyAwaiting', language)
+        : localizedAgentText('agentUnavailable', language),
       navigation: null,
       confirmation: currentConfirmation,
       actionStatus: currentConfirmation ? 'awaiting_confirmation' : 'rejected',
@@ -677,7 +691,7 @@ async function finishAgentTurn({
   return {
     ok: true,
     sessionId: session.id,
-    language: session.language,
+    language,
     reply,
     navigation,
     confirmation,
@@ -697,11 +711,12 @@ function finishAgentConfirmationTurn({
   fallbackCode,
   confirmation = null,
   actionStatus = null,
+  language = session.language,
 }) {
   return {
     ok: true,
     sessionId: session.id,
-    language: session.language,
+    language,
     reply,
     navigation: null,
     confirmation,
@@ -717,6 +732,7 @@ async function handleAgentConfirmation({
   session,
   confirmationRequest,
   screenEntity = null,
+  language = session.language,
 }) {
   const deniedTurn = async ({
     finishSession = session,
@@ -749,7 +765,8 @@ async function handleAgentConfirmation({
     });
     return finishAgentConfirmationTurn({
       session: finishSession,
-      reply: confirmationText(key, finishSession.language),
+      language,
+      reply: confirmationText(key, language),
       fallbackCode,
       confirmation: clear ? null : responseConfirmationFromDraft(pendingDraft),
       actionStatus,
@@ -868,9 +885,10 @@ async function handleAgentConfirmation({
 
   return finishAgentConfirmationTurn({
     session: claimedSession,
+    language,
     reply: result.ok
-      ? confirmationText('confirmed', claimedSession.language)
-      : confirmationText('rejected', claimedSession.language),
+      ? confirmationText('confirmed', language)
+      : confirmationText('rejected', language),
     fallbackCode: result.ok ? null : result.code || 'AGENT_CAPABILITY_FAILED',
     confirmation: null,
     actionStatus: result.ok ? 'confirmed' : 'rejected',
@@ -915,8 +933,11 @@ export async function handleAgentMessage({
       };
     }
 
-    // Language authority is the stored profile, never the request body.
-    language = await readProfileLanguage(pool, userId);
+    const profileLanguage = await readProfileLanguage(pool, userId);
+    language = resolveAgentTurnLanguage({
+      message: boundedMessage,
+      profileLanguage,
+    }).language;
 
     if (!agentConfig().enabled) {
       return {
@@ -945,10 +966,16 @@ export async function handleAgentMessage({
       const read = await readAgentSession({ db: pool, userId, sessionId });
       if (!read.ok) return read;
       session = read.data.session;
+      language = resolveAgentTurnLanguage({
+        message: boundedMessage,
+        lastTurnLanguage: lastVerifiedTurnLanguage(session, profileLanguage),
+        profileLanguage,
+      }).language;
     }
 
     if (!sessionCreated) {
-      // Smallest safe user-scoped session-language update (spec 11).
+      // Session language is now the last verified Agent turn language, not
+      // the patient profile/UI language.
       if (session.language !== language) {
         const updated = await updateAgentSessionLanguage({
           db: pool,
@@ -974,6 +1001,7 @@ export async function handleAgentMessage({
         userId,
         session,
         confirmationRequest,
+        language,
       });
     }
 
@@ -987,7 +1015,8 @@ export async function handleAgentMessage({
       if (!confirmationId) {
         return finishAgentConfirmationTurn({
           session,
-          reply: confirmationText('noPending', session.language),
+          language,
+          reply: confirmationText('noPending', language),
           fallbackCode: 'AGENT_CONFIRMATION_NOT_FOUND',
           confirmation: null,
           actionStatus: 'rejected',
@@ -1002,6 +1031,7 @@ export async function handleAgentMessage({
           confirmationId,
           decision: conversationalDecision,
         },
+        language,
       });
     }
 
@@ -1039,7 +1069,7 @@ export async function handleAgentMessage({
         userId,
         session,
         reply: localizedReferenceClarification({
-          language: session.language,
+          language,
           resolution: referenceResolution,
         }),
         fallbackCode:
@@ -1051,11 +1081,12 @@ export async function handleAgentMessage({
         navigation: null,
         navigationEntity: null,
         screenEntity,
+        language,
       });
     }
 
     const contextSlice = buildAgentContextSlice({
-      language: session.language,
+      language,
       screenContext: context.screenContext,
       sessionState: session.state,
       conversationContext,
@@ -1089,7 +1120,7 @@ export async function handleAgentMessage({
         session,
         reply: localizedAgentText(
           denied ? 'agentPermissionDenied' : 'agentUnavailable',
-          session.language,
+          language,
         ),
         fallbackCode: planned.code,
         intent: denied ? 'declined_by_safety_gateway' : 'unavailable',
@@ -1097,6 +1128,7 @@ export async function handleAgentMessage({
         navigation: null,
         navigationEntity: null,
         screenEntity,
+        language,
       });
     }
 
@@ -1111,7 +1143,7 @@ export async function handleAgentMessage({
         userId,
         session,
         reply: localizedReferenceClarification({
-          language: session.language,
+          language,
           resolution: referenceResolution,
           code: referenceBinding.code,
         }),
@@ -1121,6 +1153,7 @@ export async function handleAgentMessage({
         navigation: null,
         navigationEntity: null,
         screenEntity,
+        language,
       });
     }
     const declined =
@@ -1134,7 +1167,7 @@ export async function handleAgentMessage({
         pool,
         userId,
         session,
-        reply: confirmationText('alreadyAwaiting', session.language),
+        reply: confirmationText('alreadyAwaiting', language),
         fallbackCode: 'AGENT_CONFIRMATION_ALREADY_PENDING',
         intent: 'confirmation_already_pending',
         capabilityCalls: [],
@@ -1143,6 +1176,7 @@ export async function handleAgentMessage({
         screenEntity,
         confirmation: pending,
         actionStatus: 'awaiting_confirmation',
+        language,
       });
     }
 
@@ -1224,13 +1258,14 @@ export async function handleAgentMessage({
         pool,
         userId,
         session,
-        reply: localizedAgentText('agentUnavailable', session.language),
+        reply: localizedAgentText('agentUnavailable', language),
         fallbackCode: capabilityFailureCode,
         intent: 'capability_unavailable',
         capabilityCalls: [],
         navigation: null,
         navigationEntity: null,
         screenEntity,
+        language,
       });
     }
 
@@ -1239,7 +1274,7 @@ export async function handleAgentMessage({
         pool,
         userId,
         session,
-        reply: confirmationText('draftReady', session.language),
+        reply: confirmationText('draftReady', language),
         fallbackCode: null,
         intent: 'draft_awaiting_confirmation',
         capabilityCalls: plan.capabilityCalls,
@@ -1252,6 +1287,7 @@ export async function handleAgentMessage({
         pendingDraft,
         confirmation: responseConfirmationFromDraft(pendingDraft),
         actionStatus: 'awaiting_confirmation',
+        language,
       });
     }
 
@@ -1305,18 +1341,18 @@ export async function handleAgentMessage({
     let reply;
     let fallbackCode = null;
     if (declined) {
-      reply = localizedAgentText('agentPermissionDenied', session.language);
+      reply = localizedAgentText('agentPermissionDenied', language);
       fallbackCode = 'AGENT_PERMISSION_DENIED';
     } else if (
       navigation &&
       capabilityResults.length === 0 &&
       plan.capabilityCalls.length === 0
     ) {
-      reply = navigationReadyText(navigation.target, session.language);
+      reply = navigationReadyText(navigation.target, language);
     } else {
       const replyResult = await generateGroundedAgentReply({
         provider,
-        language: session.language,
+        language,
         message: boundedMessage,
         contextSlice,
         capabilityResults,
@@ -1324,7 +1360,7 @@ export async function handleAgentMessage({
       if (replyResult.ok) {
         reply = replyResult.reply;
       } else {
-        reply = localizedAgentText('agentUnavailable', session.language);
+        reply = localizedAgentText('agentUnavailable', language);
         fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
       }
     }
@@ -1342,6 +1378,7 @@ export async function handleAgentMessage({
       navigation,
       navigationEntity,
       screenEntity,
+      language,
     });
   } catch {
     return {
