@@ -58,9 +58,40 @@ function sessionRow(state = emptyAgentSessionState(), { language = 'roman_ur' } 
   };
 }
 
+function careGapRow(overrides = {}) {
+  return {
+    id: 301,
+    care_plan_id: 17,
+    task_id: null,
+    category: 'Schedule',
+    gap_type: 'schedule_gap',
+    title: 'Morning dose needs a time',
+    status: 'blocked',
+    severity: 'blocking',
+    lifecycle_status: 'open',
+    when_text: 'Morning',
+    summary: 'A schedule item needs an exact reminder time.',
+    instruction_snapshot: null,
+    patient_reality: null,
+    reason: 'No exact reminder time is saved.',
+    next_step: 'Review the schedule.',
+    resolution_note: null,
+    resolved_at: null,
+    source_key: 'schedule:morning:time',
+    source_kind: 'schedule_item',
+    source_id: '901',
+    due_at: null,
+    auto_managed: 1,
+    created_at: null,
+    updated_at: null,
+    ...overrides,
+  };
+}
+
 function createPool({
   initialState = emptyAgentSessionState(),
   plans = [],
+  gaps = [],
   preferredLanguage = 'Roman Urdu',
   sessionLanguage = 'roman_ur',
 } = {}) {
@@ -100,11 +131,43 @@ function createPool({
       auditRows.push(params);
       return [{ affectedRows: 1, insertId: auditRows.length }];
     }
+    if (text.startsWith('SELECT id FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1')) {
+      const plan = plans.find(
+        (item) => String(item.id) === String(params[0]) && String(params[1]) === USER,
+      );
+      return [plan ? [{ id: Number(plan.id) }] : []];
+    }
     if (text.startsWith('SELECT id, title FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1')) {
       const plan = plans.find(
         (item) => String(item.id) === String(params[0]) && String(params[1]) === USER,
       );
       return [plan ? [[{ id: Number(plan.id), title: plan.title }]][0] : []];
+    }
+    if (text.startsWith('SELECT * FROM care_plans WHERE id = ? AND user_id = ? LIMIT 1')) {
+      const plan = plans.find(
+        (item) => String(item.id) === String(params[0]) && String(params[1]) === USER,
+      );
+      return [plan ? [{
+        id: Number(plan.id),
+        title: plan.title,
+        status: 'active',
+        start_date: null,
+        readiness_score: 80,
+        understanding_score: 0,
+        activated_at: null,
+        completed_at: null,
+        completion_reason: null,
+        completed_by: null,
+        duration_mode: 'prescription',
+        suggested_end_date: null,
+        planned_end_date: null,
+        created_at: null,
+        updated_at: null,
+        document_count: 0,
+        task_count: 0,
+        open_gap_count: 0,
+        setup_step: 'complete',
+      }] : []];
     }
     if (text.includes('FROM care_plans') && text.includes('WHERE care_plans.user_id = ?')) {
       return [plans.map((plan, index) => ({
@@ -128,6 +191,16 @@ function createPool({
         open_gap_count: 0,
         setup_step: 'complete',
       }))];
+    }
+    if (text.includes('FROM care_gaps') && text.includes('WHERE id = ?') && text.includes('care_plan_id IN')) {
+      const gap = gaps.find((item) => {
+        const ownsPlan = plans.some((plan) => String(plan.id) === String(item.care_plan_id));
+        return String(item.id) === String(params[0]) && String(params[1]) === USER && ownsPlan;
+      });
+      return [gap ? [gap] : []];
+    }
+    if (text.includes('FROM care_gaps WHERE care_plan_id = ?')) {
+      return [gaps.filter((gap) => String(gap.care_plan_id) === String(params[0]))];
     }
     if (/^SELECT|^WITH|^SHOW|^DESCRIBE/i.test(text)) return [[]];
     return [{ affectedRows: 1, insertId: 1 }];
@@ -225,6 +298,58 @@ function plannedProvider(plan, { replyTemplate = 'Safe reply.', capture = null }
       configuration: () => ({ configured: true, provider: 'mock', model: 'mock', message: null }),
     }),
   };
+}
+
+function orderedEntities(kind, ids) {
+  return {
+    kind,
+    entities: ids.map((id) => ({ type: kind, id: String(id) })),
+  };
+}
+
+function assertOrderedIds(pool, kind, ids) {
+  assert.deepEqual(pool.state.recentOrderedEntityList, orderedEntities(kind, ids));
+}
+
+function carePlanListProvider({ replyTemplate } = {}) {
+  return plannedProvider({
+    intent: 'list_care_plans',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate: replyTemplate ||
+      'Aap ke care plans mein {{fact:c1_plans_1_title}} aur {{fact:c1_plans_2_title}} shamil hain.',
+  });
+}
+
+function careGapListProvider({ planId = '17', replyTemplate } = {}) {
+  return plannedProvider({
+    intent: 'list_care_gaps',
+    capabilityCalls: [{ name: 'get_care_gaps', args: { planId } }],
+    navigationIntent: null,
+  }, {
+    replyTemplate: replyTemplate || 'Aap ke care gaps ki list tayyar hai.',
+  });
+}
+
+function readResolvedCarePlanProvider() {
+  return plannedProvider({
+    intent: 'read_resolved_care_plan',
+    capabilityCalls: [{ name: 'get_care_plan', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate: 'Aap ki tafseel ab tayyar hai.',
+  });
+}
+
+function readResolvedCareGapProvider() {
+  return plannedProvider({
+    intent: 'read_resolved_care_gap',
+    capabilityCalls: [{ name: 'get_care_gap_detail', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate: 'Aap ki tafseel ab tayyar hai.',
+  });
 }
 
 await test('bare confirmation/cancellation phrase matcher is closed and deterministic', async () => {
@@ -742,6 +867,248 @@ await test('two-turn ordinal reference rejects planner substitution of another p
   assert.equal(second.navigation, null);
   assert.equal(badProvider.calls.plan, 1);
   assert.equal(badProvider.calls.reply, 0);
+});
+
+await test('care-plan list keeps ordered list through first and second detail reads', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: carePlanListProvider().provider,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.fallbackCode, undefined);
+  assertOrderedIds(pool, 'care_plan', ['17', '21']);
+
+  const secondProvider = readResolvedCarePlanProvider();
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'pehla wala dikhao',
+    provider: secondProvider.provider,
+  });
+  assert.equal(second.ok, true);
+  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.fallbackCode, undefined);
+  assert.equal(second.navigation, null);
+  assert.deepEqual(second.referencedEntities, [{ type: 'care_plan', id: '17' }]);
+  assertOrderedIds(pool, 'care_plan', ['17', '21']);
+
+  const thirdProvider = readResolvedCarePlanProvider();
+  const third = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'doosra wala dikhao',
+    provider: thirdProvider.provider,
+  });
+  assert.equal(third.ok, true);
+  assert.equal(third.language, 'roman_ur');
+  assert.equal(third.fallbackCode, undefined);
+  assert.equal(third.navigation, null);
+  assert.deepEqual(third.referencedEntities, [{ type: 'care_plan', id: '21' }]);
+  assert.doesNotMatch(third.reply, /clear karein|complete nahi kar saka/i);
+  assertOrderedIds(pool, 'care_plan', ['17', '21']);
+});
+
+await test('care-gap list keeps ordered list through first and second detail reads', async () => {
+  const pool = createPool({
+    plans: [{ id: '17', title: 'Prescription Plan' }],
+    gaps: [
+      careGapRow({ id: 301, title: 'Morning dose needs a time' }),
+      careGapRow({
+        id: 302,
+        title: 'Reality answer missing',
+        severity: 'attention',
+        status: 'at_risk',
+        source_key: 'reality:transport:missing',
+        source_kind: 'reality_check',
+      }),
+    ],
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care gaps dikhao',
+    provider: careGapListProvider().provider,
+  });
+  assert.equal(first.ok, true);
+  assert.equal(first.fallbackCode, undefined);
+  assertOrderedIds(pool, 'care_gap', ['301', '302']);
+
+  const secondProvider = readResolvedCareGapProvider();
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'pehla wala dikhao',
+    provider: secondProvider.provider,
+  });
+  assert.equal(second.ok, true);
+  assert.equal(second.fallbackCode, undefined);
+  assert.deepEqual(second.referencedEntities, [{ type: 'care_gap', id: '301' }]);
+  assertOrderedIds(pool, 'care_gap', ['301', '302']);
+
+  const thirdProvider = readResolvedCareGapProvider();
+  const third = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'doosra wala dikhao',
+    provider: thirdProvider.provider,
+  });
+  assert.equal(third.ok, true);
+  assert.equal(third.language, 'roman_ur');
+  assert.equal(third.fallbackCode, undefined);
+  assert.deepEqual(third.referencedEntities, [{ type: 'care_gap', id: '302' }]);
+  assert.doesNotMatch(third.reply, /clear karein|complete nahi kar saka/i);
+  assertOrderedIds(pool, 'care_gap', ['301', '302']);
+});
+
+await test('new care-plan list replaces older care-plan ordered list', async () => {
+  const pool = createPool({
+    initialState: {
+      ...emptyAgentSessionState(),
+      recentOrderedEntityList: orderedEntities('care_plan', ['5', '6']),
+    },
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: carePlanListProvider().provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, undefined);
+  assertOrderedIds(pool, 'care_plan', ['17', '21']);
+});
+
+await test('new care-gap list replaces prior care-plan ordered context', async () => {
+  const pool = createPool({
+    initialState: {
+      ...emptyAgentSessionState(),
+      recentOrderedEntityList: orderedEntities('care_plan', ['17', '21']),
+    },
+    plans: [{ id: '17', title: 'Prescription Plan' }],
+    gaps: [
+      careGapRow({ id: 301, title: 'Morning dose needs a time' }),
+      careGapRow({ id: 302, title: 'Reality answer missing' }),
+    ],
+  });
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care gaps dikhao',
+    provider: careGapListProvider().provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, undefined);
+  assertOrderedIds(pool, 'care_gap', ['301', '302']);
+});
+
+await test('successful empty authoritative list clears stale ordered list', async () => {
+  const pool = createPool({
+    initialState: {
+      ...emptyAgentSessionState(),
+      recentOrderedEntityList: orderedEntities('care_plan', ['17', '21']),
+    },
+    plans: [],
+  });
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: carePlanListProvider({
+      replyTemplate: 'Aap ki request complete ho gayi.',
+    }).provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, undefined);
+  assert.equal(pool.state.recentOrderedEntityList, null);
+});
+
+await test('stale ordered-list entity fails ownership revalidation before ordinal resolution', async () => {
+  const pool = createPool({
+    initialState: {
+      ...emptyAgentSessionState(),
+      recentOrderedEntityList: orderedEntities('care_plan', ['999']),
+    },
+    plans: [{ id: '17', title: 'Prescription Plan' }],
+  });
+  const provider = zeroCallProvider();
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'pehla wala dikhao',
+    provider: provider.provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.language, 'roman_ur');
+  assert.equal(result.fallbackCode, 'AGENT_REFERENCE_NOT_FOUND');
+  assert.equal(result.navigation, null);
+  assert.equal(provider.calls, 0);
+});
+
+await test('fresh ordered list keeps us wala ambiguous with multiple candidates', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: carePlanListProvider().provider,
+  });
+  assert.equal(first.ok, true);
+  assertOrderedIds(pool, 'care_plan', ['17', '21']);
+
+  const provider = zeroCallProvider();
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    provider: provider.provider,
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
+  assert.equal(second.navigation, null);
+  assert.match(second.reply, /kis wale/i);
+  assert.equal(provider.calls, 0);
 });
 
 await test('core ambiguous us wala asks clarification with zero provider calls', async () => {

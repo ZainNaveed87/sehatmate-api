@@ -542,6 +542,8 @@ function buildNextSessionState({
     navigationEntity,
   });
   const verifiedOrderedList = deriveVerifiedOrderedEntityList(capabilityResults);
+  // Only an authoritative list result replaces or clears ordinal context.
+  // Detail reads and navigation keep the previous sanitized pointer list.
   const hasVerifiedOperation = successfulCapabilityCalls.length > 0 || Boolean(navigation);
   const normalizedIntent = deriveServerNormalizedIntent({
     successfulCapabilityCalls,
@@ -558,9 +560,7 @@ function buildNextSessionState({
     recentOrderedEntityList:
       verifiedOrderedList !== undefined
         ? verifiedOrderedList
-        : hasVerifiedOperation
-          ? null
-          : sessionState?.recentOrderedEntityList ?? null,
+        : sessionState?.recentOrderedEntityList ?? null,
     lastIntent:
       hasVerifiedOperation
         ? normalizedIntent
