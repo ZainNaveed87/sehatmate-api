@@ -24,6 +24,11 @@ import {
   localizedAiFallbackText,
   readPreferredLanguageForUser,
 } from './language_support.js';
+import {
+  profileJson,
+  saveProfile,
+  validateProfile,
+} from './services/profile_service.js';
 
 import {
   agentRateLimits,
@@ -375,22 +380,6 @@ const teachBackLimiter = rateLimit({
 });
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const ageGroups = new Set([
-  'Under 18',
-  '18 – 30',
-  '31 – 45',
-  '46 – 59',
-  '60 – 70',
-  '71 – 80',
-  '81+',
-]);
-const languages = new Set(['English', 'Urdu', 'Roman Urdu']);
-const accessibilityModes = new Set([
-  'Standard',
-  'Large Text',
-  'Voice Guidance',
-  'Simple Care Mode',
-]);
 const carePlanStatuses = new Set([
   'draft',
   'processing',
@@ -572,62 +561,6 @@ function validateGoogleName(name, email) {
   }
 
   return 'Google User';
-}
-
-function validateProfile(body) {
-  const usingFor = cleanText(body.usingFor, 40);
-  const patientName = cleanText(body.patientName, 80);
-  const ageGroup = cleanText(body.ageGroup, 20);
-  const city = cleanText(body.city, 100);
-  const preferredLanguage = cleanText(body.preferredLanguage, 30);
-  const accessibilityMode = cleanText(body.accessibilityMode, 40);
-  const caregiverSupport = body.caregiverSupport === true;
-
-  if (!['Myself', 'Someone I care for'].includes(usingFor)) {
-    return { error: 'Select who this care plan is for.' };
-  }
-  if (patientName.length < 2) {
-    return { error: 'Patient name must contain at least 2 characters.' };
-  }
-  if (!ageGroups.has(ageGroup)) {
-    return { error: 'Select a valid age group.' };
-  }
-  if (city.length < 2) {
-    return { error: 'City must contain at least 2 characters.' };
-  }
-  if (!languages.has(preferredLanguage)) {
-    return { error: 'Select a valid preferred language.' };
-  }
-  if (!accessibilityModes.has(accessibilityMode)) {
-    return { error: 'Select a valid accessibility mode.' };
-  }
-
-  return {
-    value: {
-      usingFor,
-      patientName,
-      ageGroup,
-      city,
-      preferredLanguage,
-      accessibilityMode,
-      caregiverSupport,
-    },
-  };
-}
-
-function profileJson(row) {
-  if (!row) return null;
-  return {
-    id: String(row.id),
-    usingFor: row.using_for,
-    patientName: row.patient_name,
-    ageGroup: row.age_group,
-    city: row.city,
-    preferredLanguage: row.preferred_language,
-    accessibilityMode: row.accessibility_mode,
-    caregiverSupport: Boolean(row.caregiver_support),
-    onboardingCompleted: Boolean(row.onboarding_completed),
-  };
 }
 
 function instructionDurationDays(value) {
@@ -1553,56 +1486,6 @@ async function preferredLanguageForRequest(req, db = pool) {
   return req.auth.preferredLanguage;
 }
 
-async function saveProfile(userId, profile, onboardingCompleted) {
-  await pool.execute(
-    `INSERT INTO patient_profiles (
-      user_id,
-      using_for,
-      patient_name,
-      age_group,
-      city,
-      preferred_language,
-      accessibility_mode,
-      caregiver_support,
-      onboarding_completed
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      using_for = VALUES(using_for),
-      patient_name = VALUES(patient_name),
-      age_group = VALUES(age_group),
-      city = VALUES(city),
-      preferred_language = VALUES(preferred_language),
-      accessibility_mode = VALUES(accessibility_mode),
-      caregiver_support = VALUES(caregiver_support),
-      onboarding_completed = IF(
-        VALUES(onboarding_completed) = 1,
-        1,
-        onboarding_completed
-      )`,
-    [
-      userId,
-      profile.usingFor,
-      profile.patientName,
-      profile.ageGroup,
-      profile.city,
-      profile.preferredLanguage,
-      profile.accessibilityMode,
-      profile.caregiverSupport ? 1 : 0,
-      onboardingCompleted ? 1 : 0,
-    ],
-  );
-
-  const [rows] = await pool.execute(
-    `SELECT id, using_for, patient_name, age_group, city,
-      preferred_language, accessibility_mode, caregiver_support,
-      onboarding_completed
-     FROM patient_profiles WHERE user_id = ? LIMIT 1`,
-    [userId],
-  );
-
-  return profileJson(rows[0]);
-}
-
 function authenticate(req, res, next) {
   const authorization = req.get('authorization') || '';
   const [scheme, token] = authorization.split(' ');
@@ -2446,6 +2329,7 @@ app.put('/api/profile', authenticate, async (req, res, next) => {
 
   try {
     const profile = await saveProfile(
+      pool,
       req.auth.userId,
       validation.value,
       false,
@@ -2469,6 +2353,7 @@ app.post('/api/onboarding/complete', authenticate, async (req, res, next) => {
 
   try {
     const profile = await saveProfile(
+      pool,
       req.auth.userId,
       validation.value,
       true,
