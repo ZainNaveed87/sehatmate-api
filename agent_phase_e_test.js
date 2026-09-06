@@ -45,12 +45,12 @@ function normalizeSql(sql) {
   return String(sql).replace(/\s+/g, ' ').trim();
 }
 
-function sessionRow(state = emptyAgentSessionState()) {
+function sessionRow(state = emptyAgentSessionState(), { language = 'roman_ur' } = {}) {
   const sanitized = sanitizeAgentSessionState(state);
   return {
     id: Number(SESSION_ID),
     user_id: Number(USER),
-    language: 'roman_ur',
+    language,
     state_json: serializeAgentSessionState(sanitized.state),
     created_at: '2026-09-04 10:00:00',
     last_active_at: '2026-09-04 10:00:00',
@@ -58,13 +58,18 @@ function sessionRow(state = emptyAgentSessionState()) {
   };
 }
 
-function createPool({ initialState = emptyAgentSessionState(), plans = [] } = {}) {
-  let row = sessionRow(initialState);
+function createPool({
+  initialState = emptyAgentSessionState(),
+  plans = [],
+  preferredLanguage = 'Roman Urdu',
+  sessionLanguage = 'roman_ur',
+} = {}) {
+  let row = sessionRow(initialState, { language: sessionLanguage });
   const auditRows = [];
   const execute = async (sql, params = []) => {
     const text = normalizeSql(sql);
     if (text.startsWith('SELECT preferred_language FROM patient_profiles')) {
-      return [[{ preferred_language: 'Roman Urdu' }]];
+      return [[{ preferred_language: preferredLanguage }]];
     }
     if (text.startsWith('UPDATE agent_sessions SET last_active_at')) {
       return [{ affectedRows: 1 }];
@@ -133,8 +138,11 @@ function createPool({ initialState = emptyAgentSessionState(), plans = [] } = {}
     get state() {
       return JSON.parse(row.state_json);
     },
+    get sessionLanguage() {
+      return row.language;
+    },
     setState(state) {
-      row = sessionRow(state);
+      row = sessionRow(state, { language: row.language });
     },
   };
 }
@@ -200,18 +208,19 @@ function zeroCallProvider() {
   };
 }
 
-function plannedProvider(plan) {
+function plannedProvider(plan, { replyTemplate = 'Safe reply.', capture = null } = {}) {
   const calls = { plan: 0, reply: 0 };
   return {
     calls,
     provider: createAgentProvider({
-      generateJson: async ({ systemPrompt }) => {
+      generateJson: async ({ systemPrompt, userPrompt }) => {
         if (systemPrompt.includes('planning stage')) {
           calls.plan += 1;
+          capture?.planPrompts?.push(userPrompt);
           return { json: plan, model: 'mock', provider: 'mock' };
         }
         calls.reply += 1;
-        return { json: { messageTemplate: 'Safe reply.' }, model: 'mock', provider: 'mock' };
+        return { json: { messageTemplate: replyTemplate }, model: 'mock', provider: 'mock' };
       },
       configuration: () => ({ configured: true, provider: 'mock', model: 'mock', message: null }),
     }),
@@ -500,6 +509,239 @@ await test('core resolves pehla wala from verified ordered list and navigates ex
   assert.equal(provider.calls.plan, 1);
   assert.equal(provider.calls.reply, 0);
   assert.deepEqual(pool.state.currentFocus, { type: 'care_plan', id: '17' });
+});
+
+await test('real two-turn ordinal reference stores list then opens first care plan', async () => {
+  const pool = createPool({
+    preferredLanguage: 'English',
+    sessionLanguage: 'en',
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+  const listProvider = plannedProvider({
+    intent: 'list_care_plans',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate:
+      'Aap ke care plans mein {{fact:c1_plans_1_title}} aur {{fact:c1_plans_2_title}} shamil hain.',
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: listProvider.provider,
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(first.language, 'roman_ur');
+  assert.equal(first.fallbackCode, undefined);
+  assert.doesNotMatch(first.reply, /complete nahi kar saka|could not complete/i);
+  assert.deepEqual(pool.state.recentOrderedEntityList, {
+    kind: 'care_plan',
+    entities: [
+      { type: 'care_plan', id: '17' },
+      { type: 'care_plan', id: '21' },
+    ],
+  });
+  assert.equal(pool.sessionLanguage, 'roman_ur');
+
+  const capture = { planPrompts: [] };
+  const openProvider = plannedProvider({
+    intent: 'open_resolved_care_plan',
+    capabilityCalls: [],
+    navigationIntent: { target: 'care_plan_detail', params: {} },
+  }, { capture });
+
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'pehla wala dikhao',
+    provider: openProvider.provider,
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.fallbackCode, undefined);
+  assert.deepEqual(second.navigation, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '17' },
+  });
+  assert.deepEqual(second.referencedEntities, [
+    { type: 'care_plan', id: '17', title: 'Prescription Plan' },
+  ]);
+  assert.match(
+    capture.planPrompts[0],
+    /"referenceResolution":\{"status":"resolved","source":"ordinal","entity":\{"type":"care_plan","id":"17"\}\}/,
+  );
+  assert.equal(openProvider.calls.plan, 1);
+  assert.equal(openProvider.calls.reply, 0);
+});
+
+await test('real two-turn ordinal reference opens second care plan', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+  const listProvider = plannedProvider({
+    intent: 'list_care_plans',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate:
+      'Aap ke care plans mein {{fact:c1_plans_1_title}} aur {{fact:c1_plans_2_title}} shamil hain.',
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: listProvider.provider,
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(first.fallbackCode, undefined);
+  assert.deepEqual(pool.state.recentOrderedEntityList.entities.map((entity) => entity.id), [
+    '17',
+    '21',
+  ]);
+
+  const capture = { planPrompts: [] };
+  const openProvider = plannedProvider({
+    intent: 'open_resolved_care_plan',
+    capabilityCalls: [],
+    navigationIntent: { target: 'care_plan_detail', params: {} },
+  }, { capture });
+
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'doosra wala dikhao',
+    provider: openProvider.provider,
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.fallbackCode, undefined);
+  assert.deepEqual(second.navigation, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '21' },
+  });
+  assert.deepEqual(second.referencedEntities, [
+    { type: 'care_plan', id: '21', title: 'Exercise Plan' },
+  ]);
+  assert.match(
+    capture.planPrompts[0],
+    /"referenceResolution":\{"status":"resolved","source":"ordinal","entity":\{"type":"care_plan","id":"21"\}\}/,
+  );
+});
+
+await test('real two-turn pronoun reference with two care plans asks clarification', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+  const listProvider = plannedProvider({
+    intent: 'list_care_plans',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate:
+      'Aap ke care plans mein {{fact:c1_plans_1_title}} aur {{fact:c1_plans_2_title}} shamil hain.',
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: listProvider.provider,
+  });
+
+  assert.equal(first.ok, true);
+  assert.deepEqual(pool.state.recentOrderedEntityList.entities.map((entity) => entity.id), [
+    '17',
+    '21',
+  ]);
+
+  const provider = zeroCallProvider();
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    provider: provider.provider,
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
+  assert.equal(second.navigation, null);
+  assert.match(second.reply, /kis wale/i);
+  assert.equal(provider.calls, 0);
+});
+
+await test('two-turn ordinal reference rejects planner substitution of another plan', async () => {
+  const pool = createPool({
+    plans: [
+      { id: '17', title: 'Prescription Plan' },
+      { id: '21', title: 'Exercise Plan' },
+    ],
+  });
+  const listProvider = plannedProvider({
+    intent: 'list_care_plans',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  }, {
+    replyTemplate:
+      'Aap ke care plans mein {{fact:c1_plans_1_title}} aur {{fact:c1_plans_2_title}} shamil hain.',
+  });
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plan dikhao',
+    provider: listProvider.provider,
+  });
+
+  assert.equal(first.ok, true);
+  assert.deepEqual(pool.state.recentOrderedEntityList.entities.map((entity) => entity.id), [
+    '17',
+    '21',
+  ]);
+
+  const badProvider = plannedProvider({
+    intent: 'open_wrong_care_plan',
+    capabilityCalls: [],
+    navigationIntent: { target: 'care_plan_detail', params: { carePlanId: '21' } },
+  });
+
+  const second = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'pehla wala dikhao',
+    provider: badProvider.provider,
+  });
+
+  assert.equal(second.ok, true);
+  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.fallbackCode, 'AGENT_REFERENCE_MISMATCH');
+  assert.equal(second.navigation, null);
+  assert.equal(badProvider.calls.plan, 1);
+  assert.equal(badProvider.calls.reply, 0);
 });
 
 await test('core ambiguous us wala asks clarification with zero provider calls', async () => {

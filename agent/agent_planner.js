@@ -52,6 +52,7 @@ import {
 } from './agent_capability_registry.js';
 import {
   listAgentNavigationTargets,
+  resolveAgentNavigationTarget,
   validateAgentNavigationIntent,
 } from './agent_navigation_registry.js';
 import {
@@ -59,12 +60,24 @@ import {
   reviewAgentCapabilityCalls,
 } from './agent_safety_gateway.js';
 import { defaultAgentProvider } from './agent_provider.js';
-import { cleanText } from '../services/shared_utils.js';
+import { cleanText, idPattern } from '../services/shared_utils.js';
 
 /** Defensive planner-side bound on the user message (endpoint bounds it too). */
 export const AGENT_PLANNER_LIMITS = Object.freeze({
   messageMaxChars: 2000,
   intentMaxChars: 80,
+});
+
+const RESOLVED_REFERENCE_ARG_BY_TYPE = Object.freeze({
+  care_plan: 'planId',
+  care_gap: 'gapId',
+  family_member: 'relationshipId',
+});
+
+const RESOLVED_REFERENCE_NAV_PARAM_BY_TYPE = Object.freeze({
+  care_plan: 'carePlanId',
+  care_gap: 'careGapId',
+  family_member: 'relationshipId',
 });
 
 function invalidPlan(message) {
@@ -104,6 +117,83 @@ function navigationCatalogLines() {
       : '()';
     return `- ${target.target}${params}`;
   });
+}
+
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function resolvedReferenceFromContextSlice(contextSlice) {
+  const entity = contextSlice?.referenceResolution?.status === 'resolved'
+    ? contextSlice.referenceResolution.entity
+    : null;
+  if (!isPlainObject(entity)) return null;
+  const type = cleanText(entity.type, 40);
+  const id = cleanText(String(entity.id ?? ''), 64);
+  if (!RESOLVED_REFERENCE_ARG_BY_TYPE[type] || !idPattern.test(id)) return null;
+  return { type, id };
+}
+
+function bindCapabilityCallsToResolvedReference(rawCalls, reference) {
+  if (!Array.isArray(rawCalls)) return rawCalls;
+  const argName = RESOLVED_REFERENCE_ARG_BY_TYPE[reference.type];
+  return rawCalls.map((call) => {
+    if (!isPlainObject(call)) return call;
+    const capability = resolveAgentCapability(call.name);
+    if (!capability?.inputSchema?.properties?.[argName]) return call;
+    const rawArgs = call.args == null ? {} : call.args;
+    if (!isPlainObject(rawArgs)) return call;
+    if (rawArgs[argName] !== undefined && rawArgs[argName] !== null) return call;
+    return {
+      ...call,
+      args: {
+        ...rawArgs,
+        [argName]: reference.id,
+      },
+    };
+  });
+}
+
+function bindNavigationToResolvedReference(rawNavigation, reference) {
+  if (!isPlainObject(rawNavigation)) return rawNavigation;
+  const paramName = RESOLVED_REFERENCE_NAV_PARAM_BY_TYPE[reference.type];
+  const target = resolveAgentNavigationTarget(rawNavigation.target);
+  if (!target?.params || target.params[paramName] === undefined) return rawNavigation;
+  const rawParams = rawNavigation.params == null ? {} : rawNavigation.params;
+  if (!isPlainObject(rawParams)) return rawNavigation;
+  if (rawParams[paramName] !== undefined && rawParams[paramName] !== null) {
+    return rawNavigation;
+  }
+  return {
+    ...rawNavigation,
+    params: {
+      ...rawParams,
+      [paramName]: reference.id,
+    },
+  };
+}
+
+/**
+ * If Phase E has already resolved the current turn's reference to one owned
+ * entity, copy that exact id into missing compatible planner fields before
+ * strict schema validation. This does not sanitize or override provider data:
+ * unknown fields, invalid shapes, explicit wrong ids, and type mismatches
+ * still fail through validateAgentPlan/reviewPlanAgainstResolvedReference.
+ */
+function bindRawPlanToResolvedReference(rawPlan, contextSlice) {
+  const reference = resolvedReferenceFromContextSlice(contextSlice);
+  if (!reference || !isPlainObject(rawPlan)) return rawPlan;
+  return {
+    ...rawPlan,
+    capabilityCalls: bindCapabilityCallsToResolvedReference(
+      rawPlan.capabilityCalls,
+      reference,
+    ),
+    navigationIntent: bindNavigationToResolvedReference(
+      rawPlan.navigationIntent,
+      reference,
+    ),
+  };
 }
 
 /**
@@ -280,7 +370,11 @@ export async function planAgentMessage({
     return completion;
   }
 
-  const validated = validateAgentPlan(completion.data.json);
+  const planForValidation = bindRawPlanToResolvedReference(
+    completion.data.json,
+    contextSlice,
+  );
+  const validated = validateAgentPlan(planForValidation);
   if (!validated.ok) {
     return validated;
   }
