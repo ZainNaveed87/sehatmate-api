@@ -156,7 +156,7 @@ function careGapResolution(gap) {
           'Compare the instruction with the original uploaded healthcare document.',
           'If the source itself is unclear, confirm the instruction with a qualified healthcare professional.',
           'Correct the extracted text if needed and mark the instruction verified only when it matches the source.',
-          'Save the instruction. SehatRoute will automatically re-check this care gap.',
+          'Save the instruction. SehatMate will automatically re-check this care gap.',
         ],
       };
     case 'schedule_gap':
@@ -168,7 +168,7 @@ function careGapResolution(gap) {
             'Find the scheduled item linked to this gap.',
             'Choose an exact reminder time inside the allowed period shown by the app.',
             'Confirm the time and save it.',
-            'SehatRoute will automatically re-check this care gap.',
+            'SehatMate will automatically re-check this care gap.',
           ],
         };
       }
@@ -178,7 +178,7 @@ function careGapResolution(gap) {
           'Open the Schedule tab for this care plan.',
           'Regenerate or review the schedule so the verified instruction appears as a scheduled item.',
           'Do not change medical timing or treatment instructions yourself.',
-          'Save the schedule changes. SehatRoute will automatically re-check this care gap.',
+          'Save the schedule changes. SehatMate will automatically re-check this care gap.',
         ],
       };
     case 'missing_information':
@@ -188,7 +188,7 @@ function careGapResolution(gap) {
           'Open Reality Check for this care plan.',
           'Find and answer the missing practical question.',
           'Save the Reality Check answers.',
-          'SehatRoute will automatically re-check this care gap using the saved answer.',
+          'SehatMate will automatically re-check this care gap using the saved answer.',
         ],
       };
     case 'document_gap':
@@ -198,7 +198,7 @@ function careGapResolution(gap) {
           'Open Documents for this care plan.',
           'Upload the relevant prescription, discharge summary, follow-up slip, or other care document.',
           'Complete instruction extraction and human verification for the uploaded document.',
-          'SehatRoute will automatically re-check this care gap.',
+          'SehatMate will automatically re-check this care gap.',
         ],
       };
     case 'care_coordination':
@@ -384,7 +384,7 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
       severity: 'blocking',
       legacyStatus: 'blocked',
       summary: 'The plan does not currently have a source document that can be used to verify its care instructions.',
-      reason: 'SehatRoute should keep treatment instructions grounded in a user-provided healthcare document rather than inventing missing medical details.',
+      reason: 'SehatMate should keep treatment instructions grounded in a user-provided healthcare document rather than inventing missing medical details.',
       nextStep: 'Upload or link the relevant prescription, discharge summary, follow-up slip, or other care document and complete instruction verification.',
       sourceKey: 'plan:document:missing',
       sourceKind: 'care_plan',

@@ -1,9 +1,9 @@
 {
-  "name": "sehatroute-auth-api",
+  "name": "sehatmate-api",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Secure Node.js, Express, MySQL and Google authentication API for SehatRoute AI.",
+  "description": "Secure Node.js, Express, MySQL and Google authentication API for SehatMate.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

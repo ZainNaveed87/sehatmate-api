@@ -1532,7 +1532,7 @@ app.get('/health', async (_req, res, next) => {
 
     res.json({
       success: true,
-      service: 'sehatroute-auth-api',
+      service: 'sehatmate-api',
       database: 'connected',
       build: 'medical-safety-fixed-duration-v7',
       ai: aiConfiguration(),

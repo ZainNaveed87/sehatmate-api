@@ -495,7 +495,7 @@ export async function analyzeAndStoreCareGapContext({
       const result =
         await generateAiText({
           systemPrompt:
-            `You are SehatRoute AI's practical care-context classifier.
+            `You are SehatMate AI's practical care-context classifier.
 
 You may interpret:
 - routine feasibility
