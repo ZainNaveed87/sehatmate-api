@@ -972,6 +972,7 @@ await test('navigation-only turn returns deterministic localized reply without r
 });
 
 await test('READ capability execution is audited and exact 14:00 facts are backend-grounded', async () => {
+
   const pool = createFakePool({
     preferredLanguage: 'en',
     activePlans: [{ id: 7, title: 'Demo Plan', readiness_score: 85 }],
@@ -1024,6 +1025,158 @@ await test('READ capability execution is audited and exact 14:00 facts are backe
       call.params.includes(1)),
   );
 });
+
+await test(
+  'successful get_next_task falls back to deterministic English reply when reply provider fails',
+  async () => {
+    const pool = createFakePool({
+      preferredLanguage: 'en',
+      activePlans: [{ id: 7, title: 'Demo Plan', readiness_score: 85 }],
+      occurrenceRows: [
+        {
+          id: 12,
+          care_plan_id: 7,
+          schedule_item_id: 102,
+          occurrence_date: TODAY,
+          scheduled_time: '14:00',
+          status: 'pending',
+          completed_at: null,
+          completed_time: null,
+          outcome_source: 'user',
+          note: '',
+          title: 'DemoMed Beta',
+          task_kind: 'medicine',
+          display_time: 'Afternoon',
+          recurrence_text: 'Daily',
+          grounding: 'explicit',
+          plan_title: 'Demo Plan',
+        },
+      ],
+    });
+
+    const { provider } = sequencedPlanningProvider([
+      {
+        json: {
+          intent: 'read_next_task',
+          capabilityCalls: [{ name: 'get_next_task', args: {} }],
+          navigationIntent: null,
+        },
+      },
+      {
+        error: 'reply provider failed',
+      },
+    ]);
+
+    const result = await handleAgentMessage({
+      pool,
+      userId: USER,
+      message: 'What is my next task?',
+      clientToday: TODAY,
+      provider,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.language, 'en');
+    assert.equal(
+      result.reply,
+      'Your next pending care task is DemoMed Beta at 14:00.',
+    );
+    assert.ok(result.fallbackCode);
+  },
+);
+
+await test(
+  'successful get_next_task falls back to deterministic Roman Urdu reply when reply provider fails',
+  async () => {
+    const pool = createFakePool({
+      preferredLanguage: 'en',
+      activePlans: [{ id: 7, title: 'Demo Plan', readiness_score: 85 }],
+      occurrenceRows: [
+        {
+          id: 12,
+          care_plan_id: 7,
+          schedule_item_id: 102,
+          occurrence_date: TODAY,
+          scheduled_time: '14:00',
+          status: 'pending',
+          completed_at: null,
+          completed_time: null,
+          outcome_source: 'user',
+          note: '',
+          title: 'DemoMed Beta',
+          task_kind: 'medicine',
+          display_time: 'Afternoon',
+          recurrence_text: 'Daily',
+          grounding: 'explicit',
+          plan_title: 'Demo Plan',
+        },
+      ],
+    });
+
+    const { provider } = sequencedPlanningProvider([
+      {
+        json: {
+          intent: 'read_next_task',
+          capabilityCalls: [{ name: 'get_next_task', args: {} }],
+          navigationIntent: null,
+        },
+      },
+      {
+        error: 'reply provider failed',
+      },
+    ]);
+
+    const result = await handleAgentMessage({
+      pool,
+      userId: USER,
+      message: 'Mera next task kia hai?',
+      clientToday: TODAY,
+      provider,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.language, 'roman_ur');
+    assert.equal(
+      result.reply,
+      'Aap ka agla pending care task DemoMed Beta hai, time 14:00 hai.',
+    );
+    assert.ok(result.fallbackCode);
+  },
+);
+
+await test(
+  'failed get_next_task read still fails closed without deterministic task invention',
+  async () => {
+    const pool = createFakePool({
+      preferredLanguage: 'en',
+      activePlans: [{ id: 7, title: 'Demo Plan', readiness_score: 85 }],
+      throwOnOccurrenceRead: true,
+    });
+
+    const { provider, calls } = countingMockProvider({
+      plan: {
+        intent: 'read_next_task',
+        capabilityCalls: [{ name: 'get_next_task', args: {} }],
+        navigationIntent: null,
+      },
+      replyTemplate: () => 'This must never be returned.',
+    });
+
+    const result = await handleAgentMessage({
+      pool,
+      userId: USER,
+      message: 'What is my next task?',
+      clientToday: TODAY,
+      provider,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.fallbackCode, 'AGENT_CAPABILITY_FAILED');
+    assert.doesNotMatch(result.reply, /DemoMed|14:00|must never/i);
+    assert.match(result.reply, /could not complete|try again/i);
+    assert.equal(calls.reply, 0);
+  },
+);
 
 await test('GAP_NOT_FOUND short-circuits to fallback and skips reply generation', async () => {
   const pool = createFakePool({ preferredLanguage: 'en' });

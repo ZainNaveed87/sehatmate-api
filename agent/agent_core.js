@@ -117,6 +117,7 @@ import {
 } from './agent_session_store.js';
 import { AGENT_STATE_LIMITS } from './agent_session_state.js';
 import { recordAgentAction } from './agent_action_audit.js';
+import { nextTaskFromTodayState } from '../services/performance_summary_service.js';
 import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
 import {
@@ -230,6 +231,116 @@ function navigationReadyText(target, canonicalLanguage) {
     return `${label} kholne ke liye neeche Kholein dabayein.`;
   }
   return `Use Open below to open ${label}.`;
+}
+
+
+const EXACT_AGENT_CLOCK_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function safeNonNegativeCount(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) return null;
+
+  return parsed;
+}
+
+function deterministicNextTaskReply({
+  capabilityResults,
+  language,
+}) {
+  const canonicalLanguage = canonicalAgentLanguage(language);
+
+  let nextTask = null;
+  let pendingToday = null;
+
+  const directNextTask = capabilityResults.find(
+    (entry) =>
+      entry?.name === 'get_next_task' &&
+      entry?.result?.ok === true,
+  );
+
+  if (directNextTask) {
+    const data = directNextTask.result?.data;
+
+    if (
+      !data ||
+      typeof data !== 'object' ||
+      Array.isArray(data) ||
+      !Object.prototype.hasOwnProperty.call(data, 'nextTask')
+    ) {
+      return null;
+    }
+
+    nextTask = data.nextTask;
+    pendingToday = safeNonNegativeCount(data.pendingToday);
+  } else {
+    const todayTasks = capabilityResults.find(
+      (entry) =>
+        entry?.name === 'get_today_tasks' &&
+        entry?.result?.ok === true,
+    );
+
+    if (!todayTasks) return null;
+
+    const state = todayTasks.result?.data;
+
+    if (
+      !state ||
+      typeof state !== 'object' ||
+      !Array.isArray(state.occurrences) ||
+      !state.summary
+    ) {
+      return null;
+    }
+
+    nextTask = nextTaskFromTodayState(state);
+    pendingToday = safeNonNegativeCount(state.summary.pending);
+  }
+
+  if (!nextTask) {
+    if (pendingToday !== 0) return null;
+
+    if (canonicalLanguage === 'ur') {
+      return 'آج آپ کا کوئی زیرِ التوا نگہداشت کا کام نہیں ہے۔';
+    }
+
+    if (canonicalLanguage === 'roman_ur') {
+      return 'Aaj aap ka koi pending care task nahi hai.';
+    }
+
+    return 'You have no pending care task for today.';
+  }
+
+  if (
+    !nextTask ||
+    typeof nextTask !== 'object' ||
+    Array.isArray(nextTask)
+  ) {
+    return null;
+  }
+
+  const title = cleanText(nextTask.title, 120);
+  const scheduledTime = cleanText(nextTask.scheduledTime, 10);
+  const status = cleanText(nextTask.status, 20);
+
+  if (
+    !title ||
+    !EXACT_AGENT_CLOCK_PATTERN.test(scheduledTime) ||
+    status !== 'pending'
+  ) {
+    return null;
+  }
+
+  if (canonicalLanguage === 'ur') {
+    return `آپ کا اگلا زیرِ التوا کام ${title} ہے، وقت ${scheduledTime} ہے۔`;
+  }
+
+  if (canonicalLanguage === 'roman_ur') {
+    return `Aap ka agla pending care task ${title} hai, time ${scheduledTime} hai.`;
+  }
+
+  return `Your next pending care task is ${title} at ${scheduledTime}.`;
 }
 
 function confirmationText(key, canonicalLanguage) {
@@ -1581,11 +1692,24 @@ export async function handleAgentMessage({
         capabilityResults,
       });
       if (replyResult.ok) {
-        reply = replyResult.reply;
-      } else {
-        reply = localizedAgentText('agentUnavailable', language);
-        fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
-      }
+  reply = replyResult.reply;
+} else {
+  const deterministicReply = deterministicNextTaskReply({
+    capabilityResults,
+    language,
+  });
+
+  if (deterministicReply) {
+    reply = deterministicReply;
+
+    // Preserve the real reply-stage failure code for diagnostics while
+    // still returning the already-verified authoritative task facts.
+    fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
+  } else {
+    reply = localizedAgentText('agentUnavailable', language);
+    fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
+  }
+}
     }
 
     return finishAgentTurn({
