@@ -292,6 +292,162 @@ function customRealityAction(questionKey) {
   if (questionKey === 'medicine_access') return 'care_plan';
   return 'reality_check';
 }
+const SAFE_SIMULATION_NAVIGATION_ACTIONS = new Set([
+  'review_schedule',
+  'reality_check',
+  'review_instruction',
+  'documents',
+  'family_care',
+  'calendar',
+  'care_plan',
+]);
+
+function canonicalSimulationNavigationAction(value) {
+  const action = String(value || '').trim().toLowerCase();
+  switch (action) {
+    case 'schedule':
+    case 'review_schedule':
+      return 'review_schedule';
+    case 'recheck_reality':
+    case 'keep_at_risk':
+    case 'reality_check':
+      return 'reality_check';
+    case 'review_verified_instruction':
+    case 'review_instruction':
+      return 'review_instruction';
+    case 'documents':
+    case 'family_care':
+    case 'calendar':
+    case 'care_plan':
+      return action;
+    default:
+      return null;
+  }
+}
+
+function allowedSimulationActionsForGap(gap) {
+  switch (String(gap?.gap_type || '')) {
+    case 'verification':
+      return new Set(['review_instruction', 'documents', 'care_plan']);
+    case 'schedule_gap':
+      return new Set(['review_schedule', 'review_instruction', 'care_plan']);
+    case 'missing_information':
+      return new Set([
+        'reality_check',
+        'review_schedule',
+        'family_care',
+        'documents',
+        'care_plan',
+      ]);
+    case 'document_gap':
+      return new Set(['documents', 'review_instruction', 'care_plan']);
+    case 'care_coordination':
+      return new Set(['family_care', 'reality_check', 'care_plan']);
+    case 'overdue':
+      return new Set(['calendar', 'review_schedule', 'care_plan']);
+    case 'practical_fit':
+      return new Set([
+        'reality_check',
+        'review_schedule',
+        'family_care',
+        'calendar',
+        'review_instruction',
+        'documents',
+        'care_plan',
+      ]);
+    default:
+      return new Set(['care_plan']);
+  }
+}
+
+function simulationNavigationLabel(action, gap) {
+  const sourceKind = String(gap?.source_kind || '').toLowerCase();
+  switch (action) {
+    case 'review_schedule':
+      return sourceKind === 'schedule_item' ? 'Set Reminder Time' : 'Review Schedule';
+    case 'reality_check':
+      return String(gap?.gap_type || '') === 'missing_information'
+        ? 'Answer Reality Check'
+        : 'Review Reality Check';
+    case 'review_instruction':
+      return 'Review verified instruction';
+    case 'documents':
+      return 'Review documents';
+    case 'family_care':
+      return 'Review Family Care';
+    case 'calendar':
+      return 'Open Calendar';
+    default:
+      return 'Review care plan';
+  }
+}
+
+function simulationNavigationTarget(action, planId, baseTarget = null) {
+  const source =
+    baseTarget && typeof baseTarget === 'object' && !Array.isArray(baseTarget)
+      ? baseTarget
+      : {};
+  const target = {
+    ...source,
+    care_plan_id: String(planId),
+  };
+
+  if (action === 'review_schedule') target.care_plan_tab = 1;
+  else if (action === 'documents') target.care_plan_tab = 4;
+  else if (action === 'review_instruction') target.care_plan_tab = 0;
+  else target.care_plan_tab = null;
+
+  return target;
+}
+
+export function simulationNavigationForCareGap({
+  gap,
+  careGapJsonValue,
+  contextInsights = [],
+  planId,
+}) {
+  const defaultAction =
+    canonicalSimulationNavigationAction(careGapJsonValue?.action_type) ||
+    'care_plan';
+  const gapId = String(gap?.id ?? '');
+  const sourceId = String(gap?.source_id ?? '');
+  const insight = (contextInsights || []).find(
+    (item) =>
+      (gapId && String(item?.gapId ?? '') === gapId) ||
+      (sourceId && String(item?.sourceId ?? '') === sourceId),
+  );
+
+  const requiresInstructionReview = Boolean(
+    insight?.requiresInstructionReview ||
+      gap?.context_ai_requires_instruction_review,
+  );
+  const aiAction = requiresInstructionReview
+    ? 'review_instruction'
+    : insight
+      ? canonicalSimulationNavigationAction(insight.nextAction)
+      : null;
+  const allowed = allowedSimulationActionsForGap(gap);
+  const useAiAction =
+    aiAction != null &&
+    SAFE_SIMULATION_NAVIGATION_ACTIONS.has(aiAction) &&
+    (requiresInstructionReview || allowed.has(aiAction));
+  const action = useAiAction ? aiAction : defaultAction;
+
+  return {
+    action,
+    actionLabel:
+      !useAiAction && careGapJsonValue?.action_label
+        ? careGapJsonValue.action_label
+        : simulationNavigationLabel(action, gap),
+    actionSource: useAiAction ? 'ai_context' : 'gap_rule',
+    target: simulationNavigationTarget(
+      action,
+      planId,
+      careGapJsonValue?.target || null,
+    ),
+  };
+}
+
 
 function practicalAdaptationForAnswer(answer, template, option, tasks, routineProfile = null, taskDecisions = new Map()) {
   const key = String(answer?.question_key || '');
@@ -712,6 +868,12 @@ export async function readSimulationState({ pool, userId, planId }) {
 
   const blockers = openBlockingGaps.map((gap) => {
     const json = careGapJson(gap);
+    const navigation = simulationNavigationForCareGap({
+      gap,
+      careGapJsonValue: json,
+      contextInsights,
+      planId,
+    });
     return {
       type: 'care_gap',
       gapId: String(gap.id),
@@ -719,7 +881,7 @@ export async function readSimulationState({ pool, userId, planId }) {
       severity: 'blocked',
       reason: gap.reason || gap.summary,
       recommendation: gap.next_step || 'Resolve this required care-plan item before activation.',
-      action: json.action_type || 'care_plan',
+      ...navigation,
     };
   });
 
@@ -730,7 +892,15 @@ export async function readSimulationState({ pool, userId, planId }) {
       severity: 'blocked',
       reason: 'A care plan needs a schedule before reminders can be activated.',
       recommendation: 'Generate the schedule and confirm the required reminder times.',
-      action: 'schedule',
+      action: 'review_schedule',
+      actionLabel: 'Review Schedule',
+      actionSource: 'simulation_rule',
+      target: {
+        care_plan_id: String(planId),
+        source_kind: 'care_plan',
+        source_id: String(planId),
+        care_plan_tab: 1,
+      },
     });
   }
 
@@ -743,7 +913,17 @@ export async function readSimulationState({ pool, userId, planId }) {
         'One or more medicines do not yet have an explicit repeat pattern or one-time date.',
       recommendation:
         'Open Schedule and set the repeat pattern exactly as instructed by the healthcare professional.',
-      action: 'schedule',
+      action: 'review_schedule',
+      actionLabel: 'Review Schedule',
+      actionSource: 'simulation_rule',
+      target: {
+        care_plan_id: String(planId),
+        source_kind: 'schedule_item',
+        source_id: unresolvedMedicineRecurrenceTasks[0]?.id == null
+          ? null
+          : String(unresolvedMedicineRecurrenceTasks[0].id),
+        care_plan_tab: 1,
+      },
     });
   }
 

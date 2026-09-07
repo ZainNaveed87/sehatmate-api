@@ -12,6 +12,14 @@ const ALLOWED_SIGNALS = new Set([
 ]);
 
 const ALLOWED_ACTIONS = new Set([
+  'review_schedule',
+  'reality_check',
+  'review_instruction',
+  'documents',
+  'family_care',
+  'calendar',
+  'care_plan',
+  // Legacy values remain accepted for existing stored context.
   'recheck_reality',
   'keep_at_risk',
   'review_verified_instruction',
@@ -519,13 +527,20 @@ STRICT SAFETY RULES:
 9. A healthcare-professional response is context until any changed instruction is formally reviewed and verified.
 10. If a professional response may change treatment, dose, frequency, or exact medical timing:
     signal = "possible_instruction_change"
-    nextAction = "review_verified_instruction"
-11. Practical improvement should normally use:
-    nextAction = "recheck_reality"
-because the user must confirm whether the task is now reliably achievable.
-12. Apply the server-selected language only to summary and followUpQuestion.
-13. Keep signal, nextAction and requiresInstructionReview as canonical machine values.
-14. Keep user notes and healthcare-professional answers unchanged as source context. Never rewrite them as verified medical instructions.
+    nextAction = "review_instruction"
+11. Choose the next workflow from the allowlist using the actual issue context:
+    - reminder/schedule logistics -> "review_schedule"
+    - routine feasibility or a Reality Check answer -> "reality_check"
+    - verified instruction review -> "review_instruction"
+    - missing/source documents -> "documents"
+    - caregiver/family support -> "family_care"
+    - dated visit/overdue/travel logistics -> "calendar"
+    - general plan review -> "care_plan"
+    - no navigation needed -> "no_change"
+12. Do not invent a route or URL. Return only one allowlisted machine action.
+13. Apply the server-selected language only to summary and followUpQuestion.
+14. Keep signal, nextAction and requiresInstructionReview as canonical machine values.
+15. Keep user notes and healthcare-professional answers unchanged as source context. Never rewrite them as verified medical instructions.
 
 Language rules:
 ${aiLanguageInstruction(normalizedPreferredLanguage, {
@@ -546,9 +561,13 @@ Return JSON only.`,
                 ],
 
                 allowedNextActions: [
-                  'recheck_reality',
-                  'keep_at_risk',
-                  'review_verified_instruction',
+                  'review_schedule',
+                  'reality_check',
+                  'review_instruction',
+                  'documents',
+                  'family_care',
+                  'calendar',
+                  'care_plan',
                   'no_change',
                 ],
 
@@ -892,10 +911,10 @@ export function enrichSimulationFindingsWithContext(
       // -----------------------------------------
 
       if (
-        insight
-          .requiresInstructionReview ||
-        insight.nextAction ===
-          'review_verified_instruction'
+        insight.requiresInstructionReview ||
+        ['review_verified_instruction', 'review_instruction'].includes(
+          insight.nextAction,
+        )
       ) {
         return {
           ...base,
@@ -916,8 +935,9 @@ export function enrichSimulationFindingsWithContext(
       // -----------------------------------------
 
       if (
-        insight.nextAction ===
-        'recheck_reality'
+        ['recheck_reality', 'reality_check'].includes(
+          insight.nextAction,
+        )
       ) {
         return {
           ...base,
@@ -930,6 +950,60 @@ export function enrichSimulationFindingsWithContext(
 
           actionLabel:
             'Re-check practical fit',
+        };
+      }
+
+      // -----------------------------------------
+      // AI-selected safe workflow navigation
+      // -----------------------------------------
+
+      if (insight.nextAction === 'review_schedule') {
+        return {
+          ...base,
+          recommendation:
+            `${insight.summary} Review the related reminder or schedule setup while keeping verified medical instructions unchanged.`,
+          action: 'review_schedule',
+          actionLabel: 'Review schedule',
+        };
+      }
+
+      if (insight.nextAction === 'family_care') {
+        return {
+          ...base,
+          recommendation:
+            `${insight.summary} Review Family Care and arrange practical support without changing the verified care instruction.`,
+          action: 'family_care',
+          actionLabel: 'Review Family Care',
+        };
+      }
+
+      if (insight.nextAction === 'documents') {
+        return {
+          ...base,
+          recommendation:
+            `${insight.summary} Review the source care documents before changing any verified instruction.`,
+          action: 'documents',
+          actionLabel: 'Review documents',
+        };
+      }
+
+      if (insight.nextAction === 'calendar') {
+        return {
+          ...base,
+          recommendation:
+            `${insight.summary} Review the related dated task in Calendar. Keep verified treatment instructions unchanged.`,
+          action: 'calendar',
+          actionLabel: 'Open Calendar',
+        };
+      }
+
+      if (insight.nextAction === 'care_plan') {
+        return {
+          ...base,
+          recommendation:
+            `${insight.summary} Review the related care-plan information before making any practical change.`,
+          action: 'care_plan',
+          actionLabel: 'Review care plan',
         };
       }
 
