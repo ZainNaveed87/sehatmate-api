@@ -344,6 +344,27 @@ await test('readAgentSession: approved canonical stored state fields survive rea
       expiresAt: '2999-01-01T00:00:00.000Z',
     },
     pendingDraft: { title: 'Metformin' },
+    pendingClarification: {
+      clarificationId: 'clarify-state-1',
+      kind: 'entity_reference',
+      question: 'Which one do you mean?',
+      entityType: 'care_plan',
+      messageHash: 'a'.repeat(64),
+      createdAt: '2026-09-07T10:00:00.000Z',
+      expiresAt: '2026-09-07T10:05:00.000Z',
+      choices: [
+        {
+          choiceId: 'choice-state-1',
+          label: 'Morning Plan',
+          entity: { type: 'care_plan', id: '7' },
+        },
+        {
+          choiceId: 'choice-state-2',
+          label: 'Evening Plan',
+          entity: { type: 'care_plan', id: '8' },
+        },
+      ],
+    },
     lastTurnLanguage: 'roman_ur',
     lastActionSummary: 'Reminder confirmed',
   };
@@ -500,6 +521,32 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
       expiresAt: '2999-01-01T00:00:00.000Z',
     },
     pendingDraft: { title: 'Metformin', nestedObject: { deep: 'dropped' }, count: 3 },
+    pendingClarification: {
+      clarificationId: 'clarify-state-2',
+      kind: 'entity_reference',
+      question: 'Which one do you mean?',
+      entityType: 'care_plan',
+      messageHash: 'b'.repeat(64),
+      createdAt: '2026-09-07T10:00:00.000Z',
+      expiresAt: '2026-09-07T10:05:00.000Z',
+      choices: [
+        {
+          choiceId: 'choice-state-3',
+          label: 'Morning Plan',
+          entity: { type: 'care_plan', id: '7' },
+        },
+        {
+          choiceId: 'choice-state-4',
+          label: 'Bad Entity',
+          entity: { type: 'document', id: '9' },
+        },
+        {
+          choiceId: 'choice-state-5',
+          label: 'Evening Plan',
+          entity: { type: 'care_plan', id: '8' },
+        },
+      ],
+    },
     lastTurnLanguage: 'pirate',
     lastActionSummary: 'Reminder confirmed',
   });
@@ -519,6 +566,27 @@ await test('session state sanitizer rejects unexpected dangerous/unbounded shape
     },
   );
   assert.deepEqual(sanitized.state.pendingDraft, { title: 'Metformin' });
+  assert.deepEqual(sanitized.state.pendingClarification, {
+    clarificationId: 'clarify-state-2',
+    kind: 'entity_reference',
+    question: 'Which one do you mean?',
+    entityType: 'care_plan',
+    messageHash: 'b'.repeat(64),
+    createdAt: '2026-09-07T10:00:00.000Z',
+    expiresAt: '2026-09-07T10:05:00.000Z',
+    choices: [
+      {
+        choiceId: 'choice-state-3',
+        label: 'Morning Plan',
+        entity: { type: 'care_plan', id: '7' },
+      },
+      {
+        choiceId: 'choice-state-5',
+        label: 'Evening Plan',
+        entity: { type: 'care_plan', id: '8' },
+      },
+    ],
+  });
   assert.equal(sanitized.state.lastActionSummary, 'Reminder confirmed');
   assert.deepEqual(sanitized.state.currentFocus, { type: 'care_plan', id: '7' });
   assert.deepEqual(sanitized.state.recentOrderedEntityList, {

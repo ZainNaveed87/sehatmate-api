@@ -24,10 +24,10 @@
  * the spec forbids inventing one. The planner surfaces that as an explicit
  * "not available" answer instead.
  *
- * Date semantics: capabilities that take no date argument always use the
- * server-side UTC date keys of the underlying services; the optional
- * `date` argument of get_today_tasks is a validated YYYY-MM-DD calendar
- * date. "today" for reconciliation is never model-supplied.
+ * Date semantics: date-sensitive capabilities use the validated local
+ * calendar date supplied by the trusted client runtime when available.
+ * Explicit model-planned date arguments remain schema-validated separately.
+ * The runtime local date is never accepted as a model capability argument.
  *
  * Importing this module registers the capabilities as a side effect; the
  * registry stays the single lookup authority (agent_capability_registry.js).
@@ -99,7 +99,7 @@ defineAgentCapability({
   name: 'get_today_tasks',
   permissionClass: 'READ',
   description:
-    "Read the authenticated user's task occurrences for one day (default: the server's today), including task titles, scheduled times, statuses, plan titles, and the day summary counts.",
+    "Read the authenticated user's task occurrences for one day (default: the trusted runtime local date when available), including task titles, scheduled times, statuses, plan titles, and the day summary counts.",
   inputSchema: {
     properties: {
       date: {
@@ -109,12 +109,12 @@ defineAgentCapability({
     },
     required: [],
   },
-  execute: ({ pool, userId, args }) =>
+  execute: ({ pool, userId, args, clientToday }) =>
     readTodayTasksState({
       pool,
       userId,
-      date: args.date ?? null,
-      today: null,
+      date: args.date ?? clientToday ?? null,
+      today: clientToday,
     }),
   resultContract:
     '{ date, occurrences: [{ id, carePlanId, title, scheduledTime, status, ... }], summary: { total, completed, skipped, missed, pending, activePlans, openCareGaps, careReadiness } }',
@@ -129,12 +129,12 @@ defineAgentCapability({
     properties: {},
     required: [],
   },
-  execute: async ({ pool, userId }) => {
+  execute: async ({ pool, userId, clientToday }) => {
     const state = await readTodayTasksState({
       pool,
       userId,
-      date: null,
-      today: null,
+      date: clientToday,
+      today: clientToday,
     });
     if (!state.ok) return state;
     return {
@@ -173,11 +173,11 @@ defineAgentCapability({
     },
     required: [],
   },
-  execute: ({ pool, userId, args }) =>
+  execute: ({ pool, userId, args, clientToday }) =>
     readPerformanceSummary({
       pool,
       userId,
-      today: null,
+      today: clientToday,
       periodDays: args.periodDays,
       baselineDays: args.baselineDays,
     }),
@@ -207,11 +207,11 @@ defineAgentCapability({
     },
     required: [],
   },
-  execute: ({ pool, userId, args }) =>
+  execute: ({ pool, userId, args, clientToday }) =>
     readPerformanceComparison({
       pool,
       userId,
-      today: null,
+      today: clientToday,
       periodDays: args.periodDays,
       baselineDays: args.baselineDays,
     }),
@@ -431,11 +431,12 @@ defineAgentCapability({
     },
     required: ['relationshipId'],
   },
-  execute: ({ pool, userId, args }) =>
+  execute: ({ pool, userId, args, clientToday }) =>
     readFamilyMemberSummary({
       pool,
       actorUserId: userId,
       relationshipId: args.relationshipId,
+      today: clientToday,
     }),
   resultContract:
     '{ relationship, summary: { statusText, carePlans?, today?, careGaps?, simulation?, performance? } } or FAMILY_PERMISSION_DENIED',
@@ -476,12 +477,13 @@ defineAgentCapability({
     },
     required: ['relationshipId'],
   },
-  execute: ({ pool, userId, args }) =>
+  execute: ({ pool, userId, args, clientToday }) =>
     readFamilyTodayTasks({
       pool,
       actorUserId: userId,
       relationshipId: args.relationshipId,
-      date: args.date ?? null,
+      date: args.date ?? clientToday ?? null,
+      today: clientToday,
     }),
   resultContract:
     '{ date, occurrences, summary } from existing task occurrence service or FAMILY_PERMISSION_DENIED',
@@ -542,11 +544,12 @@ defineAgentCapability({
     },
     required: ['relationshipId'],
   },
-  execute: ({ pool, userId, args }) =>
+  execute: ({ pool, userId, args, clientToday }) =>
     readFamilyPerformance({
       pool,
       actorUserId: userId,
       relationshipId: args.relationshipId,
+      today: clientToday,
     }),
   resultContract:
     '{ date, today, periods, primaryPlan, realityCheck, simulation } or FAMILY_PERMISSION_DENIED',

@@ -797,6 +797,7 @@ export async function readFamilyMemberSummary({
   actorUserId,
   relationshipId,
   compact = false,
+  today = null,
 }) {
   const access = await authorizeFamilyAccess({
     pool,
@@ -806,6 +807,7 @@ export async function readFamilyMemberSummary({
   if (!access.ok) return access;
   const { relationship, permissions, targetUserId } = access.data;
   const summary = {};
+  const clientToday = taskOutcomeDate(today);
 
   if (permissions['care_plan.read'] || access.data.role === 'care_recipient') {
     const plans = await listCarePlans({ pool, userId: targetUserId });
@@ -821,13 +823,18 @@ export async function readFamilyMemberSummary({
   }
 
   if (permissions['task.read'] || access.data.role === 'care_recipient') {
-    const today = await readTodayTasksState({ pool, userId: targetUserId });
-    if (today.ok) {
+    const todayState = await readTodayTasksState({
+      pool,
+      userId: targetUserId,
+      date: clientToday,
+      today: clientToday,
+    });
+    if (todayState.ok) {
       summary.today = sectionAllowed('task.read', {
-        date: today.data.date,
-        taskSummary: today.data.summary,
-        nextTask: nextTaskFromTodayState(today.data),
-        occurrences: compact ? [] : today.data.occurrences,
+        date: todayState.data.date,
+        taskSummary: todayState.data.summary,
+        nextTask: nextTaskFromTodayState(todayState.data),
+        occurrences: compact ? [] : todayState.data.occurrences,
       });
     }
   } else {
@@ -883,7 +890,11 @@ export async function readFamilyMemberSummary({
   }
 
   if (permissions['performance.read'] || access.data.role === 'care_recipient') {
-    const performance = await readPerformanceSummary({ pool, userId: targetUserId });
+    const performance = await readPerformanceSummary({
+      pool,
+      userId: targetUserId,
+      today: clientToday,
+    });
     if (performance.ok) {
       summary.performance = sectionAllowed('performance.read', compact
         ? {
@@ -924,14 +935,22 @@ export async function readFamilyCarePlans({ pool, actorUserId, relationshipId })
   return result.ok ? { ok: true, data: result.data } : result;
 }
 
-export async function readFamilyTodayTasks({ pool, actorUserId, relationshipId, date = null }) {
+export async function readFamilyTodayTasks({
+  pool,
+  actorUserId,
+  relationshipId,
+  date = null,
+  today = null,
+}) {
   const access = await authorizeFamilyAccess({ pool, actorUserId, relationshipId, scope: 'task.read' });
   if (!access.ok) return access;
+  const clientToday = taskOutcomeDate(today);
+  const requestedDate = taskOutcomeDate(date);
   const result = await readTodayTasksState({
     pool,
     userId: access.data.targetUserId,
-    date: taskOutcomeDate(date),
-    today: null,
+    date: requestedDate || clientToday,
+    today: clientToday,
   });
   return result.ok ? { ok: true, data: result.data } : result;
 }
@@ -976,8 +995,17 @@ export async function readFamilySimulation({ pool, actorUserId, relationshipId, 
   return result.ok ? { ok: true, data: { planId: resolvedPlanId, simulation: result.data } } : result;
 }
 
-export async function readFamilyPerformance({ pool, actorUserId, relationshipId }) {
+export async function readFamilyPerformance({
+  pool,
+  actorUserId,
+  relationshipId,
+  today = null,
+}) {
   const access = await authorizeFamilyAccess({ pool, actorUserId, relationshipId, scope: 'performance.read' });
   if (!access.ok) return access;
-  return readPerformanceSummary({ pool, userId: access.data.targetUserId });
+  return readPerformanceSummary({
+    pool,
+    userId: access.data.targetUserId,
+    today: taskOutcomeDate(today),
+  });
 }

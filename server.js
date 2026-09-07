@@ -35,6 +35,7 @@ import {
 } from './agent/agent_config.js';
 
 import {
+  canonicalAgentClientToday,
   handleAgentMessage,
 } from './agent/agent_core.js';
 
@@ -1575,6 +1576,15 @@ const agentErrorStatusByCode = {
   INVALID_AGENT_SESSION_ID: 422,
   AGENT_SESSION_NOT_FOUND: 404,
   AGENT_SESSION_STATE_TOO_LARGE: 422,
+  INVALID_AGENT_TODAY: 422,
+  INVALID_AGENT_CLARIFICATION_REQUEST: 422,
+  AGENT_CLARIFICATION_NOT_FOUND: 422,
+  AGENT_CLARIFICATION_MISMATCH: 422,
+  AGENT_CLARIFICATION_CHOICE_NOT_FOUND: 422,
+  AGENT_CLARIFICATION_EXPIRED: 422,
+  AGENT_CLARIFICATION_ALREADY_HANDLED: 422,
+  AGENT_CLARIFICATION_TYPE_MISMATCH: 422,
+  AGENT_CLARIFICATION_ENTITY_NOT_FOUND: 422,
   AGENT_INTERNAL_ERROR: 500,
 };
 
@@ -1674,13 +1684,29 @@ app.post(
 
 app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next) => {
   try {
+    const rawToday = req.body?.today;
+    const clientToday = rawToday == null
+      ? null
+      : canonicalAgentClientToday(rawToday);
+
+    if (rawToday != null && !clientToday) {
+      res.status(422).json({
+        success: false,
+        code: 'INVALID_AGENT_TODAY',
+        message: 'Enter a valid local date.',
+      });
+      return;
+    }
+
     const result = await handleAgentMessage({
       pool,
       userId: req.auth.userId,
       sessionId: req.body?.sessionId ?? null,
       message: req.body?.message,
-      clientContext: req.body?.screenContext ?? req.body?.clientContext ?? null,
+      clientContext: req.body?.screenContext ?? req.body?.clientContext ?? req.body?.context ?? null,
       confirmation: req.body?.confirmation ?? null,
+      clarification: req.body?.clarification ?? null,
+      clientToday,
     });
 
     if (!result.ok) {
@@ -1720,6 +1746,7 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
         reply: result.reply,
         navigation: result.navigation,
         confirmation: result.confirmation,
+        clarification: result.clarification,
         actionStatus: result.actionStatus,
         referencedEntities: result.referencedEntities,
         ...(speech ? { speech } : {}),

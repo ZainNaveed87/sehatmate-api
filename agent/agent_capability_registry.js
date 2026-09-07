@@ -24,8 +24,10 @@
  *   - Argument values are validated per declared type (numeric ids, valid
  *     calendar dates, bounded integers, booleans, exact enums) and the
  *     whole argument payload is byte-bounded.
- *   - execute() receives ONLY ({ pool, userId, args }): no Express req/res,
- *     no authorization headers, no transport objects of any kind.
+ *   - execute() receives ONLY ({ pool, userId, args, clientToday }): no
+ *     Express req/res, no authorization headers, no transport objects of
+ *     any kind. clientToday is trusted runtime context injected by the
+ *     server and is never accepted from model-supplied args.
  *
  * This module contains no LLM provider code and never will. Navigation
  * intents are governed separately by agent_navigation_registry.js; this
@@ -349,15 +351,33 @@ function permissionDeniedExecution(capability) {
   };
 }
 
-async function executeRegisteredCapability({ capability, pool, userId, args }) {
+async function executeRegisteredCapability({
+  capability,
+  pool,
+  userId,
+  args,
+  clientToday = null,
+}) {
   const validated = validateAgentCapabilityInput(capability, args);
   if (!validated.ok) {
     return validated;
   }
-  return capability.execute({ pool, userId, args: validated.args });
+
+  return capability.execute({
+    pool,
+    userId,
+    args: validated.args,
+    clientToday,
+  });
 }
 
-export async function executeAgentCapability({ name, pool, userId, args }) {
+export async function executeAgentCapability({
+  name,
+  pool,
+  userId,
+  args,
+  clientToday = null,
+}) {
   const capability = resolveAgentCapability(name);
   if (!capability) {
     return {
@@ -373,7 +393,13 @@ export async function executeAgentCapability({ name, pool, userId, args }) {
   ) {
     return permissionDeniedExecution(capability);
   }
-  return executeRegisteredCapability({ capability, pool, userId, args });
+  return executeRegisteredCapability({
+    capability,
+    pool,
+    userId,
+    args,
+    clientToday,
+  });
 }
 
 export async function executeConfirmedAgentCapability({ name, pool, userId, args }) {

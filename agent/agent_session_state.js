@@ -15,6 +15,10 @@
  *     lastCapabilityNames: [string],            // server-known tool names
  *     pendingConfirmation: { confirmationId, kind, message, expiresAt } | null,
  *     pendingDraft: { [key]: string } | null,   // shallow, string-only draft
+ *     pendingClarification: {                  // opaque choice ids only
+ *       clarificationId, kind, question, entityType, messageHash,
+ *       createdAt, expiresAt, choices: [{ choiceId, label, entity }]
+ *     } | null,
  *     lastTurnLanguage: en | ur | roman_ur | null, // bounded reply-language memory
  *     lastActionSummary: string | null
  *   }
@@ -45,16 +49,25 @@ export const AGENT_SESSION_STATE_VERSION = 1;
 const CONVERSATION_ENTITY_TYPES = new Set(['care_plan', 'care_gap', 'family_member']);
 const MEMORY_LABEL_PATTERN = /^[a-z][a-z0-9_]*$/;
 const AGENT_LANGUAGE_CODES = new Set(['en', 'ur', 'roman_ur']);
+const OPAQUE_CLIENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,80}$/;
 
 export const AGENT_STATE_LIMITS = Object.freeze({
   maxReferencedEntities: 20,
   maxOrderedEntities: 10,
   maxCapabilityNames: 5,
+  maxClarificationChoices: 5,
   entityTypeMaxLength: 40,
   entityIdMaxLength: 64,
   orderedListKindMaxLength: 40,
   intentMaxLength: 80,
   capabilityNameMaxLength: 60,
+  clarificationIdMaxLength: 80,
+  clarificationKindMaxLength: 40,
+  clarificationChoiceIdMaxLength: 80,
+  clarificationQuestionMaxLength: 200,
+  clarificationLabelMaxLength: 160,
+  clarificationHashMaxLength: 128,
+  clarificationExpiresAtMaxLength: 40,
   confirmationKindMaxLength: 40,
   confirmationIdMaxLength: 80,
   confirmationExpiresAtMaxLength: 40,
@@ -75,6 +88,7 @@ export function emptyAgentSessionState() {
     lastCapabilityNames: [],
     pendingConfirmation: null,
     pendingDraft: null,
+    pendingClarification: null,
     lastTurnLanguage: null,
     lastActionSummary: null,
   };
@@ -163,6 +177,94 @@ function sanitizePendingDraft(value) {
   return count > 0 ? draft : null;
 }
 
+function sanitizePendingClarification(value) {
+  if (value == null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) return null;
+
+  const clarificationId = cleanText(
+    value.clarificationId,
+    AGENT_STATE_LIMITS.clarificationIdMaxLength,
+  );
+  const kind = cleanText(
+    value.kind,
+    AGENT_STATE_LIMITS.clarificationKindMaxLength,
+  );
+  const question = cleanText(
+    value.question,
+    AGENT_STATE_LIMITS.clarificationQuestionMaxLength,
+  );
+  const entityType = cleanText(
+    value.entityType,
+    AGENT_STATE_LIMITS.entityTypeMaxLength,
+  );
+  const messageHash = cleanText(
+    value.messageHash,
+    AGENT_STATE_LIMITS.clarificationHashMaxLength,
+  );
+  const createdAt = cleanText(
+    value.createdAt,
+    AGENT_STATE_LIMITS.clarificationExpiresAtMaxLength,
+  );
+  const expiresAt = cleanText(
+    value.expiresAt,
+    AGENT_STATE_LIMITS.clarificationExpiresAtMaxLength,
+  );
+  if (
+    !clarificationId ||
+    !OPAQUE_CLIENT_ID_PATTERN.test(clarificationId) ||
+    kind !== 'entity_reference' ||
+    !question ||
+    !CONVERSATION_ENTITY_TYPES.has(entityType) ||
+    !/^[a-f0-9]{64}$/i.test(messageHash) ||
+    !createdAt ||
+    !expiresAt ||
+    !Array.isArray(value.choices)
+  ) {
+    return null;
+  }
+
+  const choices = [];
+  const seenChoiceIds = new Set();
+  for (const rawChoice of value.choices.slice(0, AGENT_STATE_LIMITS.maxClarificationChoices)) {
+    if (!rawChoice || typeof rawChoice !== 'object' || Array.isArray(rawChoice)) {
+      continue;
+    }
+    const choiceId = cleanText(
+      rawChoice.choiceId,
+      AGENT_STATE_LIMITS.clarificationChoiceIdMaxLength,
+    );
+    const label = cleanText(
+      rawChoice.label,
+      AGENT_STATE_LIMITS.clarificationLabelMaxLength,
+    );
+    const entity = sanitizeEntityReference(rawChoice.entity);
+    if (
+      !choiceId ||
+      !OPAQUE_CLIENT_ID_PATTERN.test(choiceId) ||
+      seenChoiceIds.has(choiceId) ||
+      !label ||
+      !entity ||
+      entity.type !== entityType
+    ) {
+      continue;
+    }
+    seenChoiceIds.add(choiceId);
+    choices.push({ choiceId, label, entity });
+  }
+  if (choices.length < 2) return null;
+
+  return {
+    clarificationId,
+    kind,
+    question,
+    entityType,
+    messageHash: messageHash.toLowerCase(),
+    createdAt,
+    expiresAt,
+    choices,
+  };
+}
+
 function sanitizeLastTurnLanguage(value) {
   const language = cleanText(value, 20);
   return AGENT_LANGUAGE_CODES.has(language) ? language : null;
@@ -230,6 +332,7 @@ export function sanitizeAgentSessionState(input, { maxStateBytes = 16384 } = {})
     lastCapabilityNames: capabilityNames,
     pendingConfirmation: sanitizePendingConfirmation(input.pendingConfirmation),
     pendingDraft: sanitizePendingDraft(input.pendingDraft),
+    pendingClarification: sanitizePendingClarification(input.pendingClarification),
     lastTurnLanguage: sanitizeLastTurnLanguage(input.lastTurnLanguage),
     lastActionSummary: cleanText(input.lastActionSummary, AGENT_STATE_LIMITS.summaryMaxLength) || null,
   };

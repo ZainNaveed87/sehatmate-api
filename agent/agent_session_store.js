@@ -422,6 +422,7 @@ export async function claimAgentPendingConfirmation({
     ...session.state,
     pendingConfirmation: null,
     pendingDraft: null,
+    pendingClarification: null,
   };
   if (!Number.isFinite(expiresAt) || expiresAt <= now) {
     const [result] = await db.execute(
@@ -497,6 +498,152 @@ export async function claimAgentPendingConfirmation({
       session: cloneSessionWithState(row, sanitized.state),
       pendingDraft,
       pendingConfirmation,
+    },
+  };
+}
+
+export async function claimAgentPendingClarification({
+  db,
+  userId,
+  sessionId,
+  clarificationId,
+  choiceId,
+  messageHash,
+  now = Date.now(),
+}) {
+  if (!idPattern.test(sessionId || '')) return invalidSessionIdResult();
+  const canonicalClarificationId = cleanText(clarificationId, 80);
+  const canonicalChoiceId = cleanText(choiceId, 80);
+  const canonicalMessageHash = cleanText(messageHash, 128).toLowerCase();
+  if (
+    !canonicalClarificationId ||
+    !canonicalChoiceId ||
+    !/^[a-f0-9]{64}$/.test(canonicalMessageHash)
+  ) {
+    return {
+      ok: false,
+      code: 'INVALID_AGENT_CLARIFICATION_REQUEST',
+      message: 'Invalid agent clarification request.',
+    };
+  }
+
+  const row = await readActiveSessionRow(db, sessionId, userId);
+  if (!row) return sessionNotFoundResult();
+
+  const session = sessionForRow(row);
+  const pendingClarification = session.state.pendingClarification;
+  if (!pendingClarification) {
+    return {
+      ok: false,
+      code: 'AGENT_CLARIFICATION_NOT_FOUND',
+      message: 'Agent clarification not found.',
+      data: { session },
+    };
+  }
+  if (
+    pendingClarification.clarificationId !== canonicalClarificationId ||
+    pendingClarification.messageHash !== canonicalMessageHash
+  ) {
+    return {
+      ok: false,
+      code: 'AGENT_CLARIFICATION_MISMATCH',
+      message: 'Agent clarification is no longer current.',
+      data: { session },
+    };
+  }
+
+  const consumedState = {
+    ...session.state,
+    pendingClarification: null,
+  };
+
+  const expiresAt = Date.parse(pendingClarification.expiresAt || '');
+  if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+    const [result] = await db.execute(
+      `UPDATE agent_sessions
+       SET state_json = ?, last_active_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP
+         AND state_json = ?`,
+      [
+        serializeAgentSessionState(consumedState),
+        sessionId,
+        userId,
+        row.state_json,
+      ],
+    );
+    if (!result.affectedRows) {
+      return {
+        ok: false,
+        code: 'AGENT_CLARIFICATION_ALREADY_HANDLED',
+        message: 'Agent clarification was already handled.',
+        data: {
+          session: await rereadActiveSessionOrFallback(db, sessionId, userId, session),
+        },
+      };
+    }
+    return {
+      ok: false,
+      code: 'AGENT_CLARIFICATION_EXPIRED',
+      message: 'Agent clarification expired.',
+      data: { session: cloneSessionWithState(row, consumedState) },
+    };
+  }
+
+  const choice = pendingClarification.choices.find(
+    (item) => item.choiceId === canonicalChoiceId,
+  );
+  if (!choice) {
+    return {
+      ok: false,
+      code: 'AGENT_CLARIFICATION_CHOICE_NOT_FOUND',
+      message: 'Agent clarification choice not found.',
+      data: { session },
+    };
+  }
+
+  const sanitized = sanitizeAgentSessionState(consumedState, {
+    maxStateBytes: agentConfig().sessionStateMaxBytes,
+  });
+  if (!sanitized.ok) {
+    return {
+      ok: false,
+      code: sanitized.code,
+      message: sanitized.message,
+      data: { session },
+    };
+  }
+
+  const [result] = await db.execute(
+    `UPDATE agent_sessions
+     SET state_json = ?, last_active_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND user_id = ? AND expires_at > CURRENT_TIMESTAMP
+       AND state_json = ?`,
+    [
+      serializeAgentSessionState(sanitized.state),
+      sessionId,
+      userId,
+      row.state_json,
+    ],
+  );
+
+  if (!result.affectedRows) {
+    return {
+      ok: false,
+      code: 'AGENT_CLARIFICATION_ALREADY_HANDLED',
+      message: 'Agent clarification was already handled.',
+      data: {
+        session: await rereadActiveSessionOrFallback(db, sessionId, userId, session),
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    message: 'Agent clarification claimed.',
+    data: {
+      session: cloneSessionWithState(row, sanitized.state),
+      pendingClarification,
+      choice,
     },
   };
 }

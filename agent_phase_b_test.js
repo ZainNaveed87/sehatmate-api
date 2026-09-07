@@ -19,7 +19,10 @@ import {
   validateAgentCapabilityInput,
 } from './agent/agent_capability_registry.js';
 import { readAgentScreenContext } from './agent/agent_context_engine.js';
-import { handleAgentMessage } from './agent/agent_core.js';
+import {
+  canonicalAgentClientToday,
+  handleAgentMessage,
+} from './agent/agent_core.js';
 import { createAgentProvider } from './agent/agent_provider.js';
 import {
   buildAgentPlannerPrompts,
@@ -35,6 +38,7 @@ import {
   validateAndSubstituteAgentTemplate,
 } from './agent/agent_response_grounder.js';
 import { emptyAgentSessionState } from './agent/agent_session_state.js';
+import { serverDateKey } from './services/shared_utils.js';
 
 const USER = '42';
 const SESSION_ID = '501';
@@ -225,6 +229,23 @@ function countingMockProvider({ plan, replyTemplate }) {
   return { provider, calls };
 }
 
+function occurrenceReadDate(pool) {
+  return pool.calls.find((call) =>
+    call.sql.includes('o.occurrence_date = ?'))?.params[1];
+}
+
+function missedReconciliationDate(pool) {
+  return pool.calls.find((call) =>
+    call.sql.includes("o.status = 'pending'") &&
+    call.sql.includes('o.occurrence_date < ?'))?.params[1];
+}
+
+function outcomeWindowEndDates(pool) {
+  return pool.calls
+    .filter((call) => call.sql.includes('occurrence_date BETWEEN'))
+    .map((call) => call.params[2]);
+}
+
 function sequencedPlanningProvider(steps) {
   const calls = [];
   const provider = createAgentProvider({
@@ -299,6 +320,150 @@ await test('capability registry rejects unknown tools and model-supplied userId'
   const invalid = validateAgentCapabilityInput(capability, { userId: '999' });
   assert.equal(invalid.ok, false);
   assert.equal(invalid.code, 'INVALID_CAPABILITY_ARGS');
+
+  const runtimeDateInArgs = validateAgentCapabilityInput(capability, {
+    clientToday: '2026-09-07',
+  });
+  assert.equal(runtimeDateInArgs.ok, false);
+  assert.equal(runtimeDateInArgs.code, 'INVALID_CAPABILITY_ARGS');
+});
+
+await test('Agent clientToday validation is exact and rejects truncation hazards', async () => {
+  assert.equal(canonicalAgentClientToday('2026-09-07'), '2026-09-07');
+  for (const value of [
+    '2026-9-07',
+    '2026-09-31',
+    '2026-09-07Z',
+    '2026-09-07 trailing',
+    '2026-09-07T00:00:00Z',
+    '',
+    20260907,
+  ]) {
+    assert.equal(canonicalAgentClientToday(value), null, String(value));
+    const result = await handleAgentMessage({
+      pool: createFakePool(),
+      userId: USER,
+      sessionId: SESSION_ID,
+      message: 'Aaj mera next task kya hai?',
+      clientToday: value,
+      provider: mockProvider({
+        plan: { intent: 'unused', capabilityCalls: [], navigationIntent: null },
+        replyTemplate: () => 'unused',
+      }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'INVALID_AGENT_TODAY');
+  }
+});
+
+await test('get_today_tasks uses trusted clientToday when no explicit date is supplied', async () => {
+  const pool = createFakePool();
+  const result = await executeAgentCapability({
+    name: 'get_today_tasks',
+    pool,
+    userId: USER,
+    args: {},
+    clientToday: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, '2026-09-07');
+  assert.equal(occurrenceReadDate(pool), '2026-09-07');
+  assert.equal(missedReconciliationDate(pool), '2026-09-07');
+});
+
+await test('get_today_tasks explicit date wins while reconciliation keeps clientToday', async () => {
+  const pool = createFakePool();
+  const result = await executeAgentCapability({
+    name: 'get_today_tasks',
+    pool,
+    userId: USER,
+    args: { date: '2026-09-06' },
+    clientToday: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, '2026-09-06');
+  assert.equal(occurrenceReadDate(pool), '2026-09-06');
+  assert.equal(missedReconciliationDate(pool), '2026-09-07');
+});
+
+await test('get_next_task reads the trusted local today instead of server fallback', async () => {
+  const pool = createFakePool({
+    occurrenceRows: [{
+      id: 12,
+      care_plan_id: 7,
+      schedule_item_id: 102,
+      occurrence_date: '2026-09-07',
+      scheduled_time: '14:00',
+      status: 'pending',
+      completed_at: null,
+      completed_time: null,
+      outcome_source: 'user',
+      note: '',
+      title: 'DemoMed Beta',
+      task_kind: 'medicine',
+      display_time: 'Afternoon',
+      recurrence_text: 'Daily',
+      grounding: 'explicit',
+      plan_title: 'Demo Plan',
+    }],
+  });
+  const result = await executeAgentCapability({
+    name: 'get_next_task',
+    pool,
+    userId: USER,
+    args: {},
+    clientToday: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, '2026-09-07');
+  assert.equal(result.data.nextTask.title, 'DemoMed Beta');
+  assert.equal(occurrenceReadDate(pool), '2026-09-07');
+  assert.equal(missedReconciliationDate(pool), '2026-09-07');
+});
+
+await test('date-sensitive capabilities preserve server fallback when clientToday is missing', async () => {
+  const pool = createFakePool();
+  const expected = serverDateKey();
+  const result = await executeAgentCapability({
+    name: 'get_next_task',
+    pool,
+    userId: USER,
+    args: {},
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, expected);
+  assert.equal(occurrenceReadDate(pool), expected);
+});
+
+await test('performance summary and comparison use trusted clientToday', async () => {
+  const summaryPool = createFakePool();
+  const summary = await executeAgentCapability({
+    name: 'get_performance_summary',
+    pool: summaryPool,
+    userId: USER,
+    args: {},
+    clientToday: '2026-09-07',
+  });
+  assert.equal(summary.ok, true);
+  assert.equal(summary.data.date, '2026-09-07');
+  assert.equal(occurrenceReadDate(summaryPool), '2026-09-07');
+  assert.ok(outcomeWindowEndDates(summaryPool).every((date) => date === '2026-09-07'));
+
+  const comparePool = createFakePool();
+  const comparison = await executeAgentCapability({
+    name: 'compare_performance',
+    pool: comparePool,
+    userId: USER,
+    args: {},
+    clientToday: '2026-09-07',
+  });
+  assert.equal(comparison.ok, true);
+  assert.equal(comparison.data.date, '2026-09-07');
+  assert.ok(outcomeWindowEndDates(comparePool).every((date) => date === '2026-09-07'));
 });
 
 await test('planner validation rejects more than three calls and non-executable future tools', async () => {

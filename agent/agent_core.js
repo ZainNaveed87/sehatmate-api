@@ -58,7 +58,7 @@
  * fails safely instead of erroring out.
  */
 
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { agentConfig } from './agent_config.js';
 import './agent_read_tools.js';
 import './agent_draft_tools.js';
@@ -66,6 +66,7 @@ import {
   buildAgentContextSlice,
   readAgentConversationStateContext,
   readAgentScreenContext,
+  verifyAgentEntityOwnership,
 } from './agent_context_engine.js';
 import {
   deriveServerCapabilityNames,
@@ -76,10 +77,12 @@ import {
 import {
   classifyBareConfirmationDecision,
   localizedReferenceClarification,
+  localizedReferenceClarificationQuestion,
   referenceResolutionContext,
   resolvedReferenceNavigationPlan,
   resolveAgentConversationReference,
   reviewPlanAgainstResolvedReference,
+  structuredReferenceClarificationCandidates,
 } from './agent_reference_resolver.js';
 import { authorizeAgentNavigationIntent } from './agent_navigation_registry.js';
 import {
@@ -104,6 +107,7 @@ import {
 } from './agent_response_grounder.js';
 import {
   canonicalAgentLanguage,
+  claimAgentPendingClarification,
   claimAgentPendingConfirmation,
   createAgentSession,
   readAgentSession,
@@ -115,7 +119,11 @@ import { AGENT_STATE_LIMITS } from './agent_session_state.js';
 import { recordAgentAction } from './agent_action_audit.js';
 import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
-import { cleanText, idPattern } from '../services/shared_utils.js';
+import {
+  cleanText,
+  idPattern,
+  taskOutcomeDate,
+} from '../services/shared_utils.js';
 
 /**
  * Localized deterministic agent fallback text in the canonical agent
@@ -361,6 +369,74 @@ function confirmationRequestFromInput(input) {
   return { ok: true, confirmationId, decision };
 }
 
+function clarificationRequestFromInput(input) {
+  if (input == null) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, code: 'INVALID_AGENT_CLARIFICATION_REQUEST' };
+  }
+  const keys = Object.keys(input);
+  if (
+    keys.length !== 2 ||
+    !keys.includes('clarificationId') ||
+    !keys.includes('choiceId')
+  ) {
+    return { ok: false, code: 'INVALID_AGENT_CLARIFICATION_REQUEST' };
+  }
+  const clarificationId = cleanText(input.clarificationId, 80);
+  const choiceId = cleanText(input.choiceId, 80);
+  if (
+    !OPAQUE_CLIENT_ID_PATTERN.test(clarificationId) ||
+    !OPAQUE_CLIENT_ID_PATTERN.test(choiceId)
+  ) {
+    return { ok: false, code: 'INVALID_AGENT_CLARIFICATION_REQUEST' };
+  }
+  return { ok: true, clarificationId, choiceId };
+}
+
+function createPendingReferenceClarification({
+  resolution,
+  message,
+  language,
+  now = Date.now(),
+}) {
+  const candidateSet = structuredReferenceClarificationCandidates(resolution);
+  if (!candidateSet) return null;
+  const clarificationId = randomUUID();
+  const createdAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + CLARIFICATION_TTL_MS).toISOString();
+  return {
+    clarificationId,
+    kind: 'entity_reference',
+    question: localizedReferenceClarificationQuestion(language),
+    entityType: candidateSet.entityType,
+    messageHash: messageHashForClarification(message),
+    createdAt,
+    expiresAt,
+    choices: candidateSet.candidates.map((candidate) => ({
+      choiceId: randomUUID(),
+      label: candidate.title,
+      entity: {
+        type: candidate.type,
+        id: candidate.id,
+      },
+    })),
+  };
+}
+
+function responseClarificationFromPending(pendingClarification) {
+  if (!pendingClarification) return null;
+  return {
+    clarificationId: pendingClarification.clarificationId,
+    kind: pendingClarification.kind,
+    question: pendingClarification.question,
+    options: pendingClarification.choices.map((choice) => ({
+      choiceId: choice.choiceId,
+      label: choice.label,
+    })),
+    expiresAt: pendingClarification.expiresAt,
+  };
+}
+
 function actionArgsFromPendingDraft(draft) {
   if (draft?.kind === 'task_outcome') {
     const args = {
@@ -404,12 +480,27 @@ const PROFILE_LANGUAGE_SQL =
   'SELECT preferred_language FROM patient_profiles WHERE user_id = ? LIMIT 1';
 
 const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+const CLARIFICATION_TTL_MS = 5 * 60 * 1000;
 const CONFIRMATION_DECISIONS = new Set(['confirm', 'cancel']);
 const DRAFT_KINDS = new Set(['task_outcome', 'schedule_time']);
+const OPAQUE_CLIENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,80}$/;
 
 async function readProfileLanguage(pool, userId) {
   const [rows] = await pool.execute(PROFILE_LANGUAGE_SQL, [userId]);
   return canonicalAgentLanguage(rows[0]?.preferred_language);
+}
+
+export function canonicalAgentClientToday(value) {
+  if (value == null) return null;
+  if (typeof value !== 'string') return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  return taskOutcomeDate(value);
+}
+
+function messageHashForClarification(message) {
+  return createHash('sha256')
+    .update(String(message || ''), 'utf8')
+    .digest('hex');
 }
 
 function lastVerifiedTurnLanguage(session, profileLanguage) {
@@ -436,7 +527,8 @@ function canonicalEntityRef(entity) {
 /**
  * Derive the entity a capability call targets from its canonicalized
  * arguments. Phase B READ capabilities address entities exclusively
- * through planId / gapId, so this mapping stays closed.
+ * through closed, schema-validated entity id fields, so this mapping
+ * stays closed.
  */
 function entityFromCallArgs(args) {
   if (!args || typeof args !== 'object') return null;
@@ -445,6 +537,9 @@ function entityFromCallArgs(args) {
   }
   if (args.gapId !== undefined) {
     return canonicalEntityRef({ type: 'care_gap', id: args.gapId });
+  }
+  if (args.relationshipId !== undefined) {
+    return canonicalEntityRef({ type: 'family_member', id: args.relationshipId });
   }
   return null;
 }
@@ -505,6 +600,7 @@ function buildNextSessionState({
   screenEntity,
   pendingConfirmation,
   pendingDraft,
+  pendingClarification = null,
   language,
 }) {
   const previous = Array.isArray(sessionState?.lastReferencedEntities)
@@ -578,6 +674,10 @@ function buildNextSessionState({
         : pendingConfirmation,
     pendingDraft:
       pendingDraft === undefined ? sessionState?.pendingDraft ?? null : pendingDraft,
+    pendingClarification:
+      pendingClarification === undefined
+        ? sessionState?.pendingClarification ?? null
+        : pendingClarification,
     lastTurnLanguage: canonicalAgentLanguage(language),
     lastActionSummary: summary || null,
   };
@@ -634,7 +734,9 @@ async function finishAgentTurn({
   screenEntity,
   pendingConfirmation,
   pendingDraft,
+  pendingClarification,
   confirmation = null,
+  clarification = null,
   actionStatus = null,
   language = session.language,
 }) {
@@ -649,6 +751,7 @@ async function finishAgentTurn({
     screenEntity,
     pendingConfirmation,
     pendingDraft,
+    pendingClarification,
     language,
   });
 
@@ -698,6 +801,7 @@ async function finishAgentTurn({
     reply,
     navigation,
     confirmation,
+    clarification: clarification && stateUpdate?.ok === true ? clarification : null,
     actionStatus,
     referencedEntities: buildReferencedEntities({
       screenEntity,
@@ -902,7 +1006,7 @@ async function handleAgentConfirmation({
  * Handle one authenticated agent message end to end.
  *
  * Returns:
- *   { ok: true, sessionId, language, reply, navigation,
+ *   { ok: true, sessionId, language, reply, navigation, clarification,
  *     referencedEntities, fallbackCode? }
  *   { ok: false, code: 'AGENT_DISABLED' | 'AGENT_MESSAGE_EMPTY' |
  *     'INVALID_AGENT_SESSION_ID' | 'AGENT_SESSION_NOT_FOUND' |
@@ -918,15 +1022,43 @@ export async function handleAgentMessage({
   message,
   clientContext = null,
   confirmation = null,
+  clarification = null,
+  clientToday = null,
   provider = defaultAgentProvider,
 }) {
   let language = 'en';
   try {
+    const canonicalClientToday = canonicalAgentClientToday(clientToday);
+    if (clientToday != null && !canonicalClientToday) {
+      return {
+        ok: false,
+        code: 'INVALID_AGENT_TODAY',
+        message: 'Invalid local date.',
+      };
+    }
     const confirmationRequest = confirmationRequestFromInput(confirmation);
     const isConfirmationTurn = confirmation != null;
+    const clarificationRequest = clarificationRequestFromInput(clarification);
+    const isClarificationTurn = clarification != null;
+    if (isConfirmationTurn && isClarificationTurn) {
+      return {
+        ok: false,
+        code: 'INVALID_AGENT_CLARIFICATION_REQUEST',
+        message: 'Agent clarification cannot be combined with confirmation.',
+      };
+    }
+
     const boundedMessage = isConfirmationTurn
       ? ''
       : cleanText(message, AGENT_PLANNER_LIMITS.messageMaxChars);
+
+    if (isClarificationTurn && !boundedMessage) {
+      return {
+        ok: false,
+        code: 'INVALID_AGENT_CLARIFICATION_REQUEST',
+        message: 'Agent clarification request is invalid.',
+      };
+    }
 
     if (!isConfirmationTurn && !boundedMessage) {
       return {
@@ -953,7 +1085,7 @@ export async function handleAgentMessage({
     // --- owned session: create when omitted, verify when given ---
     let session;
     let sessionCreated = false;
-    if (isConfirmationTurn && sessionId == null) {
+    if ((isConfirmationTurn || isClarificationTurn) && sessionId == null) {
       return {
         ok: false,
         code: 'INVALID_AGENT_SESSION_ID',
@@ -1008,21 +1140,91 @@ export async function handleAgentMessage({
       });
     }
 
+    let selectedReferenceResolution = null;
+    if (isClarificationTurn) {
+      if (!clarificationRequest?.ok) {
+        return {
+          ok: false,
+          code: clarificationRequest?.code || 'INVALID_AGENT_CLARIFICATION_REQUEST',
+          message: 'Agent clarification request is invalid.',
+        };
+      }
+      const claimed = await claimAgentPendingClarification({
+        db: pool,
+        userId,
+        sessionId: session.id,
+        clarificationId: clarificationRequest.clarificationId,
+        choiceId: clarificationRequest.choiceId,
+        messageHash: messageHashForClarification(boundedMessage),
+      });
+      if (!claimed.ok) {
+        return {
+          ok: false,
+          code: claimed.code || 'AGENT_CLARIFICATION_REJECTED',
+          message: claimed.message || 'Agent clarification was rejected.',
+        };
+      }
+
+      session = claimed.data.session;
+      const pendingClarification = claimed.data.pendingClarification;
+      const choice = claimed.data.choice;
+      if (
+        pendingClarification.kind !== 'entity_reference' ||
+        choice.entity?.type !== pendingClarification.entityType
+      ) {
+        return {
+          ok: false,
+          code: 'AGENT_CLARIFICATION_TYPE_MISMATCH',
+          message: 'Agent clarification choice is not valid for this request.',
+        };
+      }
+
+      const owned = await verifyAgentEntityOwnership({
+        pool,
+        userId,
+        entity: choice.entity,
+      });
+      if (!owned.ok || owned.entity.type !== pendingClarification.entityType) {
+        return {
+          ok: false,
+          code: 'AGENT_CLARIFICATION_ENTITY_NOT_FOUND',
+          message: 'Agent clarification choice is no longer available.',
+        };
+      }
+
+      selectedReferenceResolution = {
+        status: 'resolved',
+        source: 'clarification_choice',
+        entity: owned.entity,
+        candidates: [owned.entity],
+      };
+    }
+
     // Phase E conversational confirmation/cancellation is deterministic and
     // bypasses planner/provider completely. It can only consume the exact
     // server-stored Phase D pending confirmation in this owned session.
-    const conversationalDecision = classifyBareConfirmationDecision(boundedMessage);
+    const conversationalDecision = isClarificationTurn
+      ? null
+      : classifyBareConfirmationDecision(boundedMessage);
     if (conversationalDecision) {
       const pendingConfirmation = session.state?.pendingConfirmation;
       const confirmationId = pendingConfirmation?.confirmationId;
       if (!confirmationId) {
-        return finishAgentConfirmationTurn({
+        return finishAgentTurn({
+          pool,
+          userId,
           session,
           language,
           reply: confirmationText('noPending', language),
           fallbackCode: 'AGENT_CONFIRMATION_NOT_FOUND',
+          intent: 'confirmation_not_found',
+          capabilityCalls: [],
+          navigation: null,
+          navigationEntity: null,
+          screenEntity: null,
           confirmation: null,
           actionStatus: 'rejected',
+          pendingClarification: null,
         });
       }
       return handleAgentConfirmation({
@@ -1052,29 +1254,38 @@ export async function handleAgentMessage({
       sessionState: session.state,
     });
 
-    const referenceResolution = await resolveAgentConversationReference({
-      pool,
-      userId,
-      message: boundedMessage,
-      screenEntity,
-      currentFocus: conversationContext.currentFocus,
-      recentEntities: conversationContext.recentEntities,
-      recentOrderedEntityList: conversationContext.recentOrderedEntityList,
-      familyMembers: conversationContext.familyMembers,
-    });
+    const referenceResolution = selectedReferenceResolution ||
+      await resolveAgentConversationReference({
+        pool,
+        userId,
+        message: boundedMessage,
+        screenEntity,
+        currentFocus: conversationContext.currentFocus,
+        recentEntities: conversationContext.recentEntities,
+        recentOrderedEntityList: conversationContext.recentOrderedEntityList,
+        familyMembers: conversationContext.familyMembers,
+      });
 
     if (
       referenceResolution.status === 'ambiguous' ||
       referenceResolution.status === 'missing'
     ) {
+      const pendingClarification = createPendingReferenceClarification({
+        resolution: referenceResolution,
+        message: boundedMessage,
+        language,
+      });
+      const structuredClarification =
+        responseClarificationFromPending(pendingClarification);
       return finishAgentTurn({
         pool,
         userId,
         session,
-        reply: localizedReferenceClarification({
-          language,
-          resolution: referenceResolution,
-        }),
+        reply: structuredClarification?.question ||
+          localizedReferenceClarification({
+            language,
+            resolution: referenceResolution,
+          }),
         fallbackCode:
           referenceResolution.status === 'ambiguous'
             ? 'AGENT_REFERENCE_AMBIGUOUS'
@@ -1084,6 +1295,8 @@ export async function handleAgentMessage({
         navigation: null,
         navigationEntity: null,
         screenEntity,
+        pendingClarification,
+        clarification: structuredClarification,
         language,
       });
     }
@@ -1220,6 +1433,7 @@ export async function handleAgentMessage({
           pool,
           userId,
           args: call.args,
+          clientToday: canonicalClientToday,
         });
       } catch {
         result = {

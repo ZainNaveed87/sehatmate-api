@@ -311,6 +311,47 @@ function assertOrderedIds(pool, kind, ids) {
   assert.deepEqual(pool.state.recentOrderedEntityList, orderedEntities(kind, ids));
 }
 
+function choiceByLabel(clarification, label) {
+  const choice = clarification?.options?.find((item) => item.label === label);
+  assert.ok(choice, `Expected clarification choice labeled ${label}`);
+  return choice;
+}
+
+function ambiguousCarePlanPool({
+  plans = [
+    { id: '17', title: 'QA Prescription Plan' },
+    { id: '21', title: 'QA Discharge Plan' },
+  ],
+  initialState = null,
+} = {}) {
+  return createPool({
+    plans,
+    initialState: initialState || {
+      ...emptyAgentSessionState(),
+      lastReferencedEntities: plans.map((plan) => ({
+        type: 'care_plan',
+        id: String(plan.id),
+      })),
+    },
+  });
+}
+
+async function requestCarePlanClarification(pool, message = 'us wala dikhao') {
+  const provider = zeroCallProvider();
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message,
+    provider: provider.provider,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
+  assert.equal(provider.calls, 0);
+  assert.ok(result.clarification);
+  return result.clarification;
+}
+
 function carePlanListProvider({ replyTemplate } = {}) {
   return plannedProvider({
     intent: 'list_care_plans',
@@ -807,6 +848,357 @@ await test('real two-turn pronoun reference with two care plans asks clarificati
   assert.equal(second.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(second.navigation, null);
   assert.match(second.reply, /kis wale/i);
+  assert.equal(second.clarification?.kind, 'entity_reference');
+  assert.equal(second.clarification.question, 'Aap kis wale ki baat kar rahe hain?');
+  assert.deepEqual(second.clarification.options.map((item) => item.label), [
+    'Prescription Plan',
+    'Exercise Plan',
+  ]);
+  assert.ok(second.clarification.options.every((item) => !('entity' in item)));
+  assert.notEqual(second.clarification.options[0].choiceId, '17');
+  assert.notEqual(second.clarification.options[1].choiceId, '21');
+  assert.equal(pool.state.pendingClarification.clarificationId, second.clarification.clarificationId);
+  assert.equal(pool.state.pendingConfirmation, null);
+  assert.equal(pool.state.pendingDraft, null);
+  assert.equal(provider.calls, 0);
+});
+
+await test('valid clarification choice resolves exact care plan navigation without provider calls', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool);
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+  const provider = zeroCallProvider();
+
+  const selected = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: provider.provider,
+  });
+
+  assert.equal(selected.ok, true);
+  assert.equal(selected.fallbackCode, undefined);
+  assert.deepEqual(selected.navigation, {
+    target: 'care_plan_detail',
+    params: { carePlanId: '17' },
+  });
+  assert.deepEqual(selected.referencedEntities, [
+    { type: 'care_plan', id: '17', title: 'QA Prescription Plan' },
+  ]);
+  assert.equal(pool.state.pendingClarification, null);
+  assert.equal(pool.state.pendingConfirmation, null);
+  assert.equal(pool.state.pendingDraft, null);
+  assert.equal(provider.calls, 0);
+});
+
+await test('clarification choice cannot bind to another candidate through planner output', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool, 'us wali simulation batao');
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+  const provider = plannedProvider({
+    intent: 'read_wrong_plan',
+    capabilityCalls: [{ name: 'get_simulation', args: { planId: '21' } }],
+    navigationIntent: null,
+  });
+
+  const selected = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wali simulation batao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: provider.provider,
+  });
+
+  assert.equal(selected.ok, true);
+  assert.equal(selected.fallbackCode, 'AGENT_REFERENCE_MISMATCH');
+  assert.equal(selected.navigation, null);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
+});
+
+await test('wrong clarification id and wrong choice id fail closed', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool);
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+
+  const wrongClarification = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: 'wrong-clarification',
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+  assert.equal(wrongClarification.ok, false);
+  assert.equal(wrongClarification.code, 'AGENT_CLARIFICATION_MISMATCH');
+
+  const wrongChoice = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: 'wrong-choice',
+    },
+    provider: zeroCallProvider().provider,
+  });
+  assert.equal(wrongChoice.ok, false);
+  assert.equal(wrongChoice.code, 'AGENT_CLARIFICATION_CHOICE_NOT_FOUND');
+});
+
+await test('expired clarification is consumed and rejected', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool);
+  pool.setState({
+    ...pool.state,
+    pendingClarification: {
+      ...pool.state.pendingClarification,
+      expiresAt: '2000-01-01T00:00:00.000Z',
+    },
+  });
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+
+  const expired = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+
+  assert.equal(expired.ok, false);
+  assert.equal(expired.code, 'AGENT_CLARIFICATION_EXPIRED');
+  assert.equal(pool.state.pendingClarification, null);
+});
+
+await test('consumed clarification choice cannot be replayed', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool);
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+  const provider = zeroCallProvider();
+
+  const first = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: provider.provider,
+  });
+  assert.equal(first.ok, true);
+
+  const replay = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+
+  assert.equal(replay.ok, false);
+  assert.equal(replay.code, 'AGENT_CLARIFICATION_NOT_FOUND');
+});
+
+await test('clarification selection is scoped to the owning user and session', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool);
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+
+  const wrongUser = await handleAgentMessage({
+    pool,
+    userId: '99',
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+  assert.equal(wrongUser.ok, false);
+  assert.equal(wrongUser.code, 'AGENT_SESSION_NOT_FOUND');
+
+  const wrongSession = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: '999',
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+  assert.equal(wrongSession.ok, false);
+  assert.equal(wrongSession.code, 'AGENT_SESSION_NOT_FOUND');
+});
+
+await test('clarification choice revalidates selected entity ownership before navigation', async () => {
+  const plans = [
+    { id: '17', title: 'QA Prescription Plan' },
+    { id: '21', title: 'QA Discharge Plan' },
+  ];
+  const pool = ambiguousCarePlanPool({ plans });
+  const clarification = await requestCarePlanClarification(pool);
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+  plans.length = 0;
+
+  const selected = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+
+  assert.equal(selected.ok, false);
+  assert.equal(selected.code, 'AGENT_CLARIFICATION_ENTITY_NOT_FOUND');
+});
+
+await test('normal new message invalidates stale pending clarification', async () => {
+  const pool = ambiguousCarePlanPool();
+  const clarification = await requestCarePlanClarification(pool);
+  const choice = choiceByLabel(clarification, 'QA Prescription Plan');
+  const provider = plannedProvider({
+    intent: 'list_care_plans',
+    capabilityCalls: [{ name: 'get_care_plans', args: {} }],
+    navigationIntent: null,
+  });
+
+  const normal = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'mere care plans dikhao',
+    provider: provider.provider,
+  });
+  assert.equal(normal.ok, true);
+  assert.equal(pool.state.pendingClarification, null);
+
+  const stale = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    clarification: {
+      clarificationId: clarification.clarificationId,
+      choiceId: choice.choiceId,
+    },
+    provider: zeroCallProvider().provider,
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.code, 'AGENT_CLARIFICATION_NOT_FOUND');
+});
+
+await test('bare haan does not select a pending clarification option', async () => {
+  const pool = ambiguousCarePlanPool();
+  await requestCarePlanClarification(pool);
+  const provider = zeroCallProvider();
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'haan',
+    provider: provider.provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, 'AGENT_CONFIRMATION_NOT_FOUND');
+  assert.equal(result.navigation, null);
+  assert.equal(pool.state.pendingClarification, null);
+  assert.equal(provider.calls, 0);
+});
+
+await test('pending clarification is separate from pending confirmation and draft', async () => {
+  const pool = ambiguousCarePlanPool({
+    initialState: {
+      ...pendingDummyState(),
+      lastReferencedEntities: [
+        { type: 'care_plan', id: '17' },
+        { type: 'care_plan', id: '21' },
+      ],
+    },
+  });
+  const provider = zeroCallProvider();
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    provider: provider.provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.ok(result.clarification);
+  assert.equal(pool.state.pendingClarification.clarificationId, result.clarification.clarificationId);
+  assert.equal(pool.state.pendingConfirmation.confirmationId, 'phase-e-confirm');
+  assert.equal(pool.state.pendingDraft.confirmationId, 'phase-e-confirm');
+  assert.equal(result.confirmation, null);
+  assert.equal(provider.calls, 0);
+});
+
+await test('larger ambiguous candidate sets do not become truncated structured choices', async () => {
+  const plans = [
+    { id: '17', title: 'Plan 1' },
+    { id: '18', title: 'Plan 2' },
+    { id: '19', title: 'Plan 3' },
+    { id: '20', title: 'Plan 4' },
+    { id: '21', title: 'Plan 5' },
+    { id: '22', title: 'Plan 6' },
+  ];
+  const pool = ambiguousCarePlanPool({
+    plans,
+    initialState: {
+      ...emptyAgentSessionState(),
+      recentOrderedEntityList: {
+        kind: 'care_plan',
+        entities: plans.map((plan) => ({ type: 'care_plan', id: plan.id })),
+      },
+    },
+  });
+  const provider = zeroCallProvider();
+
+  const result = await handleAgentMessage({
+    pool,
+    userId: USER,
+    sessionId: SESSION_ID,
+    message: 'us wala dikhao',
+    provider: provider.provider,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
+  assert.equal(result.clarification, null);
+  assert.equal(pool.state.pendingClarification, null);
   assert.equal(provider.calls, 0);
 });
 

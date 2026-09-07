@@ -7,6 +7,8 @@ import {
   DEFAULT_FAMILY_PERMISSION_SCOPES,
   readFamilyCarePlans,
   readFamilyMemberSummary,
+  readFamilyPerformance,
+  readFamilyTodayTasks,
   revokeFamilyRelationship,
   updateFamilyPermissions,
 } from './services/family_care_service.js';
@@ -203,6 +205,23 @@ function callsMatching(pool, pattern) {
   return pool.calls.filter((call) => pattern.test(call.sql));
 }
 
+function occurrenceReadDate(pool) {
+  return pool.calls.find((call) =>
+    call.sql.includes('o.occurrence_date = ?'))?.params[1];
+}
+
+function missedReconciliationDate(pool) {
+  return pool.calls.find((call) =>
+    call.sql.includes("o.status = 'pending'") &&
+    call.sql.includes('o.occurrence_date < ?'))?.params[1];
+}
+
+function outcomeWindowEndDates(pool) {
+  return pool.calls
+    .filter((call) => call.sql.includes('occurrence_date BETWEEN'))
+    .map((call) => call.params[2]);
+}
+
 await test('authenticated user can create safe invitation', async () => {
   const pool = createPool();
   const result = await createFamilyInvitation({
@@ -374,6 +393,70 @@ await test('Family summary reuses existing services with target patient id', asy
   assert.equal(result.ok, true);
   const planRead = callsMatching(pool, /WHERE care_plans\.user_id = \?/)[0];
   assert.deepEqual(planRead.params, [PATIENT]);
+});
+
+await test('Family today tasks use trusted clientToday for target patient reads', async () => {
+  const pool = createPool();
+  const result = await readFamilyTodayTasks({
+    pool,
+    actorUserId: CAREGIVER,
+    relationshipId: RELATIONSHIP_ID,
+    today: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, '2026-09-07');
+  assert.equal(occurrenceReadDate(pool), '2026-09-07');
+  assert.equal(missedReconciliationDate(pool), '2026-09-07');
+  assert.ok(callsMatching(pool, /WHERE o\.user_id = \?/).some((call) =>
+    call.params.includes(PATIENT)));
+});
+
+await test('Family explicit task date wins while reconciliation keeps clientToday', async () => {
+  const pool = createPool();
+  const result = await readFamilyTodayTasks({
+    pool,
+    actorUserId: CAREGIVER,
+    relationshipId: RELATIONSHIP_ID,
+    date: '2026-09-06',
+    today: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, '2026-09-06');
+  assert.equal(occurrenceReadDate(pool), '2026-09-06');
+  assert.equal(missedReconciliationDate(pool), '2026-09-07');
+});
+
+await test('Family summary today and performance sections use clientToday', async () => {
+  const pool = createPool();
+  const result = await readFamilyMemberSummary({
+    pool,
+    actorUserId: CAREGIVER,
+    relationshipId: RELATIONSHIP_ID,
+    today: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.summary.today.date, '2026-09-07');
+  assert.equal(result.data.summary.performance.date, '2026-09-07');
+  assert.equal(occurrenceReadDate(pool), '2026-09-07');
+  assert.ok(outcomeWindowEndDates(pool).every((date) => date === '2026-09-07'));
+});
+
+await test('Family performance uses trusted clientToday', async () => {
+  const pool = createPool();
+  const result = await readFamilyPerformance({
+    pool,
+    actorUserId: CAREGIVER,
+    relationshipId: RELATIONSHIP_ID,
+    today: '2026-09-07',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.date, '2026-09-07');
+  assert.equal(occurrenceReadDate(pool), '2026-09-07');
+  assert.ok(outcomeWindowEndDates(pool).every((date) => date === '2026-09-07'));
 });
 
 await test('no duplicate medical care records are created by family reads', async () => {

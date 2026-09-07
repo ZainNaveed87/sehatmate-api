@@ -5,7 +5,7 @@
  * never mutates user data, and never treats remembered facts as truth.
  */
 
-import { cleanText } from '../services/shared_utils.js';
+import { cleanText, idPattern } from '../services/shared_utils.js';
 import { canonicalAgentLanguage } from './agent_session_store.js';
 
 const CONFIRM_PHRASES = new Set([
@@ -70,6 +70,8 @@ const RESOLVED_REFERENCE_NAVIGATION_BY_TYPE = Object.freeze({
     param: 'relationshipId',
   }),
 });
+
+export const AGENT_REFERENCE_CLARIFICATION_MAX_OPTIONS = 5;
 
 function normalizeBarePhrase(message) {
   return String(message || '')
@@ -324,6 +326,46 @@ export function referenceResolutionContext(resolution) {
   };
 }
 
+export function localizedReferenceClarificationQuestion(language) {
+  const lang = canonicalAgentLanguage(language);
+  if (lang === 'ur') return 'آپ کس والے کی بات کر رہے ہیں؟';
+  if (lang === 'roman_ur') return 'Aap kis wale ki baat kar rahe hain?';
+  return 'Which one do you mean?';
+}
+
+export function structuredReferenceClarificationCandidates(resolution) {
+  if (resolution?.status !== 'ambiguous') return null;
+  const candidates = dedupeEntities(resolution.candidates || [])
+    .map((entity) => ({
+      type: cleanText(entity.type, 40),
+      id: cleanText(String(entity.id ?? ''), 64),
+      title: cleanText(entity.title, 160),
+    }))
+    .filter((entity) => entity.type && idPattern.test(entity.id) && entity.title);
+
+  if (
+    candidates.length < 2 ||
+    candidates.length > AGENT_REFERENCE_CLARIFICATION_MAX_OPTIONS
+  ) {
+    return null;
+  }
+
+  const entityType = candidates[0].type;
+  if (!candidates.every((entity) => entity.type === entityType)) {
+    return null;
+  }
+
+  const labels = new Set(candidates.map((entity) => entity.title));
+  if (labels.size !== candidates.length) {
+    return null;
+  }
+
+  return {
+    entityType,
+    candidates,
+  };
+}
+
 export function localizedReferenceClarification({ language, resolution, code = null }) {
   const lang = canonicalAgentLanguage(language);
   const titles = dedupeEntities(resolution?.candidates || [])
@@ -339,9 +381,7 @@ export function localizedReferenceClarification({ language, resolution, code = n
 
   if (resolution?.status === 'ambiguous') {
     const suffix = titles.length ? ` ${titles.join(' / ')}` : '';
-    if (lang === 'ur') return `آپ کس والے کی بات کر رہے ہیں؟${suffix}`;
-    if (lang === 'roman_ur') return `Aap kis wale ki baat kar rahe hain?${suffix}`;
-    return `Which one do you mean?${suffix}`;
+    return `${localizedReferenceClarificationQuestion(lang)}${suffix}`;
   }
 
   if (lang === 'ur') return 'براہ کرم واضح کریں کہ آپ کس family member، care plan یا care gap کی بات کر رہے ہیں۔';

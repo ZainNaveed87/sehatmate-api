@@ -45,11 +45,12 @@
  *     count). complete means zero unanswered questions for the primary
  *     plan.
  *
- * Date semantics are preserved from the original routes: serverDateKey()
- * and taskOutcomeDate() UTC date keys and windows clamped to 1..31 days.
- * There is no second scheduling or reconciliation implementation here; the
- * agent-facing functions only compose the extracted route primitives and
- * readSimulationState.
+ * Date semantics: callers may pass a trusted runtime local calendar date
+ * for "today"; when absent, the original serverDateKey() fallback remains.
+ * Explicit requested dates are validated separately by their caller before
+ * they reach this service. There is no second scheduling or reconciliation
+ * implementation here; the agent-facing functions only compose the
+ * extracted route primitives and readSimulationState.
  */
 
 import {
