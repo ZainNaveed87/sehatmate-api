@@ -1,6 +1,9 @@
 import bcrypt from 'bcryptjs';
 import crypto from 'node:crypto';
-import https from 'node:https';
+
+import {
+  sendTransactionalEmail,
+} from './email_service.js';
 
 const PASSWORD_RESET_CODE_TTL_MINUTES = 10;
 const PASSWORD_RESET_TOKEN_TTL_MINUTES = 10;
@@ -87,96 +90,12 @@ function timingSafeHexEqual(left, right) {
   );
 }
 
-function resendEmail(payload) {
-  const apiKey = process.env.RESEND_API_KEY?.trim();
-
-  if (!apiKey) {
-    return Promise.reject(
-      new Error('RESEND_API_KEY is not configured.'),
-    );
-  }
-
-  const body = JSON.stringify(payload);
-
-  return new Promise((resolve, reject) => {
-    const request = https.request(
-      {
-        hostname: 'api.resend.com',
-        port: 443,
-        path: '/emails',
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-      },
-      (response) => {
-        let responseBody = '';
-
-        response.setEncoding('utf8');
-
-        response.on('data', (chunk) => {
-          responseBody += chunk;
-        });
-
-        response.on('end', () => {
-          const statusCode = Number(response.statusCode || 0);
-
-          if (statusCode >= 200 && statusCode < 300) {
-            resolve(responseBody);
-            return;
-          }
-
-          let providerMessage =
-            `Resend rejected the email request with status ${statusCode}.`;
-
-          try {
-            const parsed = JSON.parse(responseBody);
-
-            if (typeof parsed?.message === 'string' && parsed.message.trim()) {
-              providerMessage = parsed.message.trim();
-            }
-          } catch {
-            // Keep the sanitized status-only fallback.
-          }
-
-          const error = new Error(providerMessage);
-          error.statusCode = statusCode;
-
-          reject(error);
-        });
-      },
-    );
-
-    request.setTimeout(10000, () => {
-      request.destroy(
-        new Error('Resend email request timed out.'),
-      );
-    });
-
-    request.on('error', reject);
-
-    request.write(body);
-    request.end();
-  });
-}
-
 async function sendPasswordResetCode({
   email,
   code,
 }) {
-  const from = process.env.PASSWORD_RESET_FROM_EMAIL?.trim();
-
-  if (!from) {
-    throw new Error(
-      'PASSWORD_RESET_FROM_EMAIL is not configured.',
-    );
-  }
-
-  await resendEmail({
-    from,
-    to: [email],
+  await sendTransactionalEmail({
+    to: email,
     subject: 'Your SehatMate password reset code',
     text:
       `Your SehatMate verification code is ${code}.\n\n` +

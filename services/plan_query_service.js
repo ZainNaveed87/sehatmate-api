@@ -225,6 +225,9 @@ export async function readCarePlanDetail({ pool, userId, planId }) {
 END
       ) AS note,
       task_kind, display_time, recurrence_text, grounding,
+      recurrence_mode, recurrence_weekdays_json,
+      recurrence_interval_days, recurrence_month_days_json,
+      recurrence_source,
       CASE
         WHEN grounding = 'explicit' AND schedule_time IS NOT NULL THEN 1
         ELSE 0

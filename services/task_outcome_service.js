@@ -22,10 +22,13 @@ import {
   cleanText,
   dbDateKey,
   idPattern,
+  recurrenceAppliesOnDate,
+  recurrenceDefinitionFromInstruction,
+  recurrenceDefinitionFromRow,
+  recurrenceDisplayText,
   schedulePeriodKey,
   serverDateKey,
   taskOutcomeDate,
-  verifiedDailyRecurrenceText,
 } from './shared_utils.js';
 
 function scheduleItemEffectiveStart(item, dateKey, plan) {
@@ -42,7 +45,7 @@ function scheduleItemEffectiveStart(item, dateKey, plan) {
   if (activatedDate) return activatedDate;
   if (scheduleDate) return scheduleDate;
   if (planStartDate) return planStartDate;
-  return dateKey;
+  return '';
 }
 
 function scheduleItemDurationEndDate(item, dateKey, plan) {
@@ -66,22 +69,11 @@ export function scheduleItemDurationExpired(item, dateKey, plan) {
 }
 
 export function scheduleItemIsDaily(item) {
-  return Boolean(verifiedDailyRecurrenceText(item?.recurrence_text));
+  return recurrenceDefinitionFromRow(item)?.mode === 'daily';
 }
 
 function scheduleItemAppliesOnDate(item, dateKey, plan) {
   if (!item?.schedule_time) return false;
-
-  const daily = scheduleItemIsDaily(item);
-  const scheduleDate = dbDateKey(item.schedule_date);
-  const planStartDate = dbDateKey(plan?.start_date);
-  const activatedDate = dbDateKey(plan?.activated_at);
-
-  // Recurring reminder slots created from instructions such as "3 times daily"
-  // intentionally may not have a schedule_date. In that case the care-plan
-  // start/activation date is the effective beginning of the recurring series.
-  // A one-off task still requires its own explicit schedule_date.
-  if (!daily && !scheduleDate) return false;
 
   const effectiveStart = scheduleItemEffectiveStart(item, dateKey, plan);
 
@@ -100,8 +92,7 @@ function scheduleItemAppliesOnDate(item, dateKey, plan) {
     return false;
   }
 
-  if (daily) return true;
-  return dateKey === scheduleDate;
+  return recurrenceAppliesOnDate(item, dateKey, effectiveStart);
 }
 
 export function taskOccurrenceJson(row) {
@@ -169,14 +160,21 @@ export async function reconcileExpiredFixedDurationOccurrences({
 
 export async function restoreVerifiedScheduleRecurrenceForPlan({ db, userId, planId }) {
   const [rows] = await db.execute(
-    `SELECT s.id, i.instruction, i.timing,
+    `SELECT s.id, s.recurrence_mode, s.recurrence_source,
+      i.category, i.instruction, i.timing,
       i.original_instruction, i.original_timing
      FROM care_schedule_items s
      JOIN extracted_instructions i ON i.id = s.instruction_id
      WHERE s.care_plan_id = ? AND s.user_id = ?
        AND i.care_plan_id = s.care_plan_id
+       AND i.category = 'medicine'
        AND i.review_status = 'verified'
-       AND (s.recurrence_text IS NULL OR TRIM(s.recurrence_text) = '')
+       AND (s.recurrence_mode IS NULL OR TRIM(s.recurrence_mode) = '')
+       AND (
+         s.recurrence_source IS NULL
+         OR TRIM(s.recurrence_source) = ''
+         OR s.recurrence_source <> 'user'
+       )
      ORDER BY s.id
      LIMIT 500`,
     [planId, userId],
@@ -184,20 +182,39 @@ export async function restoreVerifiedScheduleRecurrenceForPlan({ db, userId, pla
 
   let restoredCount = 0;
   for (const row of rows) {
-    const recurrence = verifiedDailyRecurrenceText([
-      row.instruction,
-      row.timing,
-      row.original_instruction,
-      row.original_timing,
-    ].filter(Boolean).join(' '));
+    const recurrence = recurrenceDefinitionFromInstruction(row);
     if (!recurrence) continue;
 
     const [result] = await db.execute(
       `UPDATE care_schedule_items
-       SET recurrence_text = ?, updated_at = CURRENT_TIMESTAMP
+       SET recurrence_text = CASE
+             WHEN recurrence_text IS NULL OR TRIM(recurrence_text) = ''
+               THEN ?
+             ELSE recurrence_text
+           END,
+           recurrence_mode = ?,
+           recurrence_weekdays_json = ?,
+           recurrence_interval_days = ?,
+           recurrence_month_days_json = ?,
+           recurrence_source = 'verified',
+           updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND care_plan_id = ? AND user_id = ?
-         AND (recurrence_text IS NULL OR TRIM(recurrence_text) = '')`,
-      [recurrence, row.id, planId, userId],
+         AND (recurrence_mode IS NULL OR TRIM(recurrence_mode) = '')
+         AND (
+           recurrence_source IS NULL
+           OR TRIM(recurrence_source) = ''
+           OR recurrence_source <> 'user'
+         )`,
+      [
+        recurrence.text || recurrenceDisplayText(recurrence),
+        recurrence.mode,
+        recurrence.weekdays.length ? JSON.stringify(recurrence.weekdays) : null,
+        recurrence.intervalDays,
+        recurrence.monthDays.length ? JSON.stringify(recurrence.monthDays) : null,
+        row.id,
+        planId,
+        userId,
+      ],
     );
     if (result.affectedRows) restoredCount += 1;
   }
@@ -221,7 +238,9 @@ export async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) 
   const [items] = await db.execute(
     `SELECT id, care_plan_id, user_id, schedule_date, schedule_time,
       display_time, recurrence_text, grounding, title, task_kind,
-      instruction_duration_days
+      instruction_duration_days,
+      recurrence_mode, recurrence_weekdays_json, recurrence_interval_days,
+      recurrence_month_days_json, recurrence_source
      FROM care_schedule_items
      WHERE care_plan_id = ? AND user_id = ? AND schedule_time IS NOT NULL
      ORDER BY id`,

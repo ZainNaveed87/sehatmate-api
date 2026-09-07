@@ -7,9 +7,13 @@
  * domain services.
  */
 
-import { listCarePlans } from './plan_query_service.js';
+import {
+  carePlanJson,
+  listCarePlans,
+} from './plan_query_service.js';
 import { listCareGaps } from './care_gap_service.js';
 import { readSimulationState } from './simulation_service.js';
+import { sendTransactionalEmail } from './email_service.js';
 import {
   nextTaskFromTodayState,
   readPerformanceSummary,
@@ -18,6 +22,7 @@ import {
 import {
   cleanText,
   idPattern,
+  parseStoredJson,
   parseStoredObject,
   taskOutcomeDate,
 } from './shared_utils.js';
@@ -46,6 +51,18 @@ export const DEFAULT_FAMILY_PERMISSION_SCOPES = Object.freeze([
 ]);
 
 const READABLE_SCOPES = new Set(FAMILY_PERMISSION_SCOPES);
+
+const FAMILY_SCOPE_LABELS = Object.freeze({
+  'care_plan.read': 'Care plans',
+  'schedule.read': 'Schedule',
+  'task.read': 'Today tasks',
+  'care_gap.read': 'Care gaps',
+  'simulation.read': 'Simulation',
+  'performance.read': 'Performance',
+  'task.support': 'Practical task support',
+  'simulation.participate': 'Readiness support context',
+  'schedule.review_request': 'Schedule review requests',
+});
 
 function error(code, message, data = undefined) {
   return {
@@ -90,6 +107,90 @@ function defaultScopeMap(scopes = DEFAULT_FAMILY_PERMISSION_SCOPES) {
     if (READABLE_SCOPES.has(scope)) out[scope] = true;
   }
   return out;
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function requestedScopeLabels(scopes) {
+  return Object.entries(scopes || {})
+    .filter(([, allowed]) => allowed === true)
+    .map(([scope]) => FAMILY_SCOPE_LABELS[scope] || scope)
+    .filter(Boolean);
+}
+
+function familyInvitationEmailPayload({
+  caregiver,
+  inviter,
+  relationshipLabel,
+  requestedScopes,
+}) {
+  const caregiverName = cleanText(caregiver?.name, 120);
+  const inviterName = cleanText(inviter?.name, 120) || 'A SehatMate user';
+  const label = normalizeRelationshipLabel(relationshipLabel);
+  const scopeLabels = requestedScopeLabels(requestedScopes);
+  const scopeText = scopeLabels.length
+    ? scopeLabels.join(', ')
+    : 'No permissions selected yet';
+  const greeting = caregiverName ? `Hi ${caregiverName},` : 'Hi,';
+
+  const text = [
+    greeting,
+    '',
+    `${inviterName} invited you to SehatMate Family Care as ${label}.`,
+    `Requested permissions: ${scopeText}.`,
+    '',
+    'Access starts only after you sign in to SehatMate and accept the invitation.',
+    'Open SehatMate -> Family Care -> Pending invitations.',
+    '',
+    'Family access never allows dose, diagnosis, prescription or verified medical-instruction changes unless a separate explicitly designed safe workflow exists.',
+  ].join('\n');
+
+  const scopeItems = scopeLabels.length
+    ? scopeLabels.map((scope) => `<li>${escapeHtml(scope)}</li>`).join('')
+    : '<li>No permissions selected yet</li>';
+
+  return {
+    to: caregiver.email,
+    subject: "You've been invited to SehatMate Family Care",
+    text,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#172033">
+        <h2 style="margin:0 0 16px">SehatMate Family Care invitation</h2>
+        <p style="line-height:1.6">${escapeHtml(greeting)}</p>
+        <p style="line-height:1.6">
+          ${escapeHtml(inviterName)} invited you to SehatMate Family Care as
+          <strong>${escapeHtml(label)}</strong>.
+        </p>
+        <p style="line-height:1.6;margin-bottom:8px">Requested permissions:</p>
+        <ul style="line-height:1.6;margin-top:0">${scopeItems}</ul>
+        <p style="line-height:1.6">
+          Access starts only after you sign in to SehatMate and accept the
+          invitation.
+        </p>
+        <p style="line-height:1.6">
+          Open SehatMate &rarr; Family Care &rarr; Pending invitations.
+        </p>
+        <p style="line-height:1.6;color:#667085">
+          Family access never allows dose, diagnosis, prescription or verified
+          medical-instruction changes unless a separate explicitly designed safe
+          workflow exists.
+        </p>
+      </div>
+    `,
+    tags: [
+      {
+        name: 'category',
+        value: 'family_care_invitation',
+      },
+    ],
+  };
 }
 
 function invitationJson(row) {
@@ -150,6 +251,31 @@ function relationshipJson(row, permissions = null, summary = null, actorUserId =
     },
     permissions: permissions || {},
     ...(summary ? { summary } : {}),
+  };
+}
+
+function familyInstructionJson(item) {
+  return {
+    ...item,
+    id: String(item.id),
+    title: cleanText(item.title, 160),
+    instruction: cleanText(item.instruction, 4000),
+    timing: cleanText(item.timing, 160) || null,
+    document_id: item.document_id == null ? null : String(item.document_id),
+    duplicate_of_instruction_id:
+      item.duplicate_of_instruction_id == null
+        ? null
+        : String(item.duplicate_of_instruction_id),
+    safety_sources: parseStoredJson(item.safety_sources),
+  };
+}
+
+function familyScheduleTaskJson(item) {
+  return {
+    ...item,
+    id: String(item.id),
+    instruction_id: item.instruction_id == null ? null : String(item.instruction_id),
+    caregiver_id: item.caregiver_id == null ? null : String(item.caregiver_id),
   };
 }
 
@@ -419,6 +545,7 @@ export async function createFamilyInvitation({
   caregiverEmail,
   relationshipLabel,
   scopes = null,
+  emailSender = sendTransactionalEmail,
 }) {
   const email = normalizeEmail(caregiverEmail);
   if (!email) return error('INVALID_FAMILY_INVITATION', 'Enter a valid SehatMate account email.');
@@ -461,6 +588,16 @@ export async function createFamilyInvitation({
     return error('FAMILY_INVITATION_ALREADY_PENDING', 'A pending invitation already exists.');
   }
 
+  const [inviterRows] = await pool.execute(
+    'SELECT id, name, email FROM users WHERE id = ? LIMIT 1',
+    [actorUserId],
+  );
+  const inviter = inviterRows[0] || {
+    id: actorUserId,
+    name: 'A SehatMate user',
+    email: '',
+  };
+
   const [result] = await pool.execute(
     `INSERT INTO family_invitations (
       care_recipient_user_id, caregiver_user_id, relationship_label,
@@ -483,9 +620,48 @@ export async function createFamilyInvitation({
     eventType: 'invitation_created',
     metadata: { scopes: Object.keys(requestedScopes).filter((scope) => requestedScopes[scope]) },
   });
+
+  let emailDelivery = { sent: false };
+  try {
+    await emailSender(familyInvitationEmailPayload({
+      caregiver,
+      inviter,
+      relationshipLabel: label,
+      requestedScopes,
+    }));
+    emailDelivery = { sent: true };
+    await recordFamilyAudit({
+      db: pool,
+      actorUserId,
+      careRecipientUserId: actorUserId,
+      caregiverUserId: caregiver.id,
+      invitationId: result.insertId,
+      eventType: 'invitation_email_sent',
+    });
+  } catch (err) {
+    console.error(
+      'Family invitation email delivery failed.',
+      {
+        invitationId: String(result.insertId),
+        caregiverUserId: String(caregiver.id),
+        statusCode: err?.statusCode || null,
+      },
+    );
+    await recordFamilyAudit({
+      db: pool,
+      actorUserId,
+      careRecipientUserId: actorUserId,
+      caregiverUserId: caregiver.id,
+      invitationId: result.insertId,
+      eventType: 'invitation_email_failed',
+    });
+  }
+
   return {
     ok: true,
-    message: 'Family invitation created.',
+    message: emailDelivery.sent
+      ? 'Invitation sent by email and added to SehatMate.'
+      : 'Invitation created in SehatMate, but the email could not be delivered.',
     data: {
       invitation: {
         id: String(result.insertId),
@@ -500,6 +676,7 @@ export async function createFamilyInvitation({
           email: caregiver.email,
         },
       },
+      emailDelivery,
     },
   };
 }
@@ -933,6 +1110,126 @@ export async function readFamilyCarePlans({ pool, actorUserId, relationshipId })
   if (!access.ok) return access;
   const result = await listCarePlans({ pool, userId: access.data.targetUserId });
   return result.ok ? { ok: true, data: result.data } : result;
+}
+
+export async function readFamilyCarePlanDetail({
+  pool,
+  actorUserId,
+  relationshipId,
+  planId,
+}) {
+  if (!idPattern.test(String(planId || ''))) {
+    return error('INVALID_PLAN_ID', 'Invalid care plan ID.');
+  }
+
+  const access = await authorizeFamilyAccess({
+    pool,
+    actorUserId,
+    relationshipId,
+    scope: 'care_plan.read',
+  });
+  if (!access.ok) return access;
+
+  const scheduleAllowed =
+    access.data.role === 'care_recipient' ||
+    access.data.permissions['schedule.read'] === true;
+
+  const [plans] = await pool.execute(
+    `SELECT care_plans.*,
+      (SELECT COUNT(*) FROM care_documents
+        WHERE care_documents.care_plan_id = care_plans.id) AS document_count,
+      (SELECT COUNT(*) FROM care_schedule_items
+        WHERE care_schedule_items.care_plan_id = care_plans.id) AS task_count,
+      (SELECT COUNT(*) FROM care_gaps
+        WHERE care_gaps.care_plan_id = care_plans.id
+          AND care_gaps.status <> 'resolved') AS open_gap_count
+     FROM care_plans
+     WHERE care_plans.id = ? AND care_plans.user_id = ?
+     LIMIT 1`,
+    [String(planId), access.data.targetUserId],
+  );
+  if (plans.length === 0) {
+    return error('PLAN_NOT_FOUND', 'Care plan not found.');
+  }
+
+  const [instructions] = await pool.execute(
+    `SELECT id, document_id, category, title, instruction, timing,
+      original_title, original_instruction, original_timing,
+      duplicate_of_instruction_id, duplicate_reason,
+      source_page, confidence_score, review_status,
+      requires_professional_confirmation, ambiguity_reason,
+      possible_interpretation, safety_note, safety_check_status,
+      safety_check_summary, safety_possible_interpretation,
+      safety_question, safety_sources,
+      safety_checked_at, verified_at
+     FROM extracted_instructions
+     WHERE care_plan_id = ? AND review_status = 'verified'
+     ORDER BY id`,
+    [String(planId)],
+  );
+
+  let tasks = [];
+  if (scheduleAllowed) {
+    const [taskRows] = await pool.execute(
+      `SELECT id, instruction_id, NULL AS caregiver_id,
+        schedule_date AS task_date, schedule_date, schedule_time,
+        COALESCE(TIME_FORMAT(schedule_time, '%H:%i'), NULLIF(display_time, ''), 'Review timing') AS task_time,
+        title,
+        CONCAT_WS(
+          ' · ',
+          NULLIF(recurrence_text, ''),
+          NULLIF(display_time, ''),
+          NULLIF(reason, '')
+        ) AS note,
+        task_kind, display_time, recurrence_text, grounding,
+        recurrence_mode, recurrence_weekdays_json,
+        recurrence_interval_days, recurrence_month_days_json,
+        recurrence_source,
+        CASE
+          WHEN grounding = 'explicit' AND schedule_time IS NOT NULL THEN 1
+          ELSE 0
+        END AS time_locked,
+        instruction_duration_days,
+        COALESCE(
+          NULLIF(instruction_duration_source, ''),
+          CASE
+            WHEN instruction_duration_days IS NOT NULL THEN 'verified'
+            ELSE NULL
+          END
+        ) AS instruction_duration_source,
+        CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
+        NULL AS completed_at
+       FROM care_schedule_items
+       WHERE care_plan_id = ? AND user_id = ?
+       ORDER BY schedule_date, schedule_time, id`,
+      [String(planId), access.data.targetUserId],
+    );
+    tasks = taskRows.map(familyScheduleTaskJson);
+  }
+
+  return {
+    ok: true,
+    data: {
+      relationship: relationshipJson(
+        access.data.relationship,
+        access.data.permissions,
+        null,
+        actorUserId,
+      ),
+      plan: carePlanJson(plans[0]),
+      instructions: instructions
+        .filter((item) =>
+          cleanText(item.title, 160) &&
+          cleanText(item.instruction, 4000))
+        .map(familyInstructionJson),
+      tasks,
+      schedule: {
+        allowed: scheduleAllowed,
+        requiredScope: 'schedule.read',
+      },
+      readOnly: true,
+    },
+  };
 }
 
 export async function readFamilyTodayTasks({

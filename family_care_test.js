@@ -5,6 +5,7 @@ import {
   authorizeFamilyAccess,
   createFamilyInvitation,
   DEFAULT_FAMILY_PERMISSION_SCOPES,
+  readFamilyCarePlanDetail,
   readFamilyCarePlans,
   readFamilyMemberSummary,
   readFamilyPerformance,
@@ -75,6 +76,7 @@ function invitation(overrides = {}) {
 
 function createPool({
   caregiverUser = { id: Number(CAREGIVER), name: 'Zain Caregiver', email: 'zain@example.com' },
+  inviterUser = { id: Number(PATIENT), name: 'Ali Patient', email: 'ali@example.com' },
   relationshipRow = relationship(),
   invitationRow = invitation(),
   permissions = Object.fromEntries(DEFAULT_FAMILY_PERMISSION_SCOPES.map((scope) => [scope, true])),
@@ -101,6 +103,58 @@ function createPool({
     open_gap_count: 0,
     setup_step: 'complete',
   }],
+  instructionRows = [{
+    id: 91,
+    document_id: null,
+    category: 'medicine',
+    title: 'DemoMed',
+    instruction: 'Take DemoMed once daily.',
+    timing: 'Morning',
+    original_title: '',
+    original_instruction: '',
+    original_timing: '',
+    duplicate_of_instruction_id: null,
+    duplicate_reason: null,
+    source_page: null,
+    confidence_score: 0.95,
+    review_status: 'verified',
+    requires_professional_confirmation: 0,
+    ambiguity_reason: null,
+    possible_interpretation: null,
+    safety_note: null,
+    safety_check_status: 'clear',
+    safety_check_summary: null,
+    safety_possible_interpretation: null,
+    safety_question: null,
+    safety_sources: '[]',
+    safety_checked_at: null,
+    verified_at: '2026-09-04 09:30:00',
+  }],
+  taskRows = [{
+    id: 701,
+    instruction_id: 91,
+    caregiver_id: null,
+    task_date: '2026-09-07',
+    schedule_date: '2026-09-07',
+    schedule_time: '08:00:00',
+    task_time: '08:00',
+    title: 'DemoMed',
+    note: 'once daily · Morning',
+    task_kind: 'medicine',
+    display_time: 'Morning',
+    recurrence_text: 'once daily',
+    recurrence_mode: 'daily',
+    recurrence_weekdays_json: null,
+    recurrence_interval_days: null,
+    recurrence_month_days_json: null,
+    recurrence_source: 'verified',
+    grounding: 'explicit',
+    time_locked: 1,
+    instruction_duration_days: 5,
+    instruction_duration_source: 'verified',
+    status: 'ready',
+    completed_at: null,
+  }],
 } = {}) {
   const calls = [];
   let relationshipStatus = relationshipRow?.status || 'active';
@@ -113,6 +167,11 @@ function createPool({
 
     if (text.startsWith('SELECT id, name, email FROM users WHERE email = ?')) {
       return caregiverUser ? [[caregiverUser]] : [[]];
+    }
+    if (text.startsWith('SELECT id, name, email FROM users WHERE id = ?')) {
+      return inviterUser && String(inviterUser.id) === String(params[0])
+        ? [[inviterUser]]
+        : [[]];
     }
     if (text.startsWith('SELECT id FROM family_relationships') && text.includes("status = 'active'")) {
       return duplicateActive ? [[{ id: Number(RELATIONSHIP_ID) }]] : [[]];
@@ -166,6 +225,18 @@ function createPool({
     }
     if (text.startsWith('INSERT INTO family_activity_audit')) {
       return [OK];
+    }
+    if (text.includes('FROM care_plans') && text.includes('WHERE care_plans.id = ? AND care_plans.user_id = ?')) {
+      const plan = planRows.find((item) =>
+        String(item.id) === String(params[0]) &&
+        String(params[1]) === PATIENT);
+      return plan ? [[plan]] : [[]];
+    }
+    if (text.includes('FROM extracted_instructions') && text.includes("review_status = 'verified'")) {
+      return [instructionRows];
+    }
+    if (text.includes('FROM care_schedule_items') && text.includes('ORDER BY schedule_date')) {
+      return [taskRows];
     }
     if (text.includes('FROM care_plans') && text.includes('WHERE care_plans.user_id = ?')) {
       return [planRows];
@@ -224,18 +295,61 @@ function outcomeWindowEndDates(pool) {
 
 await test('authenticated user can create safe invitation', async () => {
   const pool = createPool();
+  const emailPayloads = [];
   const result = await createFamilyInvitation({
     pool,
     actorUserId: PATIENT,
     caregiverEmail: 'zain@example.com',
     relationshipLabel: 'Ammi',
+    emailSender: async (payload) => {
+      emailPayloads.push(payload);
+    },
   });
   assert.equal(result.ok, true);
+  assert.equal(result.message, 'Invitation sent by email and added to SehatMate.');
+  assert.equal(result.data.emailDelivery.sent, true);
   assert.equal(result.data.invitation.status, 'pending');
   assert.equal(result.data.invitation.caregiverUserId, CAREGIVER);
   const insert = callsMatching(pool, /INSERT INTO family_invitations/)[0];
   assert.equal(insert.params[0], PATIENT);
   assert.equal(insert.params[1], Number(CAREGIVER));
+  assert.equal(emailPayloads.length, 1);
+  assert.equal(emailPayloads[0].to, 'zain@example.com');
+  const renderedEmail = JSON.stringify(emailPayloads[0]);
+  assert.match(renderedEmail, /Care plans/);
+  assert.doesNotMatch(renderedEmail, /Recovery plan|DemoMed|prescription refill/i);
+  assert.equal(pool.calls.some((call) => call.params.includes('invitation_email_sent')), true);
+});
+
+await test('invitation email failure keeps pending invitation and returns a safe delivery result', async () => {
+  const pool = createPool();
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    const result = await createFamilyInvitation({
+      pool,
+      actorUserId: PATIENT,
+      caregiverEmail: 'zain@example.com',
+      relationshipLabel: 'Ammi',
+      emailSender: async () => {
+        const error = new Error('provider body with sensitive diagnostic detail');
+        error.statusCode = 503;
+        throw error;
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.data.invitation.status, 'pending');
+    assert.equal(result.data.emailDelivery.sent, false);
+    assert.equal(
+      result.message,
+      'Invitation created in SehatMate, but the email could not be delivered.',
+    );
+    assert.doesNotMatch(result.message, /sensitive|provider/i);
+    assert.equal(pool.calls.some((call) => call.params.includes('invitation_email_failed')), true);
+  } finally {
+    console.error = originalError;
+  }
 });
 
 await test('user cannot invite self', async () => {
@@ -254,14 +368,19 @@ await test('user cannot invite self', async () => {
 });
 
 await test('duplicate invitation rejected', async () => {
+  let emailCount = 0;
   const result = await createFamilyInvitation({
     pool: createPool({ duplicatePending: true }),
     actorUserId: PATIENT,
     caregiverEmail: 'zain@example.com',
     relationshipLabel: 'Ammi',
+    emailSender: async () => {
+      emailCount += 1;
+    },
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'FAMILY_INVITATION_ALREADY_PENDING');
+  assert.equal(emailCount, 0);
 });
 
 await test('duplicate active relationship rejected before invite', async () => {
@@ -336,6 +455,65 @@ await test('care_plan.read scope enforced', async () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'FAMILY_PERMISSION_DENIED');
+});
+
+await test('Family plan detail derives patient owner and hides schedule without schedule scope', async () => {
+  const pool = createPool({
+    permissions: {
+      'care_plan.read': true,
+      'schedule.read': false,
+    },
+  });
+  const result = await readFamilyCarePlanDetail({
+    pool,
+    actorUserId: CAREGIVER,
+    relationshipId: RELATIONSHIP_ID,
+    planId: '8',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.readOnly, true);
+  assert.equal(result.data.plan.id, '8');
+  assert.equal(result.data.relationship.id, RELATIONSHIP_ID);
+  assert.equal(result.data.schedule.allowed, false);
+  assert.equal(result.data.schedule.requiredScope, 'schedule.read');
+  assert.deepEqual(result.data.tasks, []);
+  assert.equal(Object.hasOwn(result.data, 'documents'), false);
+  assert.equal(Object.hasOwn(result.data, 'gaps'), false);
+  assert.equal(Object.hasOwn(result.data, 'caregivers'), false);
+  assert.equal(Object.hasOwn(result.data, 'questions'), false);
+  const planRead = callsMatching(pool, /WHERE care_plans\.id = \? AND care_plans\.user_id = \?/)[0];
+  assert.deepEqual(planRead.params, ['8', PATIENT]);
+  assert.equal(
+    callsMatching(pool, /FROM care_schedule_items WHERE care_plan_id = \? AND user_id = \? ORDER BY schedule_date/).length,
+    0,
+  );
+});
+
+await test('Family plan detail includes read-only schedule rows only with schedule scope', async () => {
+  const pool = createPool({
+    permissions: {
+      'care_plan.read': true,
+      'schedule.read': true,
+    },
+  });
+  const result = await readFamilyCarePlanDetail({
+    pool,
+    actorUserId: CAREGIVER,
+    relationshipId: RELATIONSHIP_ID,
+    planId: '8',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.schedule.allowed, true);
+  assert.equal(result.data.instructions.length, 1);
+  assert.equal(result.data.tasks.length, 1);
+  assert.equal(result.data.tasks[0].id, '701');
+  assert.equal(result.data.tasks[0].recurrence_mode, 'daily');
+  assert.equal(
+    callsMatching(pool, /FROM care_schedule_items WHERE care_plan_id = \? AND user_id = \? ORDER BY schedule_date/).length,
+    1,
+  );
 });
 
 await test('task.read scope enforced', async () => {

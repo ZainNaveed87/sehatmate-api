@@ -23,6 +23,7 @@
     "test:agent-phase-b": "node agent_phase_b_test.js",
     "test:agent-foundation": "node agent_foundation_test.js",
     "test:teach-back": "node teach_back_test.js",
+    "test:schedule-recurrence": "node schedule_recurrence_test.js",
     "test:schedule-reliability": "node schedule_reliability_test.js"
   },
   "engines": {

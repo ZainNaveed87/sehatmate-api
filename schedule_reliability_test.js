@@ -13,6 +13,8 @@ import {
   scheduleItemIsDaily,
 } from './services/task_outcome_service.js';
 import {
+  recurrenceDefinitionFromText,
+  scheduleItemRecurrenceResolved,
   strictDateKey,
   verifiedDailyRecurrence,
 } from './services/shared_utils.js';
@@ -88,22 +90,26 @@ function createSchedulePool({
     if (
       text.includes('JOIN extracted_instructions i ON i.id = s.instruction_id') &&
       text.includes("i.review_status = 'verified'") &&
-      text.includes('TRIM(s.recurrence_text)')
+      text.includes("i.category = 'medicine'") &&
+      text.includes('TRIM(s.recurrence_mode)')
     ) {
       const [planId, userId] = params;
       const rows = scheduleItems
         .filter((item) =>
           String(item.care_plan_id) === String(planId) &&
           item.user_id === userId &&
-          blank(item.recurrence_text))
+          blank(item.recurrence_mode) &&
+          (blank(item.recurrence_source) || item.recurrence_source !== 'user'))
         .map((item) => {
           const instruction = instructions.find((candidate) =>
             String(candidate.id) === String(item.instruction_id) &&
             String(candidate.care_plan_id) === String(item.care_plan_id) &&
+            candidate.category === 'medicine' &&
             candidate.review_status === 'verified');
           if (!instruction) return null;
           return {
             id: item.id,
+            category: instruction.category,
             instruction: instruction.instruction,
             timing: instruction.timing,
             original_instruction: instruction.original_instruction,
@@ -114,15 +120,30 @@ function createSchedulePool({
       return [rows];
     }
 
-    if (text.startsWith('UPDATE care_schedule_items SET recurrence_text = ?')) {
-      const [recurrence, itemId, planId, userId] = params;
+    if (text.startsWith('UPDATE care_schedule_items SET recurrence_text = CASE')) {
+      const [
+        recurrence,
+        recurrenceMode,
+        recurrenceWeekdaysJson,
+        recurrenceIntervalDays,
+        recurrenceMonthDaysJson,
+        itemId,
+        planId,
+        userId,
+      ] = params;
       const item = scheduleItems.find((candidate) =>
         String(candidate.id) === String(itemId) &&
         String(candidate.care_plan_id) === String(planId) &&
         candidate.user_id === userId &&
-        blank(candidate.recurrence_text));
+        blank(candidate.recurrence_mode) &&
+        (blank(candidate.recurrence_source) || candidate.recurrence_source !== 'user'));
       if (!item) return [{ affectedRows: 0 }];
-      item.recurrence_text = recurrence;
+      if (blank(item.recurrence_text)) item.recurrence_text = recurrence;
+      item.recurrence_mode = recurrenceMode;
+      item.recurrence_weekdays_json = recurrenceWeekdaysJson;
+      item.recurrence_interval_days = recurrenceIntervalDays;
+      item.recurrence_month_days_json = recurrenceMonthDaysJson;
+      item.recurrence_source = 'verified';
       return [{ affectedRows: 1 }];
     }
 
@@ -187,6 +208,11 @@ function createSchedulePool({
             task_kind: item?.task_kind,
             display_time: item?.display_time,
             recurrence_text: item?.recurrence_text,
+            recurrence_mode: item?.recurrence_mode,
+            recurrence_weekdays_json: item?.recurrence_weekdays_json,
+            recurrence_interval_days: item?.recurrence_interval_days,
+            recurrence_month_days_json: item?.recurrence_month_days_json,
+            recurrence_source: item?.recurrence_source,
             grounding: item?.grounding,
             plan_title: plan?.title,
           };
@@ -242,6 +268,7 @@ function verifiedInstruction(overrides = {}) {
   return {
     id: '501',
     care_plan_id: '10',
+    category: 'medicine',
     review_status: 'verified',
     instruction: 'Take DemoMed one tablet four times daily for five days.',
     timing: '',
@@ -261,6 +288,11 @@ function scheduleItem(overrides = {}) {
     schedule_time: '08:00:00',
     display_time: 'Morning',
     recurrence_text: '',
+    recurrence_mode: null,
+    recurrence_weekdays_json: null,
+    recurrence_interval_days: null,
+    recurrence_month_days_json: null,
+    recurrence_source: null,
     grounding: 'suggested',
     title: 'DemoMed',
     task_kind: 'medication',
@@ -289,6 +321,36 @@ await test('verified daily recurrence parsing is explicit and exact-date parsing
   assert.equal(strictDateKey('2026-09-31'), null);
 });
 
+await test('structured recurrence parsing covers exact days, intervals and month days', async () => {
+  assert.deepEqual(recurrenceDefinitionFromText('Take one tablet on Monday, Wednesday and Friday.'), {
+    mode: 'weekdays',
+    source: 'verified',
+    weekdays: [1, 3, 5],
+    intervalDays: null,
+    monthDays: [],
+    scheduleDate: null,
+    text: 'Monday, Wednesday, Friday',
+  });
+  assert.deepEqual(recurrenceDefinitionFromText('Use one patch every 3 days.'), {
+    mode: 'interval_days',
+    source: 'verified',
+    weekdays: [],
+    intervalDays: 3,
+    monthDays: [],
+    scheduleDate: null,
+    text: 'Every 3 days',
+  });
+  assert.deepEqual(recurrenceDefinitionFromText('Take one dose monthly on the 31st.'), {
+    mode: 'month_days',
+    source: 'verified',
+    weekdays: [],
+    intervalDays: null,
+    monthDays: [31],
+    scheduleDate: null,
+    text: '31st',
+  });
+});
+
 await test('blank generated recurrence is restored from verified four-times-daily text', async () => {
   const instruction = verifiedInstruction();
   const items = [
@@ -315,6 +377,12 @@ await test('blank generated recurrence is restored from verified four-times-dail
     'four times daily',
     'four times daily',
     'four times daily',
+  ]);
+  assert.deepEqual(pool.scheduleItems.map((item) => item.recurrence_mode), [
+    'daily',
+    'daily',
+    'daily',
+    'daily',
   ]);
   assert.equal(pool.occurrences.length, 4);
   assert.deepEqual(pool.occurrences.map((item) => item.scheduled_at), [
@@ -371,12 +439,158 @@ await test('ongoing plans and period labels do not become daily recurrence', asy
   assert.equal(pool.occurrences.length, 0);
 });
 
+await test('verified weekday recurrence only creates occurrences on selected weekdays', async () => {
+  const pool = createSchedulePool({
+    plan: activePlan(),
+    instructions: [
+      verifiedInstruction({
+        id: '605',
+        instruction: 'Take DemoMed on Monday, Wednesday and Friday.',
+      }),
+    ],
+    scheduleItems: [
+      scheduleItem({
+        id: '807',
+        instruction_id: '605',
+        schedule_time: '08:00:00',
+        display_time: 'Morning',
+      }),
+    ],
+  });
+
+  await ensureOccurrencesForDate({
+    db: pool,
+    userId: USER,
+    planId: '10',
+    dateKey: '2026-09-07',
+  });
+  await ensureOccurrencesForDate({
+    db: pool,
+    userId: USER,
+    planId: '10',
+    dateKey: '2026-09-08',
+  });
+  await ensureOccurrencesForDate({
+    db: pool,
+    userId: USER,
+    planId: '10',
+    dateKey: '2026-09-09',
+  });
+
+  assert.equal(pool.scheduleItems[0].recurrence_mode, 'weekdays');
+  assert.equal(pool.scheduleItems[0].recurrence_weekdays_json, '[1,3,5]');
+  assert.deepEqual(pool.occurrences.map((item) => item.occurrence_date), [
+    '2026-09-07',
+    '2026-09-09',
+  ]);
+});
+
+await test('verified interval-days recurrence uses plan activation as the anchor', async () => {
+  const pool = createSchedulePool({
+    plan: activePlan(),
+    instructions: [
+      verifiedInstruction({
+        id: '606',
+        instruction: 'Take DemoMed every 3 days.',
+      }),
+    ],
+    scheduleItems: [
+      scheduleItem({
+        id: '808',
+        instruction_id: '606',
+        schedule_time: '09:00:00',
+      }),
+    ],
+  });
+
+  for (const dateKey of ['2026-09-07', '2026-09-08', '2026-09-10']) {
+    await ensureOccurrencesForDate({
+      db: pool,
+      userId: USER,
+      planId: '10',
+      dateKey,
+    });
+  }
+
+  assert.equal(pool.scheduleItems[0].recurrence_mode, 'interval_days');
+  assert.equal(pool.scheduleItems[0].recurrence_interval_days, 3);
+  assert.deepEqual(pool.occurrences.map((item) => item.occurrence_date), [
+    '2026-09-07',
+    '2026-09-10',
+  ]);
+});
+
+await test('verified month-day recurrence honors actual calendar days', async () => {
+  const pool = createSchedulePool({
+    plan: activePlan(),
+    instructions: [
+      verifiedInstruction({
+        id: '607',
+        instruction: 'Take DemoMed monthly on the 31st.',
+      }),
+    ],
+    scheduleItems: [
+      scheduleItem({
+        id: '809',
+        instruction_id: '607',
+        schedule_time: '09:00:00',
+      }),
+    ],
+  });
+
+  for (const dateKey of ['2026-09-30', '2026-10-31', '2026-11-30']) {
+    await ensureOccurrencesForDate({
+      db: pool,
+      userId: USER,
+      planId: '10',
+      dateKey,
+    });
+  }
+
+  assert.equal(pool.scheduleItems[0].recurrence_mode, 'month_days');
+  assert.equal(pool.scheduleItems[0].recurrence_month_days_json, '[31]');
+  assert.deepEqual(pool.occurrences.map((item) => item.occurrence_date), [
+    '2026-10-31',
+  ]);
+});
+
+await test('medicine schedule date alone does not resolve recurrence or generate a one-off', async () => {
+  const pool = createSchedulePool({
+    plan: activePlan(),
+    instructions: [
+      verifiedInstruction({
+        id: '608',
+        instruction: 'Take DemoMed with breakfast.',
+      }),
+    ],
+    scheduleItems: [
+      scheduleItem({
+        id: '810',
+        instruction_id: '608',
+        schedule_date: '2026-09-08',
+        schedule_time: '08:00:00',
+      }),
+    ],
+  });
+
+  await ensureOccurrencesForDate({
+    db: pool,
+    userId: USER,
+    planId: '10',
+    dateKey: '2026-09-08',
+  });
+
+  assert.equal(scheduleItemRecurrenceResolved(pool.scheduleItems[0]), false);
+  assert.equal(pool.occurrences.length, 0);
+});
+
 await test('one-off dated tasks remain one-off', async () => {
   const pool = createSchedulePool({
     plan: activePlan(),
     instructions: [
       verifiedInstruction({
         id: '602',
+        category: 'follow_up',
         instruction: 'Follow up with the doctor on 2026-09-08.',
         timing: '10:00 AM',
       }),
@@ -388,6 +602,7 @@ await test('one-off dated tasks remain one-off', async () => {
         schedule_date: '2026-09-08',
         schedule_time: '10:00:00',
         display_time: '10:00 AM',
+        task_kind: 'appointment',
       }),
     ],
   });

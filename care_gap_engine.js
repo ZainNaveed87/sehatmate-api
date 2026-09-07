@@ -1,4 +1,8 @@
 import { matchRealityAnswersToTemplates } from './reality_check_decision.js';
+import {
+  scheduleItemIsMedicine,
+  scheduleItemRecurrenceResolved,
+} from './services/shared_utils.js';
 
 const CARE_GAP_COLUMNS = `id, care_plan_id, task_id, category, gap_type, title, status,
   severity, lifecycle_status, when_text, summary, instruction_snapshot,
@@ -357,7 +361,9 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
     `SELECT id, instruction_id, title, task_kind,
       DATE_FORMAT(schedule_date, '%Y-%m-%d') AS schedule_date,
       TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
-      display_time, recurrence_text, reason, requires_confirmation
+      display_time, recurrence_text, reason, requires_confirmation,
+      recurrence_mode, recurrence_weekdays_json, recurrence_interval_days,
+      recurrence_month_days_json, recurrence_source
      FROM care_schedule_items
      WHERE care_plan_id = ? AND user_id = ? ORDER BY id`,
     [planId, userId],
@@ -462,6 +468,28 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
   for (const task of tasks) {
     const taskId = String(task.id);
     const title = text(task.title, 160) || 'Scheduled care task';
+    if (scheduleItemIsMedicine(task) && !scheduleItemRecurrenceResolved(task)) {
+      addGap(desired, {
+        category: 'Schedule',
+        gapType: 'schedule_gap',
+        title: `${title} still needs a repeat pattern`,
+        severity: 'blocking',
+        legacyStatus: 'unclear',
+        whenText: scheduleLabel(task),
+        summary:
+          'This medicine has reminder timing, but no explicit repeat pattern or one-time date.',
+        instructionSnapshot: text(task.recurrence_text, 4000) || text(task.display_time, 4000),
+        reason:
+          'SehatMate must not infer medicine frequency from course duration, plan end date, or reminder slots.',
+        nextStep:
+          'Open Schedule and enter only the repeat pattern stated in the healthcare professional instructions.',
+        sourceKey: scheduleIssueKey(task, 'repeat_pattern'),
+        sourceKind: 'schedule_item',
+        sourceId: taskId,
+        dueAt: dueDate(task),
+      });
+    }
+
     if (!task.schedule_time || Boolean(task.requires_confirmation)) {
       addGap(desired, {
         category: 'Schedule',

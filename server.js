@@ -75,7 +75,11 @@ import {
   cleanText,
   dbDateKey,
   idPattern,
+  recurrenceDefinitionFromInstruction,
+  recurrenceDisplayText,
   schedulePeriodKey,
+  scheduleItemIsMedicine,
+  scheduleItemRecurrenceResolved,
   scheduleWindow,
   serverDateKey,
   taskOutcomeDate,
@@ -108,6 +112,10 @@ import {
 import {
   saveScheduleItemDuration,
 } from './services/schedule_duration_service.js';
+
+import {
+  saveScheduleItemRecurrence,
+} from './services/schedule_recurrence_service.js';
 
 import {
   validatePlanDurationInput,
@@ -167,6 +175,7 @@ import {
   ensureFamilyCareSchema,
   listFamilyHome,
   readFamilyCareGaps,
+  readFamilyCarePlanDetail,
   readFamilyCarePlans,
   readFamilyMemberSummary,
   readFamilyPerformance,
@@ -214,8 +223,15 @@ const serviceErrorStatusByCode = {
   INVALID_MEDICINE_DURATION_MODE: 422,
   INVALID_MEDICINE_DURATION: 422,
   INVALID_MEDICINE_DURATION_DATE: 422,
+  INVALID_MEDICINE_RECURRENCE_MODE: 422,
+  INVALID_MEDICINE_RECURRENCE_WEEKDAYS: 422,
+  INVALID_MEDICINE_RECURRENCE_INTERVAL: 422,
+  INVALID_MEDICINE_RECURRENCE_MONTH_DAYS: 422,
+  INVALID_MEDICINE_RECURRENCE_DATE: 422,
   MEDICINE_DURATION_NOT_APPLICABLE: 422,
+  MEDICINE_RECURRENCE_NOT_APPLICABLE: 422,
   VERIFIED_MEDICINE_DURATION_LOCKED: 409,
+  VERIFIED_MEDICINE_RECURRENCE_LOCKED: 409,
   PLAN_END_REQUIRED: 409,
   MEDICAL_TIMING_CONFLICT: 409,
   DUPLICATE_REMINDER_TIME: 409,
@@ -2590,6 +2606,25 @@ app.get('/api/family/:id/care-plans', authenticate, async (req, res, next) => {
   }
 });
 
+app.get('/api/family/:relationshipId/plans/:planId', authenticate, async (req, res, next) => {
+  try {
+    const result = await readFamilyCarePlanDetail({
+      pool,
+      actorUserId: req.auth.userId,
+      relationshipId: req.params.relationshipId,
+      planId: req.params.planId,
+    });
+    if (!result.ok) {
+      sendServiceError(res, result);
+      return;
+    }
+
+    res.json({ success: true, data: result.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/family/:id/tasks/today', authenticate, async (req, res, next) => {
   try {
     const result = await readFamilyTodayTasks({
@@ -2823,13 +2858,22 @@ app.get('/api/care-plans/:id/setup-progress', authenticate, async (req, res, nex
       if (['reality_check', 'needs_attention'].includes(rows[0].status)) {
         const [tasks] = await pool.execute(
           `SELECT id, task_kind, title, display_time, recurrence_text, reason,
-            requires_confirmation
+            schedule_date, recurrence_mode, recurrence_weekdays_json,
+            recurrence_interval_days, recurrence_month_days_json,
+            recurrence_source, requires_confirmation
            FROM care_schedule_items
            WHERE care_plan_id = ? AND user_id = ?`,
           [planId, req.auth.userId],
         );
 
-        if (!tasks.length || tasks.some((task) => Boolean(task.requires_confirmation))) {
+        const unresolvedMedicineRecurrence = tasks.some((task) =>
+          scheduleItemIsMedicine(task) && !scheduleItemRecurrenceResolved(task));
+
+        if (
+          !tasks.length ||
+          tasks.some((task) => Boolean(task.requires_confirmation)) ||
+          unresolvedMedicineRecurrence
+        ) {
           step = 'schedule';
         } else {
           const reality = await realityDecisionTemplatesForPlan({
@@ -3875,6 +3919,14 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
           : null,
       ]),
     );
+    const recurrenceByInstruction = new Map(
+      instructions.map((instruction) => [
+        String(instruction.id),
+        instruction.category === 'medicine'
+          ? recurrenceDefinitionFromInstruction(instruction)
+          : null,
+      ]),
+    );
     const explicitDays = [...durationDaysByInstruction.values()]
       .filter((value) => Number.isInteger(value) && value > 0 && value <= 3650);
     const scheduleDates = schedule.map((item) => item.date).filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value || ''));
@@ -3901,14 +3953,21 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
      for (const item of schedule) {
   const durationDays =
     durationDaysByInstruction.get(String(item.instructionId)) || null;
+  const structuredRecurrence =
+    recurrenceByInstruction.get(String(item.instructionId)) || null;
+  const recurrenceText = structuredRecurrence
+    ? structuredRecurrence.text || recurrenceDisplayText(structuredRecurrence)
+    : null;
 
   await connection.execute(
     `INSERT INTO care_schedule_items (
       care_plan_id, user_id, instruction_id, title, task_kind,
       schedule_date, schedule_time, display_time, recurrence_text,
+      recurrence_mode, recurrence_weekdays_json, recurrence_interval_days,
+      recurrence_month_days_json, recurrence_source,
       grounding, requires_confirmation, confirmation_status, reason,
       instruction_duration_days, instruction_duration_source
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       planId,
       req.auth.userId,
@@ -3918,7 +3977,16 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
       item.date,
       item.time,
       item.displayTime,
-      item.recurrence,
+      recurrenceText,
+      structuredRecurrence?.mode || null,
+      structuredRecurrence?.weekdays?.length
+        ? JSON.stringify(structuredRecurrence.weekdays)
+        : null,
+      structuredRecurrence?.intervalDays || null,
+      structuredRecurrence?.monthDays?.length
+        ? JSON.stringify(structuredRecurrence.monthDays)
+        : null,
+      structuredRecurrence ? 'verified' : null,
       item.grounding,
       item.requiresConfirmation ? 1 : 0,
       item.requiresConfirmation ? 'needs_confirmation' : 'ready',
@@ -4025,6 +4093,35 @@ app.patch(
         itemId: req.params.id,
         mode: req.body?.mode,
         durationDays: req.body?.durationDays,
+        today: req.body?.today,
+      });
+
+      if (!result.ok) {
+        sendServiceError(res, result);
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: result.message,
+        data: result.data,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.patch(
+  '/api/schedule-items/:id/recurrence',
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const result = await saveScheduleItemRecurrence({
+        pool,
+        userId: req.auth.userId,
+        itemId: req.params.id,
+        body: req.body,
         today: req.body?.today,
       });
 
@@ -4872,7 +4969,9 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       });
       const [scheduleRows] = await pool.execute(
         `SELECT task_kind, title, display_time, recurrence_text, reason,
-          schedule_time, requires_confirmation
+          schedule_date, schedule_time, requires_confirmation,
+          recurrence_mode, recurrence_weekdays_json, recurrence_interval_days,
+          recurrence_month_days_json, recurrence_source
          FROM care_schedule_items
          WHERE care_plan_id = ? AND user_id = ?`,
         [planId, req.auth.userId],
@@ -4895,6 +4994,8 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
       ).length;
       const missingTimeCount = scheduleRows.filter((item) => item.schedule_time == null).length;
       const confirmationCount = scheduleRows.filter((item) => Boolean(item.requires_confirmation)).length;
+      const unresolvedMedicineRecurrenceCount = scheduleRows.filter((item) =>
+        scheduleItemIsMedicine(item) && !scheduleItemRecurrenceResolved(item)).length;
       const reality = await realityDecisionTemplatesForPlan({
         db: pool,
         planId,
@@ -4917,12 +5018,20 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
         scheduleRows.length === 0 ||
         missingTimeCount > 0 ||
         confirmationCount > 0 ||
+        unresolvedMedicineRecurrenceCount > 0 ||
         unansweredRealityCount > 0
       ) {
         const activationIssues = [];
         if (verifiedCount === 0 || pendingCount > 0) activationIssues.push('instruction review');
         if (blockingGapCount > 0) activationIssues.push('blocking care gaps');
-        if (scheduleRows.length === 0 || missingTimeCount > 0 || confirmationCount > 0) activationIssues.push('schedule confirmation');
+        if (
+          scheduleRows.length === 0 ||
+          missingTimeCount > 0 ||
+          confirmationCount > 0 ||
+          unresolvedMedicineRecurrenceCount > 0
+        ) {
+          activationIssues.push('schedule confirmation');
+        }
         if (unansweredRealityCount > 0) activationIssues.push('Reality Check');
 
         res.status(409).json({
@@ -4936,6 +5045,7 @@ app.patch('/api/care-plans/:id/status', authenticate, async (req, res, next) => 
             attentionGapCount,
             missingTimeCount,
             confirmationCount,
+            unresolvedMedicineRecurrenceCount,
             unansweredRealityCount,
             realityRiskCount,
           },
@@ -5451,6 +5561,64 @@ if (!durationSourceColumns.length) {
   );
 }
 
+const [recurrenceColumns] = await pool.execute(
+  `SELECT COLUMN_NAME
+   FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME = 'care_schedule_items'
+     AND COLUMN_NAME IN (
+       'recurrence_mode',
+       'recurrence_weekdays_json',
+       'recurrence_interval_days',
+       'recurrence_month_days_json',
+       'recurrence_source'
+     )`,
+);
+
+const recurrenceColumnNames = new Set(
+  recurrenceColumns.map((item) => item.COLUMN_NAME),
+);
+
+if (!recurrenceColumnNames.has('recurrence_mode')) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN recurrence_mode VARCHAR(20) NULL
+     AFTER recurrence_text`,
+  );
+}
+
+if (!recurrenceColumnNames.has('recurrence_weekdays_json')) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN recurrence_weekdays_json LONGTEXT NULL
+     AFTER recurrence_mode`,
+  );
+}
+
+if (!recurrenceColumnNames.has('recurrence_interval_days')) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN recurrence_interval_days INT UNSIGNED NULL
+     AFTER recurrence_weekdays_json`,
+  );
+}
+
+if (!recurrenceColumnNames.has('recurrence_month_days_json')) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN recurrence_month_days_json LONGTEXT NULL
+     AFTER recurrence_interval_days`,
+  );
+}
+
+if (!recurrenceColumnNames.has('recurrence_source')) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN recurrence_source VARCHAR(20) NULL
+     AFTER recurrence_month_days_json`,
+  );
+}
+
 
 // Existing/backfill medicine duration code comes AFTER this
 const [existingMedicineSchedules] = await pool.execute(
@@ -5490,6 +5658,68 @@ const [existingMedicineSchedules] = await pool.execute(
          instruction_duration_source = 'verified'
      WHERE id = ?`,
     [days, row.id],
+  );
+}
+
+const [existingMedicineRecurrences] = await pool.execute(
+  `SELECT
+    s.id,
+    s.recurrence_mode,
+    s.recurrence_source,
+    i.instruction,
+    i.timing,
+    i.original_instruction,
+    i.original_timing
+   FROM care_schedule_items s
+   JOIN extracted_instructions i
+     ON i.id = s.instruction_id
+   WHERE i.category = 'medicine'
+     AND i.review_status = 'verified'
+     AND (
+       s.recurrence_mode IS NULL
+       OR TRIM(s.recurrence_mode) = ''
+     )
+     AND (
+       s.recurrence_source IS NULL
+       OR TRIM(s.recurrence_source) = ''
+       OR s.recurrence_source <> 'user'
+     )`,
+);
+
+for (const row of existingMedicineRecurrences) {
+  const recurrence = recurrenceDefinitionFromInstruction(row);
+  if (!recurrence) continue;
+
+  await pool.execute(
+    `UPDATE care_schedule_items
+     SET recurrence_text = CASE
+           WHEN recurrence_text IS NULL OR TRIM(recurrence_text) = ''
+             THEN ?
+           ELSE recurrence_text
+         END,
+         recurrence_mode = ?,
+         recurrence_weekdays_json = ?,
+         recurrence_interval_days = ?,
+         recurrence_month_days_json = ?,
+         recurrence_source = 'verified'
+     WHERE id = ?
+       AND (
+         recurrence_mode IS NULL
+         OR TRIM(recurrence_mode) = ''
+       )
+       AND (
+         recurrence_source IS NULL
+         OR TRIM(recurrence_source) = ''
+         OR recurrence_source <> 'user'
+       )`,
+    [
+      recurrence.text || recurrenceDisplayText(recurrence),
+      recurrence.mode,
+      recurrence.weekdays.length ? JSON.stringify(recurrence.weekdays) : null,
+      recurrence.intervalDays,
+      recurrence.monthDays.length ? JSON.stringify(recurrence.monthDays) : null,
+      row.id,
+    ],
   );
 }
 }

@@ -48,6 +48,8 @@ import {
   parseStoredObject,
   routineNoteTime,
   schedulePeriodKey,
+  scheduleItemIsMedicine,
+  scheduleItemRecurrenceResolved,
   scheduleWindow,
   timeFitsScheduleWindow,
 } from './shared_utils.js';
@@ -515,7 +517,9 @@ export async function readSimulationState({ pool, userId, planId }) {
   const [tasks] = await pool.execute(
     `SELECT id, instruction_id, title, task_kind, schedule_date,
       TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
-      display_time, recurrence_text, grounding, reason, requires_confirmation
+      display_time, recurrence_text, grounding, reason, requires_confirmation,
+      recurrence_mode, recurrence_weekdays_json, recurrence_interval_days,
+      recurrence_month_days_json, recurrence_source
      FROM care_schedule_items
      WHERE care_plan_id = ? AND user_id = ?
      ORDER BY schedule_date, schedule_time, id`,
@@ -616,6 +620,11 @@ export async function readSimulationState({ pool, userId, planId }) {
       .filter((item) => Boolean(item.requires_confirmation))
       .map((item) => String(item.id)),
   );
+  const unresolvedMedicineRecurrenceTasks = tasks.filter((item) =>
+    scheduleItemIsMedicine(item) && !scheduleItemRecurrenceResolved(item));
+  for (const item of unresolvedMedicineRecurrenceTasks) {
+    unclearTaskIds.add(String(item.id));
+  }
   const atRiskTaskIds = new Set();
   let nonTaskRiskCount = 0;
   for (const evaluated of unresolvedRiskAnswers) {
@@ -721,6 +730,19 @@ export async function readSimulationState({ pool, userId, planId }) {
       severity: 'blocked',
       reason: 'A care plan needs a schedule before reminders can be activated.',
       recommendation: 'Generate the schedule and confirm the required reminder times.',
+      action: 'schedule',
+    });
+  }
+
+  if (unresolvedMedicineRecurrenceTasks.length > 0) {
+    blockers.unshift({
+      type: 'schedule_recurrence',
+      title: 'Medicine repeat pattern missing',
+      severity: 'blocked',
+      reason:
+        'One or more medicines do not yet have an explicit repeat pattern or one-time date.',
+      recommendation:
+        'Open Schedule and set the repeat pattern exactly as instructed by the healthcare professional.',
       action: 'schedule',
     });
   }
