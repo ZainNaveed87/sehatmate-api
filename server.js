@@ -80,6 +80,7 @@ import {
   serverDateKey,
   taskOutcomeDate,
   timeFitsScheduleWindow,
+  verifiedDailyRecurrence,
 } from './services/shared_utils.js';
 
 import {
@@ -103,6 +104,10 @@ import {
 import {
   confirmScheduleItem,
 } from './services/schedule_confirm_service.js';
+
+import {
+  validatePlanDurationInput,
+} from './services/plan_duration_service.js';
 
 import {
   carePlanJson,
@@ -862,21 +867,17 @@ function normalizedInstructionScheduleKey(instruction) {
   ].join('|');
 }
 
+function dailyRecurrenceForInstruction(instruction) {
+  return verifiedDailyRecurrence([
+    instruction?.instruction,
+    instruction?.timing,
+    instruction?.original_instruction,
+    instruction?.original_timing,
+  ].filter(Boolean).join(' '));
+}
+
 function explicitDailyFrequencyCount(instruction) {
-  const value = `${instruction?.instruction || ''} ${instruction?.timing || ''}`
-    .toLowerCase()
-    .replace(/\s+/g, ' ');
-
-  const numeric = value.match(
-    /\b([1-9])\s*(?:x|times?)\s*(?:a|per)?\s*(?:day|daily)\b/i,
-  );
-  if (numeric) return Number(numeric[1]);
-
-  if (/\bonce\s+(?:a\s+)?(?:day|daily)\b/i.test(value)) return 1;
-  if (/\btwice\s+(?:a\s+)?(?:day|daily)\b/i.test(value)) return 2;
-  if (/\bthrice\s+(?:a\s+)?(?:day|daily)\b/i.test(value)) return 3;
-
-  return null;
+  return dailyRecurrenceForInstruction(instruction)?.count || null;
 }
 
 
@@ -987,23 +988,30 @@ function normalizeCareScheduleForInstructions(
   const output = [];
   for (const [instructionId, items] of grouped.entries()) {
     const instruction = instructionById.get(instructionId);
-    const expectedCount = explicitDailyFrequencyCount(instruction);
+    const verifiedDaily = dailyRecurrenceForInstruction(instruction);
+    const expectedCount = verifiedDaily?.count || null;
     const guardedItems = applyVerifiedExactTimesToScheduleItems(
       items,
       instruction,
       expectedCount,
     );
+    const recurringItems = verifiedDaily
+      ? guardedItems.map((item) => ({
+          ...item,
+          recurrence: item.recurrence || verifiedDaily.recurrence,
+        }))
+      : guardedItems;
 
     if (!expectedCount) {
-      output.push(...guardedItems);
+      output.push(...recurringItems);
       continue;
     }
 
-    const hasVerifiedExactTime = guardedItems.some(
+    const hasVerifiedExactTime = recurringItems.some(
       (item) => item.grounding === 'explicit' && Boolean(item.time),
     );
 
-    const currentPeriods = guardedItems
+    const currentPeriods = recurringItems
       .map((item) =>
         schedulePeriodKey(`${item.displayTime || ''} ${item.recurrence || ''}`),
       )
@@ -1033,16 +1041,17 @@ function normalizeCareScheduleForInstructions(
         if (desiredPeriods.length === expectedCount) break;
       }
 
-      const base = guardedItems[0];
+      const base = recurringItems[0];
       if (!base) continue;
 
       for (let index = 0; index < expectedCount; index += 1) {
-        const source = guardedItems[index] || base;
+        const source = recurringItems[index] || base;
         const period = desiredPeriods[index] || defaultPeriods[index];
         const label = periodDisplayLabel(period);
         const frequency =
           source.recurrence ||
           base.recurrence ||
+          verifiedDaily?.recurrence ||
           `${expectedCount} times daily`;
 
         output.push({
@@ -1071,27 +1080,28 @@ function normalizeCareScheduleForInstructions(
 
     // If AI returned too many rows but the periods are already sensible, keep
     // only the number required by the verified daily frequency.
-    if (guardedItems.length > expectedCount) {
-      output.push(...guardedItems.slice(0, expectedCount));
+    if (recurringItems.length > expectedCount) {
+      output.push(...recurringItems.slice(0, expectedCount));
       continue;
     }
 
     // If AI returned too few rows for a plain verified frequency, create the
     // missing reminder slots as confirmable organizational periods.
     if (
-      guardedItems.length < expectedCount &&
+      recurringItems.length < expectedCount &&
       defaultPeriods.length === expectedCount
     ) {
-      const base = guardedItems[0];
+      const base = recurringItems[0];
       if (!base) continue;
 
       for (let index = 0; index < expectedCount; index += 1) {
-        const source = guardedItems[index] || base;
+        const source = recurringItems[index] || base;
         const period = defaultPeriods[index];
         const label = periodDisplayLabel(period);
         const frequency =
           source.recurrence ||
           base.recurrence ||
+          verifiedDaily?.recurrence ||
           `${expectedCount} times daily`;
 
         output.push({
@@ -1118,7 +1128,7 @@ function normalizeCareScheduleForInstructions(
       continue;
     }
 
-    output.push(...guardedItems);
+    output.push(...recurringItems);
   }
 
   return output;
@@ -2705,24 +2715,21 @@ app.post('/api/care-plans/bulk-delete', authenticate, async (req, res, next) => 
 });
 
 app.patch('/api/care-plans/:id/duration', authenticate, async (req, res, next) => {
-  const planId = req.params.id;
-  const mode = cleanText(req.body?.mode, 20);
-  const allowedModes = new Set(['prescription', 'custom', 'ongoing']);
-  const endDate = cleanText(req.body?.endDate, 10);
-  if (!idPattern.test(planId) || !allowedModes.has(mode)) {
-    return res.status(422).json({ success: false, message: 'Select a valid plan duration.' });
+  const validation = validatePlanDurationInput({
+    planId: req.params.id,
+    mode: req.body?.mode,
+    endDate: req.body?.endDate,
+    today: req.body?.today ?? req.body?.clientToday,
+  });
+  if (!validation.ok) {
+    return res.status(422).json({ success: false, message: validation.message });
   }
-  if (mode !== 'ongoing' && !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-    return res.status(422).json({ success: false, message: 'Select a valid plan end date.' });
-  }
-  if (mode !== 'ongoing' && endDate < new Date().toISOString().slice(0, 10)) {
-    return res.status(422).json({ success: false, message: 'Plan end date cannot be in the past.' });
-  }
+  const { planId, mode, endDate } = validation.data;
   try {
     const [result] = await pool.execute(
       `UPDATE care_plans SET duration_mode = ?, planned_end_date = ?
        WHERE id = ? AND user_id = ?`,
-      [mode, mode === 'ongoing' ? null : endDate, planId, req.auth.userId],
+      [mode, endDate, planId, req.auth.userId],
     );
     if (!result.affectedRows) return res.status(404).json({ success: false, message: 'Care plan not found.' });
     await recordLifecycleEvent({
@@ -2733,9 +2740,9 @@ app.patch('/api/care-plans/:id/duration', authenticate, async (req, res, next) =
       reason: mode === 'ongoing'
         ? 'Care plan changed to ongoing.'
         : `Care plan end date set to ${endDate}.`,
-      metadata: { mode, endDate: mode === 'ongoing' ? null : endDate },
+      metadata: { mode, endDate },
     });
-    res.json({ success: true, message: 'Plan duration saved.', data: { mode, endDate: mode === 'ongoing' ? null : endDate } });
+    res.json({ success: true, message: 'Plan duration saved.', data: { mode, endDate } });
   } catch (error) { next(error); }
 });
 

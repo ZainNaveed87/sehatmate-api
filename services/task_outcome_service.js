@@ -25,6 +25,7 @@ import {
   schedulePeriodKey,
   serverDateKey,
   taskOutcomeDate,
+  verifiedDailyRecurrenceText,
 } from './shared_utils.js';
 
 function scheduleItemEffectiveStart(item, dateKey, plan) {
@@ -64,9 +65,8 @@ export function scheduleItemDurationExpired(item, dateKey, plan) {
   return Boolean(endDate && dateKey > endDate);
 }
 
-function scheduleItemIsDaily(item) {
-  const recurrence = String(item?.recurrence_text || '').toLowerCase();
-  return /\b(?:daily|every\s+day|each\s+day|once\s+daily|twice\s+daily|times\s+daily|per\s+day)\b/.test(recurrence);
+export function scheduleItemIsDaily(item) {
+  return Boolean(verifiedDailyRecurrenceText(item?.recurrence_text));
 }
 
 function scheduleItemAppliesOnDate(item, dateKey, plan) {
@@ -167,6 +167,43 @@ export async function reconcileExpiredFixedDurationOccurrences({
   }
 }
 
+export async function restoreVerifiedScheduleRecurrenceForPlan({ db, userId, planId }) {
+  const [rows] = await db.execute(
+    `SELECT s.id, i.instruction, i.timing,
+      i.original_instruction, i.original_timing
+     FROM care_schedule_items s
+     JOIN extracted_instructions i ON i.id = s.instruction_id
+     WHERE s.care_plan_id = ? AND s.user_id = ?
+       AND i.care_plan_id = s.care_plan_id
+       AND i.review_status = 'verified'
+       AND (s.recurrence_text IS NULL OR TRIM(s.recurrence_text) = '')
+     ORDER BY s.id
+     LIMIT 500`,
+    [planId, userId],
+  );
+
+  let restoredCount = 0;
+  for (const row of rows) {
+    const recurrence = verifiedDailyRecurrenceText([
+      row.instruction,
+      row.timing,
+      row.original_instruction,
+      row.original_timing,
+    ].filter(Boolean).join(' '));
+    if (!recurrence) continue;
+
+    const [result] = await db.execute(
+      `UPDATE care_schedule_items
+       SET recurrence_text = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND care_plan_id = ? AND user_id = ?
+         AND (recurrence_text IS NULL OR TRIM(recurrence_text) = '')`,
+      [recurrence, row.id, planId, userId],
+    );
+    if (result.affectedRows) restoredCount += 1;
+  }
+  return restoredCount;
+}
+
 export async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) {
   const [plans] = await db.execute(
     `SELECT id, status, start_date, activated_at, completed_at,
@@ -178,6 +215,8 @@ export async function ensureOccurrencesForDate({ db, userId, planId, dateKey }) 
   );
   const plan = plans[0];
   if (!plan || plan.status !== 'active') return;
+
+  await restoreVerifiedScheduleRecurrenceForPlan({ db, userId, planId });
 
   const [items] = await db.execute(
     `SELECT id, care_plan_id, user_id, schedule_date, schedule_time,

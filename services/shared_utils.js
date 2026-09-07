@@ -59,8 +59,87 @@ export function taskOutcomeDate(value) {
   return text;
 }
 
+export function strictDateKey(value) {
+  if (typeof value !== 'string') return null;
+  const text = value
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200d\u2060\ufeff]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  return taskOutcomeDate(text);
+}
+
 export function serverDateKey(value = new Date()) {
   return value.toISOString().slice(0, 10);
+}
+
+function canonicalDailyRecurrence(count) {
+  switch (Number(count)) {
+    case 1:
+      return 'once daily';
+    case 2:
+      return 'twice daily';
+    case 3:
+      return 'three times daily';
+    case 4:
+      return 'four times daily';
+    default:
+      return `${count} times daily`;
+  }
+}
+
+export function verifiedDailyRecurrence(value) {
+  const text = cleanText(value, 4000)
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+  if (!text) return null;
+
+  const numeric = text.match(
+    /\b([1-9])\s*(?:x|times?)\s*(?:a|per)?\s*(?:day|daily)\b/i,
+  ) || text.match(/\b([1-9])\s*\/\s*day\b/i);
+  if (numeric) {
+    const count = Number(numeric[1]);
+    return { count, recurrence: canonicalDailyRecurrence(count) };
+  }
+
+  const wordCounts = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+  };
+  const word = text.match(
+    /\b(one|two|three|four|five|six|seven|eight|nine)\s+times?\s*(?:a|per)?\s*(?:day|daily)\b/i,
+  );
+  if (word) {
+    const count = wordCounts[word[1].toLowerCase()];
+    return { count, recurrence: canonicalDailyRecurrence(count) };
+  }
+
+  if (/\bonce\s+(?:(?:a|per)\s+)?(?:day|daily)\b/i.test(text)) {
+    return { count: 1, recurrence: 'once daily' };
+  }
+  if (/\btwice\s+(?:(?:a|per)\s+)?(?:day|daily)\b/i.test(text)) {
+    return { count: 2, recurrence: 'twice daily' };
+  }
+  if (/\bthrice\s+(?:(?:a|per)\s+)?(?:day|daily)\b/i.test(text)) {
+    return { count: 3, recurrence: 'three times daily' };
+  }
+
+  if (/\b(?:daily|every\s+day|each\s+day|per\s+day)\b/i.test(text)) {
+    return { count: null, recurrence: 'daily' };
+  }
+
+  return null;
+}
+
+export function verifiedDailyRecurrenceText(value) {
+  return verifiedDailyRecurrence(value)?.recurrence || '';
 }
 
 export function dbDateKey(value) {
