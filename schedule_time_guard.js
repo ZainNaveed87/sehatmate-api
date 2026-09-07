@@ -74,6 +74,14 @@ function looksLikeTimeRange(value) {
   return /\b(?:between|from)\b[^.]{0,50}\b(?:and|to|until|through)\b/.test(text);
 }
 
+function clockKey(value) {
+  const match = /^(\d{1,2}):([0-5]\d)/.exec(normalizeSpace(value));
+  if (!match) return null;
+  const hour = Number(match[1]);
+  if (!Number.isInteger(hour) || hour < 0 || hour > 23) return null;
+  return `${String(hour).padStart(2, '0')}:${match[2]}`;
+}
+
 /**
  * Return clock times that are safe to treat as explicit schedule facts.
  *
@@ -117,14 +125,27 @@ export function extractVerifiedExactClockTimes(instruction = {}) {
   return candidates;
 }
 
+/**
+ * True only when the schedule row's stored clock exactly matches an exact
+ * clock time present in the verified source text supplied on the same object.
+ * Grounding is intentionally not checked here so legacy rows can be repaired
+ * when their stored time already matches the verified source exactly.
+ */
+export function scheduleTimeMatchesVerifiedExactSource(scheduleItem = {}) {
+  const storedTime = clockKey(
+    scheduleItem.schedule_time || scheduleItem.scheduleTime || scheduleItem.time,
+  );
+  if (!storedTime) return false;
+
+  return extractVerifiedExactClockTimes(scheduleItem).some(
+    (item) => clockKey(item.time) === storedTime,
+  );
+}
 
 export function isVerifiedExactScheduleItemLocked(scheduleItem = {}) {
   const grounding = normalizeSpace(scheduleItem.grounding).toLowerCase();
-  const storedTime = normalizeSpace(
-    scheduleItem.schedule_time || scheduleItem.scheduleTime || scheduleItem.time,
-  );
-  if (grounding !== 'explicit' || !storedTime) return false;
-  return extractVerifiedExactClockTimes(scheduleItem).length > 0;
+  if (grounding !== 'explicit') return false;
+  return scheduleTimeMatchesVerifiedExactSource(scheduleItem);
 }
 
 /**

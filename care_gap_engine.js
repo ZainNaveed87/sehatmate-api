@@ -1,4 +1,5 @@
 import { matchRealityAnswersToTemplates } from './reality_check_decision.js';
+import { scheduleTimeMatchesVerifiedExactSource } from './schedule_time_guard.js';
 import {
   scheduleItemIsMedicine,
   scheduleItemRecurrenceResolved,
@@ -358,16 +359,50 @@ export async function refreshCareGaps({ db, planId, userId, realityQuestionTempl
     [planId],
   );
   const [tasks] = await db.execute(
-    `SELECT id, instruction_id, title, task_kind,
-      DATE_FORMAT(schedule_date, '%Y-%m-%d') AS schedule_date,
-      TIME_FORMAT(schedule_time, '%H:%i') AS schedule_time,
-      display_time, recurrence_text, reason, requires_confirmation,
-      recurrence_mode, recurrence_weekdays_json, recurrence_interval_days,
-      recurrence_month_days_json, recurrence_source
-     FROM care_schedule_items
-     WHERE care_plan_id = ? AND user_id = ? ORDER BY id`,
+    `SELECT s.id, s.instruction_id, s.title, s.task_kind,
+      DATE_FORMAT(s.schedule_date, '%Y-%m-%d') AS schedule_date,
+      TIME_FORMAT(s.schedule_time, '%H:%i') AS schedule_time,
+      s.display_time, s.recurrence_text, s.reason, s.grounding,
+      s.requires_confirmation,
+      s.recurrence_mode, s.recurrence_weekdays_json,
+      s.recurrence_interval_days, s.recurrence_month_days_json,
+      s.recurrence_source,
+      i.instruction, i.timing, i.original_instruction, i.original_timing,
+      i.review_status AS instruction_review_status
+     FROM care_schedule_items s
+     LEFT JOIN extracted_instructions i
+       ON i.id = s.instruction_id
+      AND i.care_plan_id = s.care_plan_id
+     WHERE s.care_plan_id = ? AND s.user_id = ? ORDER BY s.id`,
     [planId, userId],
   );
+
+  // Legacy/generated rows can retain requires_confirmation = 1 even when
+  // their stored clock already exactly matches a verified source instruction.
+  // Repair only that derived confirmation state. Never invent or move a time.
+  for (const task of tasks) {
+    const verifiedInstruction =
+      text(task.instruction_review_status, 20).toLowerCase() === 'verified';
+    const exactSourceMatch =
+      verifiedInstruction && scheduleTimeMatchesVerifiedExactSource(task);
+
+    if (!exactSourceMatch || !Boolean(task.requires_confirmation)) continue;
+
+    await db.execute(
+      `UPDATE care_schedule_items
+       SET requires_confirmation = 0,
+           confirmation_status = 'ready',
+           grounding = 'explicit',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND care_plan_id = ? AND user_id = ?
+         AND requires_confirmation = 1`,
+      [task.id, planId, userId],
+    );
+
+    task.requires_confirmation = 0;
+    task.grounding = 'explicit';
+  }
+
   const [answers] = await db.execute(
     `SELECT question_key, category, question_text, selected_answer, risk_points, note
      FROM care_reality_answers WHERE care_plan_id = ? AND user_id = ?`,

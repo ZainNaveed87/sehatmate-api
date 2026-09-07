@@ -3,6 +3,7 @@ import {
   applyVerifiedExactTimesToScheduleItems,
   extractVerifiedExactClockTimes,
   isVerifiedExactScheduleItemLocked,
+  scheduleTimeMatchesVerifiedExactSource,
 } from './schedule_time_guard.js';
 
 const betaInstruction = {
@@ -56,6 +57,23 @@ assert.deepEqual(appointment, [
   { time: '10:00:00', displayTime: '10:00 AM' },
 ]);
 
+assert.equal(
+  scheduleTimeMatchesVerifiedExactSource({
+    schedule_time: '14:00',
+    instruction: betaInstruction.instruction,
+    timing: betaInstruction.timing,
+  }),
+  true,
+);
+
+assert.equal(
+  scheduleTimeMatchesVerifiedExactSource({
+    schedule_time: '09:00',
+    instruction: betaInstruction.instruction,
+    timing: betaInstruction.timing,
+  }),
+  false,
+);
 
 assert.equal(isVerifiedExactScheduleItemLocked({
   grounding: 'explicit',
@@ -67,6 +85,13 @@ assert.equal(isVerifiedExactScheduleItemLocked({
 assert.equal(isVerifiedExactScheduleItemLocked({
   grounding: 'suggested',
   schedule_time: '14:00',
+  instruction: betaInstruction.instruction,
+  timing: betaInstruction.timing,
+}), false);
+
+assert.equal(isVerifiedExactScheduleItemLocked({
+  grounding: 'explicit',
+  schedule_time: '09:00',
   instruction: betaInstruction.instruction,
   timing: betaInstruction.timing,
 }), false);
