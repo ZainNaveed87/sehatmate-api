@@ -193,13 +193,24 @@ function familyInvitationEmailPayload({
   };
 }
 
-function invitationJson(row) {
+function invitationJson(row, actorUserId = null) {
+  const actorId = actorUserId == null ? '' : String(actorUserId);
+  const caregiverId = String(row.caregiver_user_id ?? '');
+  const recipientId = String(row.care_recipient_user_id ?? '');
+  const direction = actorId && actorId === caregiverId
+    ? 'incoming'
+    : actorId && actorId === recipientId
+      ? 'outgoing'
+      : 'unknown';
+  const canRespond = direction === 'incoming' && row.status === 'pending';
   return {
     id: String(row.id),
     careRecipientUserId: String(row.care_recipient_user_id),
     caregiverUserId: String(row.caregiver_user_id),
     relationshipLabel: row.relationship_label,
     status: row.status,
+    direction,
+    canRespond,
     createdAt: row.created_at,
     acceptedAt: row.accepted_at,
     declinedAt: row.declined_at,
@@ -669,6 +680,8 @@ export async function createFamilyInvitation({
         caregiverUserId: String(caregiver.id),
         relationshipLabel: label,
         status: 'pending',
+        direction: 'outgoing',
+        canRespond: false,
         requestedScopes,
         caregiver: {
           id: String(caregiver.id),
@@ -742,7 +755,7 @@ export async function listFamilyHome({ pool, actorUserId }) {
     ok: true,
     data: {
       relationships,
-      pendingInvitations: invitationRows.map(invitationJson),
+      pendingInvitations: invitationRows.map((row) => invitationJson(row, actorUserId)),
       permissionScopes: FAMILY_PERMISSION_SCOPES,
     },
   };
