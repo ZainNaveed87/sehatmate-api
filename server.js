@@ -106,6 +106,10 @@ import {
 } from './services/schedule_confirm_service.js';
 
 import {
+  saveScheduleItemDuration,
+} from './services/schedule_duration_service.js';
+
+import {
   validatePlanDurationInput,
 } from './services/plan_duration_service.js';
 
@@ -207,6 +211,12 @@ const serviceErrorStatusByCode = {
   CARE_PLAN_TITLE_EXISTS: 409,
   SCHEDULE_NOT_GENERATED: 409,
   EXACT_TIME_LOCKED: 409,
+  INVALID_MEDICINE_DURATION_MODE: 422,
+  INVALID_MEDICINE_DURATION: 422,
+  INVALID_MEDICINE_DURATION_DATE: 422,
+  MEDICINE_DURATION_NOT_APPLICABLE: 422,
+  VERIFIED_MEDICINE_DURATION_LOCKED: 409,
+  PLAN_END_REQUIRED: 409,
   MEDICAL_TIMING_CONFLICT: 409,
   DUPLICATE_REMINDER_TIME: 409,
   DUPLICATE_REMINDER_PERIOD: 409,
@@ -3236,6 +3246,7 @@ app.post(
                   instruction.safetyNote,
                   duplicateOfInstructionId,
                   duplicateReason,
+                  
                 ],
               );
 
@@ -3887,32 +3898,36 @@ app.post('/api/care-plans/:id/generate-schedule', authenticate, aiLimiter, async
         'DELETE FROM care_schedule_items WHERE care_plan_id = ? AND user_id = ?',
         [planId, req.auth.userId],
       );
-      for (const item of schedule) {
-        await connection.execute(
-          `INSERT INTO care_schedule_items (
-            care_plan_id, user_id, instruction_id, title, task_kind,
-            schedule_date, schedule_time, display_time, recurrence_text,
-            grounding, requires_confirmation, confirmation_status, reason,
-            instruction_duration_days
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            planId,
-            req.auth.userId,
-            item.instructionId,
-            item.title,
-            item.taskKind,
-            item.date,
-            item.time,
-            item.displayTime,
-            item.recurrence,
-            item.grounding,
-            item.requiresConfirmation ? 1 : 0,
-            item.requiresConfirmation ? 'needs_confirmation' : 'ready',
-            item.reason,
-            durationDaysByInstruction.get(String(item.instructionId)) || null,
-          ],
-        );
-      }
+     for (const item of schedule) {
+  const durationDays =
+    durationDaysByInstruction.get(String(item.instructionId)) || null;
+
+  await connection.execute(
+    `INSERT INTO care_schedule_items (
+      care_plan_id, user_id, instruction_id, title, task_kind,
+      schedule_date, schedule_time, display_time, recurrence_text,
+      grounding, requires_confirmation, confirmation_status, reason,
+      instruction_duration_days, instruction_duration_source
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      planId,
+      req.auth.userId,
+      item.instructionId,
+      item.title,
+      item.taskKind,
+      item.date,
+      item.time,
+      item.displayTime,
+      item.recurrence,
+      item.grounding,
+      item.requiresConfirmation ? 1 : 0,
+      item.requiresConfirmation ? 'needs_confirmation' : 'ready',
+      item.reason,
+      durationDays,
+      durationDays ? 'verified' : null,
+    ],
+  );
+}
       if ((plans[0].duration_mode || 'prescription') === 'prescription') {
         await connection.execute(
           `UPDATE care_plans SET suggested_end_date = ?, planned_end_date = ?
@@ -3998,6 +4013,36 @@ app.patch('/api/schedule-items/:id/confirm', authenticate, async (req, res, next
     next(error);
   }
 });
+
+app.patch(
+  '/api/schedule-items/:id/duration',
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const result = await saveScheduleItemDuration({
+        pool,
+        userId: req.auth.userId,
+        itemId: req.params.id,
+        mode: req.body?.mode,
+        durationDays: req.body?.durationDays,
+        today: req.body?.today,
+      });
+
+      if (!result.ok) {
+        sendServiceError(res, result);
+        return;
+      }
+
+      res.json({
+        success: true,
+        message: result.message,
+        data: result.data,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 
 function customRealityRiskPoints(note, template) {
@@ -5372,40 +5417,81 @@ async function ensureMedicalSafetySchema() {
   );
 
   const [scheduleColumns] = await pool.execute(
-    `SELECT COLUMN_NAME
-     FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = DATABASE()
-       AND TABLE_NAME = 'care_schedule_items'
-       AND COLUMN_NAME = 'instruction_duration_days'
-     LIMIT 1`,
-  );
-  if (!scheduleColumns.length) {
-    await pool.execute(
-      `ALTER TABLE care_schedule_items
-       ADD COLUMN instruction_duration_days INT UNSIGNED NULL AFTER reason`,
-    );
-  }
+  `SELECT COLUMN_NAME
+   FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME = 'care_schedule_items'
+     AND COLUMN_NAME = 'instruction_duration_days'
+   LIMIT 1`,
+);
 
-  const [existingMedicineSchedules] = await pool.execute(
-    `SELECT s.id, i.instruction, i.timing
-     FROM care_schedule_items s
-     JOIN extracted_instructions i ON i.id = s.instruction_id
-     WHERE s.instruction_duration_days IS NULL
-       AND i.category = 'medicine'`,
+if (!scheduleColumns.length) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN instruction_duration_days INT UNSIGNED NULL AFTER reason`,
   );
+}
+
+
+// NEW — duration source column
+const [durationSourceColumns] = await pool.execute(
+  `SELECT COLUMN_NAME
+   FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME = 'care_schedule_items'
+     AND COLUMN_NAME = 'instruction_duration_source'
+   LIMIT 1`,
+);
+
+if (!durationSourceColumns.length) {
+  await pool.execute(
+    `ALTER TABLE care_schedule_items
+     ADD COLUMN instruction_duration_source VARCHAR(20) NULL
+     AFTER instruction_duration_days`,
+  );
+}
+
+
+// Existing/backfill medicine duration code comes AFTER this
+const [existingMedicineSchedules] = await pool.execute(
+    `SELECT
+      s.id,
+      s.instruction_duration_days,
+      s.instruction_duration_source,
+      i.instruction,
+      i.timing,
+      i.original_instruction,
+      i.original_timing
+     FROM care_schedule_items s
+     JOIN extracted_instructions i
+       ON i.id = s.instruction_id
+     WHERE i.category = 'medicine'
+       AND (
+         s.instruction_duration_source IS NULL
+         OR TRIM(s.instruction_duration_source) = ''
+       )`,
+  );
+
+
   for (const row of existingMedicineSchedules) {
-    const days = instructionDurationDays(
-      `${row.instruction || ''} ${row.timing || ''}`,
-    );
-    if (days) {
-      await pool.execute(
-        `UPDATE care_schedule_items
-         SET instruction_duration_days = ?
-         WHERE id = ?`,
-        [days, row.id],
-      );
-    }
-  }
+  const days = instructionDurationDays(
+    `${row.instruction || row.original_instruction || ''} ` +
+    `${row.timing || row.original_timing || ''}`,
+  );
+
+  if (!days) continue;
+
+  await pool.execute(
+    `UPDATE care_schedule_items
+     SET instruction_duration_days = COALESCE(
+           instruction_duration_days,
+           ?
+         ),
+         instruction_duration_source = 'verified'
+     WHERE id = ?`,
+    [days, row.id],
+  );
+}
 }
 
 async function cleanupDuplicatePendingDoctorQuestions() {

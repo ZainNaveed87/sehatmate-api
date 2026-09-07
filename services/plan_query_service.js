@@ -191,19 +191,53 @@ export async function readCarePlanDetail({ pool, userId, planId }) {
         NULLIF(recurrence_text, ''),
         NULLIF(display_time, ''),
         NULLIF(reason, ''),
-        CASE
-          WHEN instruction_duration_days IS NOT NULL
-          THEN CONCAT('Fixed medicine course: ', instruction_duration_days, ' day', IF(instruction_duration_days = 1, '', 's'), '; stops automatically')
-          ELSE NULL
-        END
+       CASE
+  WHEN instruction_duration_source = 'verified'
+       AND instruction_duration_days IS NOT NULL
+  THEN CONCAT(
+    'Verified medicine duration: ',
+    instruction_duration_days,
+    ' day',
+    IF(instruction_duration_days = 1, '', 's')
+  )
+
+  WHEN instruction_duration_source = 'user'
+       AND instruction_duration_days IS NOT NULL
+  THEN CONCAT(
+    'User-provided medicine duration: ',
+    instruction_duration_days,
+    ' day',
+    IF(instruction_duration_days = 1, '', 's')
+  )
+
+  WHEN instruction_duration_source = 'user_plan_end'
+  THEN 'User-provided medicine duration: until care-plan end date'
+
+  WHEN instruction_duration_days IS NOT NULL
+  THEN CONCAT(
+    'Medicine duration: ',
+    instruction_duration_days,
+    ' day',
+    IF(instruction_duration_days = 1, '', 's')
+  )
+
+  ELSE NULL
+END
       ) AS note,
       task_kind, display_time, recurrence_text, grounding,
       CASE
         WHEN grounding = 'explicit' AND schedule_time IS NOT NULL THEN 1
         ELSE 0
       END AS time_locked,
-      instruction_duration_days,
-      CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
+     instruction_duration_days,
+COALESCE(
+  NULLIF(instruction_duration_source, ''),
+  CASE
+    WHEN instruction_duration_days IS NOT NULL THEN 'verified'
+    ELSE NULL
+  END
+) AS instruction_duration_source,
+CASE WHEN requires_confirmation = 1 THEN 'at_risk' ELSE 'ready' END AS status,
       NULL AS completed_at
      FROM care_schedule_items
      WHERE care_plan_id = ? AND user_id = ?
