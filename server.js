@@ -9,6 +9,8 @@ import { OAuth2Client } from 'google-auth-library';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import mysql from 'mysql2/promise';
+import {installVoiceBackend,voiceHttpError} from './agent/agent_voice_routes.js';
+import {mountAgentSessionRoutes} from './agent/agent_session_routes.js';
 
 import {
   AiServiceError,
@@ -311,7 +313,7 @@ const allowedOrigins = (process.env.CLIENT_ORIGINS || '')
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-const pool = mysql.createPool({
+const databaseOptions = {
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 3306),
   database: process.env.DB_NAME,
@@ -322,7 +324,11 @@ const pool = mysql.createPool({
   queueLimit: 0,
   charset: 'utf8mb4',
   enableKeepAlive: true,
-});
+};
+const pool = mysql.createPool(databaseOptions);
+// Advisory locks use separate connections so they cannot starve Agent database queries.
+const voiceLockPool = mysql.createPool({...databaseOptions,connectionLimit:2,waitForConnections:false});
+const voiceLifecycleLockPool = mysql.createPool({...databaseOptions,connectionLimit:2,waitForConnections:false});
 
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -1718,6 +1724,9 @@ app.post(
   },
 );
 
+const voiceBackend = installVoiceBackend({app,pool,lockPool:voiceLockPool,sessionLockPool:voiceLifecycleLockPool,authenticate});
+mountAgentSessionRoutes({app,pool,authenticate,limiter:agentLimiter});
+
 app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next) => {
   try {
     const rawToday = req.body?.today;
@@ -1734,7 +1743,8 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
       return;
     }
 
-    const result = await handleAgentMessage({
+    const result = await voiceBackend.turns.manual({userId:req.auth.userId,sessionId:req.body?.sessionId,
+      run:()=>handleAgentMessage({
       pool,
       userId: req.auth.userId,
       sessionId: req.body?.sessionId ?? null,
@@ -1743,7 +1753,7 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
       confirmation: req.body?.confirmation ?? null,
       clarification: req.body?.clarification ?? null,
       clientToday,
-    });
+    })});
 
     if (!result.ok) {
       res.status(agentErrorStatusByCode[result.code] || 422).json({
@@ -1790,6 +1800,7 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
       },
     });
   } catch (error) {
+    if(error.code?.startsWith('VOICE_')) {voiceHttpError(error,res);return;}
     next(error);
   }
 });

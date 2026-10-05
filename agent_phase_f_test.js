@@ -502,7 +502,7 @@ await test('TTS failure does not modify action/session safety state', async () =
   });
   const pool = createFakePool({ initialState: pendingTaskState() });
   const before = JSON.stringify(pool.state);
-  const result = await provider.synthesizeApprovedReply({ reply: 'Safe reply.' });
+  const result = await provider.synthesizeApprovedReply({ reply: 'Welcome to SehatMate.' });
   assert.equal(result.ok, false);
   assert.equal(JSON.stringify(pool.state), before);
   assert.equal(pool.taskMutationCount, 0);

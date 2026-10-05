@@ -10,6 +10,7 @@
 import { AiServiceError } from '../ai_service.js';
 import { cleanText } from '../services/shared_utils.js';
 import { AGENT_PLANNER_LIMITS } from './agent_planner.js';
+import {legacyFishSpeechAllowed,isFishSpeechModel} from './agent_voice_config.js';
 
 export const VOICE_PROVIDER_LIMITS = Object.freeze({
   maxAudioBytes: 1_500_000,
@@ -61,6 +62,7 @@ export function agentVoiceConfig(env = process.env) {
     audioModel: env.SEHATMATE_AUDIO_MODEL?.trim() || '',
     ttsModel: env.SEHATMATE_TTS_MODEL?.trim() || '',
     ttsVoice: env.SEHATMATE_TTS_VOICE?.trim() || '',
+    fishDisabled: parseBoolean(env.FISH_DISABLED,false),
     appUrl: env.APP_URL?.trim() || 'https://sehatmate-api.secretstechies.com',
   });
 }
@@ -411,12 +413,15 @@ export function createAgentVoiceProvider(overrides = {}) {
       const config = configProvider();
       const configError = validateVoiceConfigForSpeech(config);
       if (configError) return configError;
-      const input = cleanText(reply, VOICE_PROVIDER_LIMITS.maxSpeechChars + 1);
-      if (!input) {
+      const input = typeof reply === 'string' ? reply : '';
+      if (!input.trim()) {
         return voiceFailure('VOICE_TTS_EMPTY_REPLY', 'Voice output requires a reply.', 422);
       }
       if (input.length > VOICE_PROVIDER_LIMITS.maxSpeechChars) {
         return voiceFailure('VOICE_TTS_REPLY_TOO_LONG', 'The reply is too long for voice output.', 422);
+      }
+      if(!legacyFishSpeechAllowed(config.ttsModel,input) || config.fishDisabled && isFishSpeechModel(config.ttsModel)) {
+        return voiceFailure('VOICE_PRIVACY_DEVICE_REQUIRED','Use device speech for this reply.',422);
       }
 
       try {

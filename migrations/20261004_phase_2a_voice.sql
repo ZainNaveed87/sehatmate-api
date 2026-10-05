@@ -1,0 +1,50 @@
+-- Manual migration only. Do not run against production without separate authorization.
+-- Requires existing users and agent_sessions (Phase A2). No startup schema changes.
+CREATE TABLE IF NOT EXISTS agent_voice_sessions (
+  id VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  agent_session_id BIGINT UNSIGNED NULL,
+  room_name VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  participant_identity VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  dispatch_id VARCHAR(80) NULL,
+  job_id VARCHAR(80) NULL,
+  worker_identity VARCHAR(80) NULL,
+  transport_owner VARCHAR(16) NOT NULL,
+  transport_epoch INT UNSIGNED NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  active_turn_id VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  usage_day DATE NOT NULL,
+  charged_seconds INT UNSIGNED NOT NULL,
+  created_at DATETIME(3) NOT NULL,
+  last_active_at DATETIME(3) NOT NULL,
+  expires_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY voice_room_unique (room_name),
+  KEY voice_owner_usage_idx (user_id, usage_day),
+  KEY voice_agent_idx (agent_session_id, status),
+  KEY voice_expiry_idx (status, expires_at),
+  CONSTRAINT voice_user_fk FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT voice_agent_fk FOREIGN KEY (agent_session_id) REFERENCES agent_sessions(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS agent_turn_receipts (
+  voice_session_id VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  agent_session_id BIGINT UNSIGNED NULL,
+  turn_id VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  transport_epoch INT UNSIGNED NOT NULL,
+  request_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  confirmation_id VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  confirmation_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL,
+  status VARCHAR(24) NOT NULL,
+  encrypted_result MEDIUMTEXT NULL,
+  started_at DATETIME(3) NOT NULL,
+  finished_at DATETIME(3) NULL,
+  result_expires_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (voice_session_id, turn_id),
+  UNIQUE KEY voice_confirmation_unique (agent_session_id, confirmation_id),
+  KEY voice_receipt_expiry_idx (result_expires_at),
+  CONSTRAINT voice_receipt_session_fk FOREIGN KEY (voice_session_id) REFERENCES agent_voice_sessions(id) ON DELETE CASCADE,
+  CONSTRAINT voice_receipt_user_fk FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT voice_receipt_agent_fk FOREIGN KEY (agent_session_id) REFERENCES agent_sessions(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
