@@ -152,9 +152,15 @@ export function createLiveKitVoiceProvider({
       const bound = d.state?.jobs.some(j => {
         if (j.id !== b.jobId) return false;
 
+        const jobRoomName = typeof j.room?.name === 'string' && j.room.name.length > 0
+          ? j.room.name
+          : undefined;
+
         let reason;
         if (j.dispatchId !== s.dispatchId) reason = 'JOB_DISPATCH';
-        else if (j.room?.name !== s.roomName) reason = 'JOB_ROOM';
+        // Dispatch room and job dispatch ID above remain authoritative when
+        // LiveKit omits the optional Job room name.
+        else if (jobRoomName !== undefined && jobRoomName !== s.roomName) reason = 'JOB_ROOM_MISMATCH';
         else if (j.state?.participantIdentity !== b.workerIdentity) reason = 'PARTICIPANT_IDENTITY';
         else if (!j.state?.workerId) reason = 'WORKER_ID';
         else if (Number(j.state?.endedAt)) reason = 'JOB_ENDED';

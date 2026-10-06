@@ -16,7 +16,7 @@ test('binding diagnostics report only the first failed check without provider va
     ['JOB_MISSING',({d})=>{d.state.jobs=[];}],
     ['JOB_MISSING',({d})=>{d.state=undefined;}],
     ['JOB_DISPATCH',({job})=>{job.dispatchId='private-other-dispatch';job.room=null;job.state=null;}],
-    ['JOB_ROOM',({job})=>{job.room=null;job.state=null;}],
+    ['JOB_ROOM_MISMATCH',({job})=>{job.room={name:'private-other-room'};job.state=null;}],
     ['PARTICIPANT_IDENTITY',({job})=>{job.state.participantIdentity='private-other-identity';job.state.workerId='';job.state.endedAt=1n;}],
     ['PARTICIPANT_IDENTITY',({job})=>{job.state=undefined;}],
     ['WORKER_ID',({job})=>{job.state.workerId='';job.state.endedAt=1n;}],
@@ -56,6 +56,41 @@ test('binding diagnostics preserve successful any-matching-job behavior and prov
   assert.deepEqual(logs,[['VOICE_LIVEKIT_BINDING_FAILED:JOB_DISPATCH']]);
   logs.length=0;error=new Error('private-provider-body private-token');
   await assert.rejects(provider.binding(row,b),e=>e===error);assert.deepEqual(logs,[]);
+});
+
+test('optional job room compatibility retains all remaining binding checks',async t=>{
+  const cases=[
+    ['matching', {name:'private-room'}],
+    ['absent', undefined],
+    ['null', null],
+    ['name absent', {}],
+    ['empty', {name:''}],
+    ['non-string name', {name:123}],
+    ['mismatching', {name:'private-other-room'}, 'JOB_ROOM_MISMATCH'],
+    ['whitespace is present', {name:' '}, 'JOB_ROOM_MISMATCH'],
+  ];
+  for(const room of [undefined,{name:''}]) {
+    for(const reason of ['PARTICIPANT_IDENTITY','WORKER_ID','JOB_ENDED']) {
+      cases.push([`optional room still enforces ${reason}`,room,reason]);
+    }
+  }
+  for(const [label,room,reason] of cases) {
+    await t.test(label,async t=>{
+      const row={dispatchId:'private-dispatch',roomName:'private-room'};
+      const b={jobId:'private-job',workerIdentity:'private-identity'};
+      const job={id:b.jobId,dispatchId:row.dispatchId,room,
+        state:{participantIdentity:b.workerIdentity,workerId:'private-worker',endedAt:0n}};
+      if(reason==='PARTICIPANT_IDENTITY') job.state.participantIdentity='private-other-identity';
+      if(reason==='WORKER_ID') job.state.workerId='';
+      if(reason==='JOB_ENDED') job.state.endedAt=1n;
+      const d={id:row.dispatchId,room:row.roomName,agentName:'sehatmate-voice',state:{jobs:[job]}};
+      const logs=[];t.mock.method(console,'warn',(...args)=>logs.push(args));
+      const provider=createLiveKitVoiceProvider({config:{agentName:'sehatmate-voice'},secrets:{},rooms:{},
+        dispatch:{getDispatch:async()=>d}});
+      assert.equal(await provider.binding(row,b),!reason);
+      assert.deepEqual(logs,reason?[[`VOICE_LIVEKIT_BINDING_FAILED:${reason}`]]:[]);
+    });
+  }
 });
 
 test('official SDK signs only microphone, room-scoped, short-lived participant grants',async()=>{
