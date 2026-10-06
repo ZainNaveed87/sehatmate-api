@@ -1026,12 +1026,16 @@ export function createVoiceSessionService({
 
     await active(initial);
 
-    if (
-      initial.transportOwner !==
-        'worker' ||
-      input.roomName !==
-        initial.roomName
-    ) {
+    if (initial.transportOwner !== 'worker') {
+      console.warn('VOICE_BINDING_FAILED:TRANSPORT_OWNER');
+      throw voiceError(
+        'VOICE_WORKER_BINDING',
+        403,
+      );
+    }
+
+    if (input.roomName !== initial.roomName) {
+      console.warn('VOICE_BINDING_FAILED:ROOM_NAME');
       throw voiceError(
         'VOICE_WORKER_BINDING',
         403,
@@ -1047,6 +1051,7 @@ export function createVoiceSessionService({
           input,
         );
     } catch {
+      console.warn('VOICE_BINDING_FAILED:PROVIDER_BINDING');
       throw voiceError(
         'VOICE_PROVIDER_UNAVAILABLE',
         503,
@@ -1054,6 +1059,7 @@ export function createVoiceSessionService({
     }
 
     if (!binding) {
+      console.warn('VOICE_BINDING_FAILED:PROVIDER_BINDING');
       throw voiceError(
         'VOICE_WORKER_BINDING',
         403,
@@ -1093,6 +1099,7 @@ export function createVoiceSessionService({
                 input.workerIdentity
             )
           ) {
+            console.warn('VOICE_BINDING_FAILED:EXISTING_DB_BINDING');
             throw voiceError(
               'VOICE_WORKER_BINDING',
               403,

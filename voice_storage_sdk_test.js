@@ -5,6 +5,59 @@ import {readFileSync} from 'node:fs';
 import {createVoiceStore} from './services/voice_store.js';
 import {createLiveKitVoiceProvider} from './services/livekit_voice_provider.js';
 
+test('binding diagnostics report only the first failed check without provider values',async t=>{
+  const cases=[
+    ['DISPATCH_MISSING',({row})=>{row.dispatchId=null;}],
+    ['DISPATCH_MISSING',f=>{f.result=null;}],
+    ['DISPATCH_ID',({d})=>{d.id='private-other-dispatch';}],
+    ['DISPATCH_ROOM',({d})=>{d.room='private-other-room';}],
+    ['AGENT_NAME',({d})=>{d.agentName='private-other-agent';}],
+    ['JOB_MISSING',({job})=>{job.id='private-other-job';job.dispatchId=null;job.state=null;}],
+    ['JOB_MISSING',({d})=>{d.state.jobs=[];}],
+    ['JOB_MISSING',({d})=>{d.state=undefined;}],
+    ['JOB_DISPATCH',({job})=>{job.dispatchId='private-other-dispatch';job.room=null;job.state=null;}],
+    ['JOB_ROOM',({job})=>{job.room=null;job.state=null;}],
+    ['PARTICIPANT_IDENTITY',({job})=>{job.state.participantIdentity='private-other-identity';job.state.workerId='';job.state.endedAt=1n;}],
+    ['PARTICIPANT_IDENTITY',({job})=>{job.state=undefined;}],
+    ['WORKER_ID',({job})=>{job.state.workerId='';job.state.endedAt=1n;}],
+    ['JOB_ENDED',({job})=>{job.state.endedAt=1n;}],
+  ];
+  for(const [reason,mutate] of cases) {
+    await t.test(reason,async t=>{
+      const row={dispatchId:'private-dispatch',roomName:'private-room'};
+      const b={jobId:'private-job',workerIdentity:'private-identity'};
+      const job={id:b.jobId,dispatchId:row.dispatchId,room:{name:row.roomName},
+        state:{participantIdentity:b.workerIdentity,workerId:'private-worker',endedAt:0n}};
+      const d={id:row.dispatchId,room:row.roomName,agentName:'sehatmate-voice',state:{jobs:[job]}};
+      const f={row,b,job,d,result:d};mutate(f);
+      const logs=[];t.mock.method(console,'warn',(...args)=>logs.push(args));
+      const provider=createLiveKitVoiceProvider({config:{agentName:'sehatmate-voice'},secrets:{},rooms:{},
+        dispatch:{getDispatch:async()=>f.result}});
+      assert.equal(await provider.binding(row,b),false);
+      assert.deepEqual(logs,[[`VOICE_LIVEKIT_BINDING_FAILED:${reason}`]]);
+    });
+  }
+});
+
+test('binding diagnostics preserve successful any-matching-job behavior and provider exceptions',async t=>{
+  const logs=[];t.mock.method(console,'warn',(...args)=>logs.push(args));
+  const row={dispatchId:'private-dispatch',roomName:'private-room'};
+  const b={jobId:'private-job',workerIdentity:'private-identity'};
+  const valid={id:b.jobId,dispatchId:row.dispatchId,room:{name:row.roomName},
+    state:{participantIdentity:b.workerIdentity,workerId:'private-worker',endedAt:0n}};
+  const jobs=[{...valid,dispatchId:'private-other-dispatch'},valid];
+  const d={id:row.dispatchId,room:row.roomName,agentName:'sehatmate-voice',state:{jobs}};
+  let error;
+  const provider=createLiveKitVoiceProvider({config:{agentName:'sehatmate-voice'},secrets:{},rooms:{},
+    dispatch:{getDispatch:async()=>{if(error) throw error;return d;}}});
+  assert.equal(await provider.binding(row,b),true);assert.deepEqual(logs,[]);
+  jobs.pop();
+  assert.equal(await provider.binding(row,b),false);
+  assert.deepEqual(logs,[['VOICE_LIVEKIT_BINDING_FAILED:JOB_DISPATCH']]);
+  logs.length=0;error=new Error('private-provider-body private-token');
+  await assert.rejects(provider.binding(row,b),e=>e===error);assert.deepEqual(logs,[]);
+});
+
 test('official SDK signs only microphone, room-scoped, short-lived participant grants',async()=>{
   const provider=createLiveKitVoiceProvider({config:{livekitUrl:'wss://example.livekit.cloud'},
     secrets:{livekitKey:'mock-key',livekitSecret:'s'.repeat(40)},rooms:{},dispatch:{}});

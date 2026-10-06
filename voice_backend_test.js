@@ -39,6 +39,53 @@ function setup(overrides={}) {
 }
 const create = s=>s.sessions.create({userId:'1',input:{agentSessionId:'9'}});
 const expectCode = (promise,code)=>assert.rejects(promise,e=>e.code===code);
+
+test('claim binding diagnostics preserve security checks and never include binding values',async t=>{
+  const cases=[
+    ['TRANSPORT_OWNER',({row,input})=>{row.transportOwner='device';input.roomName='private-wrong-room';}],
+    ['ROOM_NAME',({input})=>{input.roomName='private-wrong-room';}],
+    ['PROVIDER_BINDING',f=>{f.binding=false;}],
+    ['EXISTING_DB_BINDING',({row})=>{row.jobId='private-existing-job';row.workerIdentity='private-existing-worker';}],
+    ['EXISTING_DB_BINDING',({row,input})=>{row.jobId=input.jobId;row.workerIdentity='private-existing-worker';}],
+  ];
+  for(const [reason,mutate] of cases) {
+    await t.test(reason,async t=>{
+      let calls=0;const f={binding:true};
+      const s=setup({provider:{binding:async()=>{calls++;return f.binding;}}});
+      const a=await create(s);
+      f.row=await s.store.getSession(a.id);
+      f.input={roomName:a.roomName,jobId:'AJ_mock',workerIdentity:'worker-mock'};
+      mutate(f);await s.store.saveSession(f.row);
+      const before=await s.store.getSession(a.id);
+      const logs=[];t.mock.method(console,'warn',(...args)=>logs.push(args));
+      await expectCode(s.sessions.claim({id:a.id,serviceIdentity:'sehatmate-worker',input:f.input}),'VOICE_WORKER_BINDING');
+      assert.deepEqual(logs,[[`VOICE_BINDING_FAILED:${reason}`]]);
+      assert.deepEqual(await s.store.getSession(a.id),before);
+      assert.equal(calls,['TRANSPORT_OWNER','ROOM_NAME'].includes(reason)?0:1);
+    });
+  }
+});
+
+test('claim provider exception logs only a fixed binding marker and preserves unavailable error',async t=>{
+  const s=setup({provider:{binding:async()=>{throw new Error('private-provider-body private-token');}}});
+  const a=await create(s);
+  const logs=[];t.mock.method(console,'warn',(...args)=>logs.push(args));
+  await expectCode(s.sessions.claim({id:a.id,serviceIdentity:'sehatmate-worker',
+    input:{roomName:a.roomName,jobId:'AJ_mock',workerIdentity:'worker-mock'}}),'VOICE_PROVIDER_UNAVAILABLE');
+  assert.deepEqual(logs,[['VOICE_BINDING_FAILED:PROVIDER_BINDING']]);
+});
+
+test('successful repeated claims keep their database binding and emit no failure diagnostics',async t=>{
+  const s=setup();const a=await create(s);
+  const logs=[];t.mock.method(console,'warn',(...args)=>logs.push(args));
+  const args={id:a.id,serviceIdentity:'sehatmate-worker',
+    input:{roomName:a.roomName,jobId:'AJ_mock',workerIdentity:'worker-mock'}};
+  const first=await s.sessions.claim(args);const second=await s.sessions.claim(args);
+  assert.equal(first.epoch,second.epoch);
+  const row=await s.store.getSession(a.id);
+  assert.equal(row.jobId,args.input.jobId);assert.equal(row.workerIdentity,args.input.workerIdentity);
+  assert.deepEqual(logs,[]);
+});
 test('creates opaque owned session, reuses eligible session without resetting expiry',async()=>{
   const s=setup();const first=await create(s);const next=await create(s);
   assert.equal(first.id,next.id);assert.equal(first.expiresAt,next.expiresAt);

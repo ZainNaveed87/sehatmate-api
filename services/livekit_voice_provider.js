@@ -129,8 +129,13 @@ export function createLiveKitVoiceProvider({
     },
 
     async binding(s, b) {
-      if (!s.dispatchId) {
+      const fail = reason => {
+        console.warn(`VOICE_LIVEKIT_BINDING_FAILED:${reason}`);
         return false;
+      };
+
+      if (!s.dispatchId) {
+        return fail('DISPATCH_MISSING');
       }
 
       const d = await dispatch.getDispatch(
@@ -138,22 +143,29 @@ export function createLiveKitVoiceProvider({
         s.roomName,
       );
 
-      return Boolean(
-        d &&
-          d.id === s.dispatchId &&
-          d.room === s.roomName &&
-          d.agentName === config.agentName &&
-          d.state?.jobs.some(
-            j =>
-              j.id === b.jobId &&
-              j.dispatchId === s.dispatchId &&
-              j.room?.name === s.roomName &&
-              j.state?.participantIdentity ===
-                b.workerIdentity &&
-              j.state?.workerId &&
-              !Number(j.state?.endedAt),
-          ),
-      );
+      if (!d) return fail('DISPATCH_MISSING');
+      if (d.id !== s.dispatchId) return fail('DISPATCH_ID');
+      if (d.room !== s.roomName) return fail('DISPATCH_ROOM');
+      if (d.agentName !== config.agentName) return fail('AGENT_NAME');
+
+      let firstFailure = 'JOB_MISSING';
+      const bound = d.state?.jobs.some(j => {
+        if (j.id !== b.jobId) return false;
+
+        let reason;
+        if (j.dispatchId !== s.dispatchId) reason = 'JOB_DISPATCH';
+        else if (j.room?.name !== s.roomName) reason = 'JOB_ROOM';
+        else if (j.state?.participantIdentity !== b.workerIdentity) reason = 'PARTICIPANT_IDENTITY';
+        else if (!j.state?.workerId) reason = 'WORKER_ID';
+        else if (Number(j.state?.endedAt)) reason = 'JOB_ENDED';
+        else return true;
+
+        // Preserve any-matching-job acceptance; emit only on overall failure.
+        if (firstFailure === 'JOB_MISSING') firstFailure = reason;
+        return false;
+      });
+
+      return bound ? true : fail(firstFailure);
     },
 
     async revoke(s) {
