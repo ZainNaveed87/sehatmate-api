@@ -99,7 +99,7 @@ defineAgentCapability({
   name: 'get_today_tasks',
   permissionClass: 'READ',
   description:
-    "Read the authenticated user's task occurrences for one day (default: the trusted runtime local date when available), including task titles, scheduled times, statuses, plan titles, and the day summary counts.",
+    "Read the authenticated user's task occurrences for one day (default: the trusted runtime local date when available), including task titles, scheduled times, statuses, plan titles, and day summary counts. Use only for an actual personal task/schedule query, never general conversation or app-help merely mentioning today.",
   inputSchema: {
     properties: {
       date: {
@@ -124,7 +124,7 @@ defineAgentCapability({
   name: 'get_next_task',
   permissionClass: 'READ',
   description:
-    "Read the authenticated user's next pending task for today: the earliest still-pending occurrence in today's schedule order, with the pending count for the day.",
+    "Read the authenticated user's next pending task for today: the earliest still-pending occurrence in today's schedule order, with the pending count. Requires a request for the user's next/pending task, not general help, app capabilities, or an unclear conversational question.",
   inputSchema: {
     properties: {},
     required: [],

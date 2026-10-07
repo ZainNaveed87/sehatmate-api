@@ -1,4 +1,7 @@
-// Internal voice policy. No room/client language or medical facts enter this path.
+import {AsyncLocalStorage} from 'node:async_hooks';
+
+// Shared trivial-conversation optimization; semantic routing handles all other wording.
+// No room/client language or medical facts enter this path. Voice affects formatting only.
 const PHRASES = Object.freeze({
   greeting: {
     en: 'Hello! How can I help you?',
@@ -33,10 +36,39 @@ export function voiceConversationReply({message,language,state,clientContext}) {
   return reply ? {reply,kind} : null;
 }
 
-export function recordVoiceLatency(stage,started) {
-  if (!['PLANNER','GROUNDED_REPLY','TOTAL'].includes(stage)) return;
-  const ms=Math.max(0,performance.now()-started);
-  const bucket=ms<100?'LT_100MS':ms<500?'100_499MS':ms<1000?'500_999MS':
+const voiceTiming=new AsyncLocalStorage();
+const STAGES=new Set(['PREPARE','FAST_PATH','MODEL','TOOLS','GROUNDING','PERSIST','PLANNER','GROUNDED_REPLY','TOTAL']);
+function latencyBucket(started) {
+  const ms=performance.now()-started;
+  if (!Number.isFinite(ms)||ms<0) return 'UNKNOWN';
+  return ms<100?'LT_100MS':ms<500?'100_499MS':ms<1000?'500_999MS':
     ms<2000?'1_2S':ms<5000?'2_5S':ms<10000?'5_10S':ms<20000?'10_20S':'GE_20S';
-  console.info(`VOICE_AGENT_LATENCY:${stage}:${bucket}`);
+}
+export function recordVoiceLatency(stage,started) {
+  if (STAGES.has(stage)) console.info(`VOICE_AGENT_LATENCY:${stage}:${latencyBucket(started)}`);
+}
+export function recordVoiceTurnLatency(stage,started) {
+  if (['PREPARE','PERSIST','TOTAL'].includes(stage)) {
+    console.info(`VOICE_TURN_LATENCY:${stage}:${latencyBucket(started)}`);
+  }
+}
+export function runVoiceTiming(enabled,operation) {
+  if (!enabled || voiceTiming.getStore()) return operation();
+  return voiceTiming.run(true,async()=>{
+    const started=performance.now();
+    try {return await operation();}
+    finally {recordVoiceLatency('TOTAL',started);}
+  });
+}
+export async function timeVoiceStage(stage,operation) {
+  if (!voiceTiming.getStore()) return operation();
+  const started=performance.now();
+  try {return await operation();}
+  finally {recordVoiceLatency(stage,started);}
+}
+export function timeVoiceSync(stage,operation) {
+  if (!voiceTiming.getStore()) return operation();
+  const started=performance.now();
+  try {return operation();}
+  finally {recordVoiceLatency(stage,started);}
 }

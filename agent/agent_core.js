@@ -120,7 +120,8 @@ import { recordAgentAction } from './agent_action_audit.js';
 import { nextTaskFromTodayState } from '../services/performance_summary_service.js';
 import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
-import {voiceConversationReply,recordVoiceLatency} from './agent_voice_quality.js';
+import {voiceConversationReply,recordVoiceLatency,runVoiceTiming,timeVoiceStage,timeVoiceSync} from './agent_voice_quality.js';
+import {assistantHelpReply,unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic_routes.js';
 import {
   cleanText,
   idPattern,
@@ -249,7 +250,10 @@ function safeNonNegativeCount(value) {
 function deterministicNextTaskReply({
   capabilityResults,
   language,
+  message,
+  category,
 }) {
+  if (!currentTaskFallbackAllowed({message,category})) return null;
   const canonicalLanguage = canonicalAgentLanguage(language);
 
   let nextTask = null;
@@ -831,7 +835,11 @@ function buildReferencedEntities({
  * turn result. A session that expired mid-turn or a store failure never
  * invalidates the already-safe reply.
  */
-async function finishAgentTurn({
+function finishAgentTurn(input) {
+  return timeVoiceStage('PERSIST',()=>persistAgentTurn(input));
+}
+
+async function persistAgentTurn({
   pool,
   userId,
   session,
@@ -1000,12 +1008,12 @@ async function handleAgentConfirmation({
     });
   }
 
-  const claimed = await claimAgentPendingConfirmation({
+  const claimed = await timeVoiceStage('PERSIST',()=>claimAgentPendingConfirmation({
     db: pool,
     userId,
     sessionId: session.id,
     confirmationId: confirmationRequest.confirmationId,
-  });
+  }));
   if (!claimed.ok) {
     const finishSession = claimed.data?.session || session;
     const code = claimed.code || 'AGENT_CONFIRMATION_NOT_FOUND';
@@ -1069,12 +1077,12 @@ async function handleAgentConfirmation({
 
   let result;
   try {
-    result = await executeConfirmedAgentCapability({
+    result = await timeVoiceStage('TOOLS',()=>executeConfirmedAgentCapability({
       name: pendingDraft.toolName,
       pool,
       userId,
       args,
-    });
+    }));
   } catch {
     result = {
       ok: false,
@@ -1127,7 +1135,11 @@ async function handleAgentConfirmation({
  * Never throws. `provider` is injectable so tests mock both planning and
  * reply turns without any real provider credentials.
  */
-export async function handleAgentMessage({
+export async function handleAgentMessage(input) {
+  return runVoiceTiming(input.voiceReply===true,()=>handleAgentMessageInternal(input));
+}
+
+async function handleAgentMessageInternal({
   pool,
   userId,
   sessionId = null,
@@ -1140,7 +1152,7 @@ export async function handleAgentMessage({
   voiceReply = false,
 }) {
   let language = 'en';
-  const voiceStarted=performance.now();
+  const prepareStarted=performance.now();
   try {
     const canonicalClientToday = canonicalAgentClientToday(clientToday);
     if (clientToday != null && !canonicalClientToday) {
@@ -1249,6 +1261,7 @@ export async function handleAgentMessage({
       session = touched.data.session;
     }
 
+    if (voiceReply) recordVoiceLatency('PREPARE',prepareStarted);
     if (isConfirmationTurn) {
       return handleAgentConfirmation({
         pool,
@@ -1268,14 +1281,14 @@ export async function handleAgentMessage({
           message: 'Agent clarification request is invalid.',
         };
       }
-      const claimed = await claimAgentPendingClarification({
+      const claimed = await timeVoiceStage('PERSIST',()=>claimAgentPendingClarification({
         db: pool,
         userId,
         sessionId: session.id,
         clarificationId: clarificationRequest.clarificationId,
         choiceId: clarificationRequest.choiceId,
         messageHash: messageHashForClarification(boundedMessage),
-      });
+      }));
       if (!claimed.ok) {
         return {
           ok: false,
@@ -1359,11 +1372,11 @@ export async function handleAgentMessage({
       });
     }
 
-    const conversation=voiceReply && !isClarificationTurn
-      ? voiceConversationReply({message,language,state:session.state,clientContext})
+    const conversation=!isClarificationTurn
+      ? timeVoiceSync('FAST_PATH',()=>voiceConversationReply({message,language,state:session.state,clientContext}))
       : null;
     if (conversation) {
-      console.info(`VOICE_AGENT_FAST_PATH:${conversation.kind.toUpperCase()}`);
+      if (voiceReply) console.info(`VOICE_AGENT_FAST_PATH:${conversation.kind.toUpperCase()}`);
       // Ownership, active-session checks, language and touch have already run.
       // Preserve conversation state; no facts, actions, confirmations or navigation.
       return {ok:true,sessionId:session.id,language,reply:conversation.reply,
@@ -1371,6 +1384,7 @@ export async function handleAgentMessage({
     }
 
     // --- bounded verified context (fail-safe drops, ownership first) ---
+    const contextStarted=performance.now();
     const context = await readAgentScreenContext({
       pool,
       userId,
@@ -1396,6 +1410,7 @@ export async function handleAgentMessage({
         familyMembers: conversationContext.familyMembers,
       });
 
+    if (voiceReply) recordVoiceLatency('PREPARE',contextStarted);
     if (
       referenceResolution.status === 'ambiguous' ||
       referenceResolution.status === 'missing'
@@ -1535,6 +1550,7 @@ export async function handleAgentMessage({
     }
 
     // --- execute validated READ/DRAFT calls (bounded by the gateway) ---
+    const toolsStarted=performance.now();
     const capabilityResults = [];
     const successfulCapabilityCalls = [];
     let capabilityFailureCode = null;
@@ -1608,6 +1624,7 @@ export async function handleAgentMessage({
       }
     }
 
+    if (voiceReply) recordVoiceLatency('TOOLS',toolsStarted);
     if (capabilityFailureCode) {
       return finishAgentTurn({
         pool,
@@ -1647,6 +1664,7 @@ export async function handleAgentMessage({
     }
 
     // --- navigation authorization (ownership BEFORE emit) ---
+    const navigationStarted=performance.now();
     let navigation = null;
     let navigationEntity = null;
     if (plan.navigationIntent) {
@@ -1692,12 +1710,17 @@ export async function handleAgentMessage({
       }
     }
 
+    if (voiceReply && plan.navigationIntent) recordVoiceLatency('TOOLS',navigationStarted);
     // --- grounded reply (or the deterministic denial) ---
     let reply;
     let fallbackCode = null;
-    if (declined) {
+    if (plan.category === 'app_help') {
+      reply = assistantHelpReply(language);
+    } else if (declined) {
       reply = localizedAgentText('agentPermissionDenied', language);
       fallbackCode = 'AGENT_PERMISSION_DENIED';
+    } else if (plan.category === 'unsupported') {
+      reply = unsupportedAgentReply(language);
     } else if (
       navigation &&
       capabilityResults.length === 0 &&
@@ -1713,6 +1736,7 @@ export async function handleAgentMessage({
         contextSlice,
         capabilityResults,
         voiceReply,
+        category: plan.category,
       });
       if (voiceReply) recordVoiceLatency('GROUNDED_REPLY',replyStarted);
       if (replyResult.ok) {
@@ -1721,6 +1745,8 @@ export async function handleAgentMessage({
   const deterministicReply = deterministicNextTaskReply({
     capabilityResults,
     language,
+    message: boundedMessage,
+    category: plan.category,
   });
 
   if (deterministicReply) {
@@ -1757,7 +1783,5 @@ export async function handleAgentMessage({
       code: 'AGENT_INTERNAL_ERROR',
       message: localizedAgentText('agentUnavailable', language),
     };
-  } finally {
-    if (voiceReply) recordVoiceLatency('TOTAL',voiceStarted);
   }
 }

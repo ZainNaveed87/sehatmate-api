@@ -1,3 +1,4 @@
+import {withSemanticTestCategory} from './agent_test_fixtures.js';
 /**
  * Phase B Agent Core tests (no HTTP server, no real database, no real LLM).
  *
@@ -11,6 +12,7 @@
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import {mock} from 'node:test';
 
 import {
   defineAgentCapability,
@@ -171,7 +173,7 @@ function mockProvider({ plan, replyTemplate }) {
       if (systemPrompt.includes('planning stage')) {
         calls.plan += 1;
         return {
-          json: plan,
+          json: withSemanticTestCategory(plan),
           model: 'mock-planner',
           provider: 'mock',
           inputTokens: 0,
@@ -203,7 +205,7 @@ function countingMockProvider({ plan, replyTemplate }) {
       if (systemPrompt.includes('planning stage')) {
         calls.plan += 1;
         return {
-          json: plan,
+          json: withSemanticTestCategory(plan),
           model: 'mock-planner',
           provider: 'mock',
           inputTokens: 0,
@@ -254,7 +256,7 @@ function sequencedPlanningProvider(steps) {
       const step = steps[Math.min(calls.length - 1, steps.length - 1)];
       if (step.error) throw new Error(step.error);
       return {
-        json: step.json,
+        json: withSemanticTestCategory(step.json),
         model: 'mock-planner',
         provider: 'mock',
         inputTokens: 0,
@@ -1903,6 +1905,85 @@ await test('voice conversational shortcut is closed, leaves pending decisions al
   const denied=await handleAgentMessage({pool:createFakePool(),userId:'other',sessionId:SESSION_ID,
     message:'hello',provider,voiceReply:true});
   assert.equal(denied.ok,false);assert.deepEqual(calls,{plan:0,reply:0});
+});
+
+await test('voice TOTAL waits for required session persistence and separates its duration',async()=>{
+  let now=0,persisted=false;
+  const clock=mock.method(performance,'now',()=>now);
+  const logs=[];const logging=mock.method(console,'info',line=>logs.push(line));
+  const pool=createFakePool();const execute=pool.execute;
+  pool.execute=async(sql,params)=>{
+    if(normalizeSql(sql).startsWith('UPDATE agent_sessions SET state_json')) {
+      now+=11000;persisted=true;
+    }
+    return execute(sql,params);
+  };
+  const {provider,calls}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+    replyTemplate:()=> 'How can I help?'});
+  try {
+    const result=await handleAgentMessage({pool,userId:USER,sessionId:SESSION_ID,
+      message:'a normal question',provider,voiceReply:true});
+    assert.equal(result.ok,true);assert.equal(persisted,true);
+    assert.deepEqual(calls,{plan:1,reply:1});
+    assert.ok(logs.includes('VOICE_AGENT_LATENCY:PERSIST:10_20S'));
+    assert.equal(logs.filter(line=>line==='VOICE_AGENT_LATENCY:TOTAL:10_20S').length,1);
+  } finally {clock.mock.restore();logging.mock.restore();}
+});
+
+await test('voice timing identifies two model waits without adding execution or logging content',async()=>{
+  let now=0;const clock=mock.method(performance,'now',()=>now);
+  const logs=[];const logging=mock.method(console,'info',line=>logs.push(line));
+  let plans=0,replies=0;
+  const provider=createAgentProvider({generateJson:async({systemPrompt})=>{
+    const planner=systemPrompt.includes('planning stage');
+    if(planner) {plans++;now+=8000;} else {replies++;now+=6000;}
+    return {json:planner?{category:'conversation',intent:'conversation',capabilityCalls:[],navigationIntent:null}:
+      {messageTemplate:'How can I help?'},model:'private-model',provider:'private-provider'};
+  }});
+  try {
+    const result=await handleAgentMessage({pool:createFakePool(),userId:USER,sessionId:SESSION_ID,
+      message:'private transcript',provider,voiceReply:true});
+    assert.equal(result.ok,true);assert.equal(plans,1);assert.equal(replies,1);
+    assert.equal(logs.filter(line=>line==='VOICE_AGENT_LATENCY:MODEL:5_10S').length,2);
+    assert.ok(logs.includes('VOICE_AGENT_LATENCY:TOTAL:10_20S'));
+    for(const line of logs) assert.match(line,/^VOICE_AGENT_LATENCY:(PREPARE|FAST_PATH|MODEL|TOOLS|GROUNDING|PERSIST|PLANNER|GROUNDED_REPLY|TOTAL):(LT_100MS|100_499MS|500_999MS|1_2S|2_5S|5_10S|10_20S|GE_20S|UNKNOWN)$/);
+  } finally {clock.mock.restore();logging.mock.restore();}
+});
+
+await test('slow tool is timed once without duplicate model or capability execution',async()=>{
+  let now=0,tools=0;
+  defineAgentCapability({name:'voice_timing_read',permissionClass:'READ',description:'Test timing read.',
+    inputSchema:{properties:{},required:[]},resultContract:'Test-only empty verified result.',
+    execute:async()=>{tools++;now+=12000;return {ok:true,data:{}};}});
+  const clock=mock.method(performance,'now',()=>now);
+  const logs=[];const logging=mock.method(console,'info',line=>logs.push(line));
+  const {provider,calls}=countingMockProvider({plan:{intent:'read_context',
+    capabilityCalls:[{name:'voice_timing_read',args:{}}],navigationIntent:null},replyTemplate:()=> 'How can I help?'});
+  try {
+    const result=await handleAgentMessage({pool:createFakePool(),userId:USER,sessionId:SESSION_ID,
+      message:'read my verified information',provider,voiceReply:true});
+    assert.equal(result.ok,true);assert.equal(tools,1);assert.deepEqual(calls,{plan:1,reply:1});
+    assert.ok(logs.includes('VOICE_AGENT_LATENCY:TOOLS:10_20S'));
+    assert.ok(logs.includes('VOICE_AGENT_LATENCY:TOTAL:10_20S'));
+  } finally {clock.mock.restore();logging.mock.restore();}
+});
+
+await test('timing remains fixed and content-free on failures and does not leak into text requests',async()=>{
+  const {runVoiceTiming,timeVoiceStage,recordVoiceLatency}=await import('./agent/agent_voice_quality.js');
+  const logs=[];const logging=mock.method(console,'info',line=>logs.push(line));
+  try {
+    await assert.rejects(runVoiceTiming(false,()=>timeVoiceStage('MODEL',async()=>{
+      throw new Error('private-provider-body');
+    })));
+    assert.deepEqual(logs,[]);
+    await assert.rejects(runVoiceTiming(true,()=>timeVoiceStage('MODEL',async()=>{
+      throw new Error('private-provider-body');
+    })));
+    assert.equal(logs.length,2);
+    for(const line of logs) assert.match(line,/^VOICE_AGENT_LATENCY:(MODEL|TOTAL):[A-Z0-9_]+$/);
+    recordVoiceLatency('private transcript',0);
+    assert.equal(logs.length,2);
+  } finally {logging.mock.restore();}
 });
 
 console.log(`Phase B Agent tests passed (${passed} tests).`);

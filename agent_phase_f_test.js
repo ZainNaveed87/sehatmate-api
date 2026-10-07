@@ -1,3 +1,4 @@
+import {withSemanticTestCategory} from './agent_test_fixtures.js';
 /** Phase F voice + safe navigation regression tests. */
 import assert from 'node:assert/strict';
 
@@ -205,7 +206,7 @@ function plannedProvider(plan) {
       generateJson: async ({ systemPrompt }) => {
         if (systemPrompt.includes('planning stage')) {
           calls.plan += 1;
-          return { json: plan, model: 'mock', provider: 'mock' };
+          return { json: withSemanticTestCategory(plan), model: 'mock', provider: 'mock' };
         }
         calls.reply += 1;
         return { json: { messageTemplate: 'Safe reply.' }, model: 'mock', provider: 'mock' };

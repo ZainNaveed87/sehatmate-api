@@ -1,3 +1,4 @@
+import {withSemanticTestCategory} from './agent_test_fixtures.js';
 /** Phase E/F multilingual turn-language regression tests. */
 import assert from 'node:assert/strict';
 
@@ -220,7 +221,7 @@ function planProvider(plan, { mismatch = false, capture = null } = {}) {
       if (systemPrompt.includes('planning stage')) {
         calls.plan += 1;
         capture?.planPrompts?.push(userPrompt);
-        return { json: plan, model: 'mock-planner', provider: 'mock' };
+        return { json: withSemanticTestCategory(plan), model: 'mock-planner', provider: 'mock' };
       }
       calls.reply += 1;
       capture?.replyLanguages?.push(preferredLanguage);

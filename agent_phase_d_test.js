@@ -1,3 +1,4 @@
+import {withSemanticTestCategory} from './agent_test_fixtures.js';
 /**
  * Phase D Agent tests: safe drafts plus explicit confirmed actions.
  */
@@ -152,7 +153,7 @@ function fakeProvider(plan) {
       generateJson: async ({ systemPrompt }) => {
         if (systemPrompt.includes('planning stage')) {
           calls.plan += 1;
-          return { json: plan, model: 'mock', provider: 'mock' };
+          return { json: withSemanticTestCategory(plan), model: 'mock', provider: 'mock' };
         }
         calls.reply += 1;
         return {
@@ -187,7 +188,7 @@ function pausedPlanProvider({ plan, started, release }) {
       if (systemPrompt.includes('planning stage')) {
         started.resolve();
         await release.promise;
-        return { json: plan, model: 'mock', provider: 'mock' };
+        return { json: withSemanticTestCategory(plan), model: 'mock', provider: 'mock' };
       }
       return {
         json: { messageTemplate: 'Safe reply.' },

@@ -53,6 +53,7 @@ import {
   defaultAgentProvider,
 } from './agent_provider.js';
 import { canonicalAgentLanguage } from './agent_session_store.js';
+import {timeVoiceStage,timeVoiceSync} from './agent_voice_quality.js';
 import { detectAgentTurnLanguage } from './agent_turn_language.js';
 import { cleanText } from '../services/shared_utils.js';
 
@@ -88,6 +89,9 @@ const INTERNAL_MACHINE_LABEL_PATTERN = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g;
 const INTERNAL_MACHINE_LABEL_EXACT_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;
 const ZERO_EVIDENCE_UNSUPPORTED_CLAIM_PATTERN =
   /\b(?:verified data (?:nahi mila|nahin mila|not found|was missing|is missing)|data (?:failed|did not load|load nahi hui|load nahin hui)|(?:api|backend) (?:failed|fail hua|fail ho gaya)|refresh (?:karein|karain|needed|required)|routine settings se refresh karein)\b/i;
+// Additional fail-closed defense for zero-tool conversation, never a replacement
+// for canonical patient-fact validation. App feature claims use server help instead.
+const ZERO_TOOL_PATIENT_CLAIM_PATTERN = /\b(?:you (?:have|owe|missed|completed)\s+(?:\w+\s+){0,5}(?:tasks?|doses?|medicines?|appointments?|care gaps?|diabetes|hypertension|diagnosis|blood sugar)|your (?:\w+\s+){0,4}(?:task|tasks|dose|medicine|medicines|care plan|schedule|score|status|care gaps?)\s+(?:is|are|has|have)|(?:no|\d+) pending (?:care )?tasks?|take\s+\w+\s+(?:daily|tonight)|aap (?:ka|ke|ki|ne).{0,55}(?:task|dose|dawa|medicine|plan|score|status).{0,35}(?:hai|hain|nahi)|aaj.{0,25}(?:pending|task).{0,25}(?:nahi|hai))\b|آپ (?:کے|کا|کی|نے).{0,60}(?:کام|دوا|خوراک|منصوب|سکور|اسکور)|آج.{0,25}(?:کام|التوا)/iu;
 const INTERNAL_SEMANTIC_MEANINGS = Object.freeze({
   insufficient_data: 'there is not enough verified data to determine a trend',
   needs_attention: 'this item needs attention',
@@ -607,6 +611,7 @@ export function buildAgentReplyPrompts({
   contextSlice = null,
   capabilityResults = [],
   voiceReply = false,
+  category = null,
 }) {
   const prepared = prepareAgentReplyContext(capabilityResults);
   const label = agentReplyLanguageLabel(language);
@@ -616,7 +621,10 @@ export function buildAgentReplyPrompts({
     agentReplyLanguageDirective(language),
     '',
     'Grounding rules:',
-    '- Base the reply ONLY on the verified capability results and context provided. Never invent medicines, doses, times, scores, statuses, care gaps, or navigation.',
+    '- Patient-specific facts must come ONLY from verified capability results. Never invent medicines, doses, times, scores, statuses, care gaps, or navigation.',
+    ...(['conversation','ambiguous'].includes(category) ? [
+      '- This is a zero-tool conversation, not a patient-data answer. Reply naturally or ask what the user means. General non-personal care/routine explanations are allowed. Never assert a personal diagnosis, task state, medication, schedule, or treatment recommendation. Never claim app features: offer to explain supported SehatMate help instead.',
+    ] : []),
     '- Whenever you state an exact medical or care fact (medicine name, task title, dose, unit, timing, exact clock time, task status, score, rate, count, or care gap status), you MUST reference it with a fact placeholder like {{fact:c1_plan_title}} from the fact catalog instead of writing the value yourself.',
     '- Canonical fact catalog entries intentionally hide exact values. Use their semantic labels to choose the placeholder; the backend will substitute the exact value after validation.',
     '- Never write exact clock times (for example 2 PM, 14:00, 2 baje), doses (for example 5 mg), or percentages (for example 85%) as literal text. Use placeholders only.',
@@ -652,7 +660,7 @@ export function buildAgentReplyPrompts({
       : []),
     '',
     'Screen/session context (structured, read-only):',
-    JSON.stringify(contextSlice ?? {}),
+    JSON.stringify(['conversation','ambiguous'].includes(category) ? {} : (contextSlice ?? {})),
     '',
     'User message (untrusted text):',
     message,
@@ -1042,13 +1050,29 @@ export function validateAndSubstituteAgentTemplate({ registry, template }) {
  * Never throws. The caller (agent_core) maps every failure to the
  * localized deterministic agentUnavailable fallback.
  */
-export async function generateGroundedAgentReply({
+export async function generateGroundedAgentReply(input) {
+  let result;
+  try {result=await generateGroundedAgentReplyInternal(input);}
+  catch {result={ok:false,code:'AGENT_PROVIDER_FAILED',message:'Reply generation failed.'};}
+  if (!result.ok) {
+    const marker=result.failureKind === 'ZERO_EVIDENCE' ? 'ZERO_EVIDENCE' : ({
+      AGENT_REPLY_INVALID:'INVALID_OUTPUT',AGENT_MESSAGE_EMPTY:'INVALID_OUTPUT',
+      AGENT_REPLY_LANGUAGE_MISMATCH:'LANGUAGE',AGENT_FACT_UNKNOWN:'FACT_UNKNOWN',
+      AGENT_FACT_CONFLICT:'FACT_CONFLICT',
+    }[result.code] ?? 'PROVIDER');
+    console.info(`AGENT_REPLY_FAILURE:${marker}`);
+  }
+  return result;
+}
+
+async function generateGroundedAgentReplyInternal({
   provider = defaultAgentProvider,
   language,
   message,
   contextSlice = null,
   capabilityResults = [],
   voiceReply = false,
+  category = null,
 }) {
   const boundedMessage = cleanText(message, AGENT_GROUNDER_LIMITS.messageMaxChars);
   if (!boundedMessage) {
@@ -1059,23 +1083,25 @@ export async function generateGroundedAgentReply({
     };
   }
 
-  const { systemPrompt, userPrompt, factRegistry } = buildAgentReplyPrompts({
+  const { systemPrompt, userPrompt, factRegistry } = timeVoiceSync('GROUNDING',()=>buildAgentReplyPrompts({
     language,
     message: boundedMessage,
     contextSlice,
     capabilityResults,
     voiceReply,
-  });
+    category,
+  }));
 
-  const completion = await provider.generateAgentReply({
+  const completion = await timeVoiceStage('MODEL',()=>provider.generateAgentReply({
     systemPrompt,
     userPrompt,
     preferredLanguage: agentReplyLanguageLabel(language),
-  });
+  }));
   if (!completion.ok) {
     return completion;
   }
 
+  return timeVoiceSync('GROUNDING',()=>{
   const output = validateReplyOutput(completion.data.json);
   if (!output.ok) {
     return output;
@@ -1093,10 +1119,12 @@ export async function generateGroundedAgentReply({
     output.template,
     capabilityResults,
   );
-  if (unsupportedZeroEvidenceClaim) {
-    return invalidReply(
+  const zeroToolPatientClaim = capabilityResults.length === 0 &&
+    ZERO_TOOL_PATIENT_CLAIM_PATTERN.test(String(output.template));
+  if (unsupportedZeroEvidenceClaim || zeroToolPatientClaim) {
+    return {...invalidReply(
       `messageTemplate claims missing data, load failure, or refresh need without verified capability evidence: ${unsupportedZeroEvidenceClaim}`,
-    );
+    ),failureKind:'ZERO_EVIDENCE'};
   }
 
   const grounded = validateAndSubstituteAgentTemplate({
@@ -1113,4 +1141,5 @@ export async function generateGroundedAgentReply({
     usedFactIds: grounded.usedFactIds,
     model: completion.data.model,
   };
+  });
 }

@@ -1,3 +1,4 @@
+import {withSemanticTestCategory} from './agent_test_fixtures.js';
 /** Phase E conversation intelligence + structured memory regression tests. */
 import assert from 'node:assert/strict';
 
@@ -290,7 +291,7 @@ function plannedProvider(plan, { replyTemplate = 'Safe reply.', capture = null }
         if (systemPrompt.includes('planning stage')) {
           calls.plan += 1;
           capture?.planPrompts?.push(userPrompt);
-          return { json: plan, model: 'mock', provider: 'mock' };
+          return { json: withSemanticTestCategory(plan), model: 'mock', provider: 'mock' };
         }
         calls.reply += 1;
         return { json: { messageTemplate: replyTemplate }, model: 'mock', provider: 'mock' };
