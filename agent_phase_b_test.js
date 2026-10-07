@@ -1846,4 +1846,63 @@ await test('POST /api/agent/message route contract is auth and limiter guarded',
   assert.match(source, /AGENT_DISABLED:\s*503/);
 });
 
+await test('voice greeting fast path avoids providers but never accepts a compound care request', async () => {
+  for (const message of ['hello','hi','can you hear me','thank you']) {
+    const pool=createFakePool();
+    const {provider,calls}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+      replyTemplate:()=> 'How can I help?'});
+    const result=await handleAgentMessage({pool,userId:USER,sessionId:SESSION_ID,message,provider,voiceReply:true});
+    assert.equal(result.ok,true);
+    assert.deepEqual(calls,{plan:0,reply:0});
+    assert.equal(result.navigation,null);
+    assert.equal(result.confirmation,null);
+    assert.deepEqual(result.referencedEntities,[]);
+  }
+  for (const message of ['hello, what is my next task today','what is my next task today','thank you, confirm it',
+      'open my care plan','can you hear me and change my medicine']) {
+    const {provider,calls}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+      replyTemplate:()=> 'How can I help with your care?'});
+    await handleAgentMessage({pool:createFakePool(),userId:USER,sessionId:SESSION_ID,message,provider,voiceReply:true});
+    assert.equal(calls.plan,1);
+  }
+});
+
+await test('voice reply instructions preserve safety and do not alter text chat policy', async () => {
+  const args={language:'en',message:'question'};
+  const normal=buildAgentReplyPrompts(args);
+  const voice=buildAgentReplyPrompts({...args,voiceReply:true});
+  assert.match(voice.systemPrompt,/1.?3 short spoken sentences/);
+  assert.match(voice.systemPrompt,/immediate question first/);
+  assert.match(voice.systemPrompt,/safety.*confirmation/i);
+  assert.match(voice.systemPrompt,/fact placeholder/);
+  assert.doesNotMatch(normal.systemPrompt,/1.?3 short spoken sentences/);
+  assert.ok(voice.systemPrompt.length<=4000);
+});
+
+await test('Roman Urdu voice output stays Roman Urdu when recognized speech is Urdu script', async () => {
+  const templates={'Urdu':'میں آپ کی مدد کر سکتا ہوں۔','Roman Urdu':'Main aap ki madad kar sakta hoon.'};
+  const {provider}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+    replyTemplate:language=>templates[language]});
+  const result=await handleAgentMessage({pool:createFakePool({preferredLanguage:'roman_ur'}),userId:USER,
+    sessionId:SESSION_ID,message:'میری مدد کریں',provider,voiceReply:true});
+  assert.equal(result.language,'roman_ur');
+  assert.equal(result.reply,templates['Roman Urdu']);
+});
+
+await test('voice conversational shortcut is closed, leaves pending decisions alone and checks ownership', async()=>{
+  const {voiceConversationReply}=await import('./agent/agent_voice_quality.js');
+  for(const field of ['pendingConfirmation','pendingDraft','pendingClarification']) {
+    assert.equal(voiceConversationReply({message:'hello',language:'en',state:{[field]:{}}}),null);
+  }
+  assert.equal(voiceConversationReply({message:'hello',language:'en',state:{},clientContext:{screen:'care_plan'}}),null);
+  assert.equal(voiceConversationReply({message:'hello and give medication advice',language:'en',state:{}}),null);
+  assert.equal(voiceConversationReply({message:'yes',language:'en',state:{}}),null);
+  assert.equal(voiceConversationReply({message:'hello'+' '.repeat(2100)+'change my medicine',language:'en',state:{}}),null);
+  const {provider,calls}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+    replyTemplate:()=> 'Hello'});
+  const denied=await handleAgentMessage({pool:createFakePool(),userId:'other',sessionId:SESSION_ID,
+    message:'hello',provider,voiceReply:true});
+  assert.equal(denied.ok,false);assert.deepEqual(calls,{plan:0,reply:0});
+});
+
 console.log(`Phase B Agent tests passed (${passed} tests).`);

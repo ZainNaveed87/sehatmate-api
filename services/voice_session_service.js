@@ -120,7 +120,7 @@ export function createVoiceSessionService({
     return s;
   }
 
-  async function active(s) {
+  async function active(s, onAgent = null) {
     enabled();
 
     if (
@@ -147,6 +147,7 @@ export function createVoiceSessionService({
       );
     }
 
+    if (onAgent) onAgent(a.data.session);
     return s;
   }
 
@@ -1066,6 +1067,7 @@ export function createVoiceSessionService({
       );
     }
 
+    let sttLanguage;
     const s =
       await store.transaction(
         initial.userId,
@@ -1077,6 +1079,11 @@ export function createVoiceSessionService({
                 id,
                 db,
               ),
+              agent => {
+                // readAgent is scoped to the authenticated owner and normalizes
+                // stored Agent languages. Roman Urdu is an output preference.
+                sttLanguage = ['ur', 'roman_ur'].includes(agent.language) ? 'ur' : 'en';
+              },
             );
 
           if (
@@ -1203,6 +1210,8 @@ export function createVoiceSessionService({
 
       genericPrompts:
         genericSpeechCatalog(),
+
+      sttLanguage,
     };
   }
 

@@ -40,6 +40,30 @@ function setup(overrides={}) {
 const create = s=>s.sessions.create({userId:'1',input:{agentSessionId:'9'}});
 const expectCode = (promise,code)=>assert.rejects(promise,e=>e.code===code);
 
+test('voice-only reply policy is selected by the server and cannot be supplied in turn input',async()=>{
+  let received;
+  const s=await turnSetup(async args=>{received=args;return {ok:true,sessionId:'9',language:'en',reply:'Approved answer.'};});
+  await s.service.submit({userId:'1',id:s.a.id,input:s.input});
+  assert.equal(received.voiceReply,true);
+  await expectCode(s.service.submit({userId:'1',id:s.a.id,
+    input:{...s.input,turnId:'other-turn',voiceReply:false}}),'VOICE_INVALID_REQUEST');
+});
+
+test('worker claim selects speech language only from the owned Agent session',async t=>{
+  for(const [language,expected] of [['en','en'],['ur','ur'],['roman_ur','ur']]) {
+    await t.test(language,async()=>{
+      const s=setup();s.agent.language=language;const a=await create(s);
+      const args={id:a.id,serviceIdentity:'sehatmate-worker',
+        input:{roomName:a.roomName,jobId:'AJ_mock',workerIdentity:'worker-mock'}};
+      assert.equal((await s.sessions.claim(args)).sttLanguage,expected);
+      await expectCode(s.sessions.claim({...args,input:{...args.input,sttLanguage:'multi'}}),'VOICE_INVALID_REQUEST');
+      await expectCode(s.sessions.create({userId:'1',input:{agentSessionId:'9',sttLanguage:'ur'}}),'VOICE_INVALID_REQUEST');
+      s.agent.language='en';
+      assert.equal((await s.sessions.claim(args)).sttLanguage,'en');
+    });
+  }
+});
+
 test('claim binding diagnostics preserve security checks and never include binding values',async t=>{
   const cases=[
     ['TRANSPORT_OWNER',({row,input})=>{row.transportOwner='device';input.roomName='private-wrong-room';}],

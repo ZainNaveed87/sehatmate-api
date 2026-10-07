@@ -98,7 +98,8 @@ export function createAgentTurnService({store,sessions,config,receiptKey,handleA
     const execution=(async()=>{
       try {
         const result=await handleAgent({userId,sessionId:initial.agentSessionId,message:input.message,
-          clientContext:input.screenContext||null,confirmation:input.confirmation||null,clarification:input.clarification||null,clientToday:input.today||null});
+          clientContext:input.screenContext||null,confirmation:input.confirmation||null,clarification:input.clarification||null,clientToday:input.today||null,
+          voiceReply:true});
         // The core may report a mutation failure after a partial write; this is uncertain.
         if(!result?.ok||result.fallbackCode==='AGENT_CAPABILITY_FAILED') throw voiceError('VOICE_AGENT_UNCERTAIN');
         r.encryptedResult=encrypt(result,r);r.status='completed';

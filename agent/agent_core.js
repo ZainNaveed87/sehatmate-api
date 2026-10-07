@@ -120,6 +120,7 @@ import { recordAgentAction } from './agent_action_audit.js';
 import { nextTaskFromTodayState } from '../services/performance_summary_service.js';
 import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
+import {voiceConversationReply,recordVoiceLatency} from './agent_voice_quality.js';
 import {
   cleanText,
   idPattern,
@@ -1136,8 +1137,10 @@ export async function handleAgentMessage({
   clarification = null,
   clientToday = null,
   provider = defaultAgentProvider,
+  voiceReply = false,
 }) {
   let language = 'en';
+  const voiceStarted=performance.now();
   try {
     const canonicalClientToday = canonicalAgentClientToday(clientToday);
     if (clientToday != null && !canonicalClientToday) {
@@ -1180,10 +1183,15 @@ export async function handleAgentMessage({
     }
 
     const profileLanguage = await readProfileLanguage(pool, userId);
-    language = resolveAgentTurnLanguage({
+    const turnLanguage = input => {
+      const detected=resolveAgentTurnLanguage(input).language;
+      // Roman Urdu is an output preference; Urdu-script STT must not erase it.
+      return voiceReply && profileLanguage==='roman_ur' && detected==='ur' ? 'roman_ur' : detected;
+    };
+    language = turnLanguage({
       message: boundedMessage,
       profileLanguage,
-    }).language;
+    });
 
     if (!agentConfig().enabled) {
       return {
@@ -1212,11 +1220,11 @@ export async function handleAgentMessage({
       const read = await readAgentSession({ db: pool, userId, sessionId });
       if (!read.ok) return read;
       session = read.data.session;
-      language = resolveAgentTurnLanguage({
+      language = turnLanguage({
         message: boundedMessage,
         lastTurnLanguage: lastVerifiedTurnLanguage(session, profileLanguage),
         profileLanguage,
-      }).language;
+      });
     }
 
     if (!sessionCreated) {
@@ -1351,6 +1359,17 @@ export async function handleAgentMessage({
       });
     }
 
+    const conversation=voiceReply && !isClarificationTurn
+      ? voiceConversationReply({message,language,state:session.state,clientContext})
+      : null;
+    if (conversation) {
+      console.info(`VOICE_AGENT_FAST_PATH:${conversation.kind.toUpperCase()}`);
+      // Ownership, active-session checks, language and touch have already run.
+      // Preserve conversation state; no facts, actions, confirmations or navigation.
+      return {ok:true,sessionId:session.id,language,reply:conversation.reply,
+        navigation:null,confirmation:null,clarification:null,actionStatus:null,referencedEntities:[]};
+    }
+
     // --- bounded verified context (fail-safe drops, ownership first) ---
     const context = await readAgentScreenContext({
       pool,
@@ -1425,6 +1444,7 @@ export async function handleAgentMessage({
       message: boundedMessage,
       resolution: referenceResolution,
     });
+    const plannerStarted=performance.now();
     const planned = fastNavigationPlan
       ? validateAgentPlan(fastNavigationPlan)
       : await planAgentMessage({
@@ -1432,6 +1452,7 @@ export async function handleAgentMessage({
           message: boundedMessage,
           contextSlice,
         });
+    if (voiceReply) recordVoiceLatency('PLANNER',plannerStarted);
     if (!planned.ok) {
       if (planned.code === 'AGENT_MESSAGE_EMPTY') {
         return {
@@ -1684,13 +1705,16 @@ export async function handleAgentMessage({
     ) {
       reply = navigationReadyText(navigation.target, language);
     } else {
+      const replyStarted=performance.now();
       const replyResult = await generateGroundedAgentReply({
         provider,
         language,
         message: boundedMessage,
         contextSlice,
         capabilityResults,
+        voiceReply,
       });
+      if (voiceReply) recordVoiceLatency('GROUNDED_REPLY',replyStarted);
       if (replyResult.ok) {
   reply = replyResult.reply;
 } else {
@@ -1733,5 +1757,7 @@ export async function handleAgentMessage({
       code: 'AGENT_INTERNAL_ERROR',
       message: localizedAgentText('agentUnavailable', language),
     };
+  } finally {
+    if (voiceReply) recordVoiceLatency('TOTAL',voiceStarted);
   }
 }
