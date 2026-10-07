@@ -12,7 +12,7 @@
  *     -> validated capability executions (registry + safety gateway, max 3)
  *     -> audited READ results from authoritative backend services
  *     -> navigation authorization (ownership BEFORE emit)
- *     -> ONE grounded reply turn (agent_response_grounder.js)
+ *     -> grounded reply (plus one product-support review for app_help)
  *     -> bounded session state update (referenced entities + summary only)
  *
  * Safety properties (spec sections 8-22):
@@ -21,8 +21,9 @@
  *     planner returns a decline_* plan (the instructed refusal shape) and
  *     when the safety gateway rejects a non-executable permission class
  *     outright. Nothing ever executes in either case.
- *   - The provider is called at most three times per message (up to two
- *     planning turns, one reply turn) through the injectable provider seam.
+ *   - The provider is called at most four times per message (up to two
+ *     planning turns, one reply turn, and one app-help support review) through
+ *     the injectable provider seam.
  *     Every unrepaired provider or model-output failure maps to the
  *     localized deterministic
  *     agentUnavailable fallback: the agent never claims an action happened,
@@ -41,7 +42,8 @@
  *   - Session state stays bounded (spec 10): canonical { type, id }
  *     referenced entities capped at AGENT_STATE_LIMITS plus a short
  *     deterministic lastActionSummary built from server-known facts
- *     (intent label, executed tool names, navigation target). No
+ *     (intent label, executed tool names, navigation target), or a normalized
+ *     conversational topic and registered product-fact references. No
  *     conversation transcripts are stored.
  *   - The request body can never set reply language authority. The user's
  *     stored profile language remains the app/UI/default language only.
@@ -122,7 +124,8 @@ import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
 import {voiceConversationReply,recordVoiceLatency,runVoiceTiming,timeVoiceStage,timeVoiceSync} from './agent_voice_quality.js';
 import {readProfileLanguage} from './agent_profile_language.js';
-import {assistantHelpReply,unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic_routes.js';
+import {productConversationContext,productConversationSummary} from './agent_product_context.js';
+import {unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic_routes.js';
 import {
   cleanText,
   idPattern,
@@ -710,6 +713,7 @@ function buildNextSessionState({
   pendingDraft,
   pendingClarification = null,
   language,
+  conversationalSummary = null,
 }) {
   const previous = Array.isArray(sessionState?.lastReferencedEntities)
     ? sessionState.lastReferencedEntities
@@ -787,7 +791,10 @@ function buildNextSessionState({
         ? sessionState?.pendingClarification ?? null
         : pendingClarification,
     lastTurnLanguage: canonicalAgentLanguage(language),
-    lastActionSummary: summary || null,
+    lastActionSummary:
+      !hasVerifiedOperation && conversationalSummary
+        ? conversationalSummary
+        : summary || null,
   };
 }
 
@@ -851,6 +858,7 @@ async function persistAgentTurn({
   clarification = null,
   actionStatus = null,
   language = session.language,
+  conversationalSummary = null,
 }) {
   const nextState = buildNextSessionState({
     sessionState: session.state,
@@ -865,6 +873,7 @@ async function persistAgentTurn({
     pendingDraft,
     pendingClarification,
     language,
+    conversationalSummary,
   });
 
   let stateUpdate = null;
@@ -1440,12 +1449,15 @@ async function handleAgentMessageInternal({
       });
     }
 
-    const contextSlice = buildAgentContextSlice({
-      language,
-      screenContext: context.screenContext,
-      sessionState: session.state,
-      conversationContext,
-      referenceResolution: referenceResolutionContext(referenceResolution),
+    const contextSlice = Object.freeze({
+      ...buildAgentContextSlice({
+        language,
+        screenContext: context.screenContext,
+        sessionState: session.state,
+        conversationContext,
+        referenceResolution: referenceResolutionContext(referenceResolution),
+      }),
+      conversationTopic: productConversationContext(session.state.lastActionSummary),
     });
 
     // --- deterministic resolved-reference navigation or bounded planning ---
@@ -1708,9 +1720,8 @@ async function handleAgentMessageInternal({
     // --- grounded reply (or the deterministic denial) ---
     let reply;
     let fallbackCode = null;
-    if (plan.category === 'app_help') {
-      reply = assistantHelpReply(language);
-    } else if (declined) {
+    let conversationalSummary = null;
+    if (declined) {
       reply = localizedAgentText('agentPermissionDenied', language);
       fallbackCode = 'AGENT_PERMISSION_DENIED';
     } else if (plan.category === 'unsupported') {
@@ -1734,26 +1745,28 @@ async function handleAgentMessageInternal({
       });
       if (voiceReply) recordVoiceLatency('GROUNDED_REPLY',replyStarted);
       if (replyResult.ok) {
-  reply = replyResult.reply;
-} else {
-  const deterministicReply = deterministicNextTaskReply({
-    capabilityResults,
-    language,
-    message: boundedMessage,
-    category: plan.category,
-  });
+        reply = replyResult.reply;
+        conversationalSummary = replyResult.conversationalSummary ||
+          (['conversation','ambiguous'].includes(plan.category) ? productConversationSummary({category:plan.category,topic:plan.intent}) : null);
+      } else {
+        const deterministicReply = deterministicNextTaskReply({
+          capabilityResults,
+          language,
+          message: boundedMessage,
+          category: plan.category,
+        });
 
-  if (deterministicReply) {
-    reply = deterministicReply;
+        if (deterministicReply) {
+          reply = deterministicReply;
 
-    // Preserve the real reply-stage failure code for diagnostics while
-    // still returning the already-verified authoritative task facts.
-    fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
-  } else {
-    reply = localizedAgentText('agentUnavailable', language);
-    fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
-  }
-}
+          // Preserve the real reply-stage failure code for diagnostics while
+          // still returning the already-verified authoritative task facts.
+          fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
+        } else {
+          reply = localizedAgentText('agentUnavailable', language);
+          fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
+        }
+      }
     }
 
     return finishAgentTurn({
@@ -1770,6 +1783,7 @@ async function handleAgentMessageInternal({
       navigationEntity,
       screenEntity,
       language,
+      conversationalSummary,
     });
   } catch {
     return {

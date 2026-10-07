@@ -29,6 +29,7 @@ function provider(plan,reply='How can I help with your care?',fail=false) {
     prompts.push(args);
     if(args.systemPrompt.includes('planning stage')) return {json:plan,model:'mock'};
     if(fail) throw new Error('PRIVATE_PROVIDER_BODY');
+    if(args.systemPrompt.includes('product support review')) return {json:{supported:true,factIds:['cap_get_care_plans'],topic:'care_plan_support'},model:'mock'};
     return {json:{messageTemplate:reply},model:'mock'};
   }});
   return {p,prompts};
@@ -48,12 +49,11 @@ for(const message of [
 ]) test(`app help uses server catalog, not patient tools: ${message}`,async()=>{
   for(const voiceReply of [false,true]) {
     const {result,db,prompts}=await turn(message,route('app_help'),{voiceReply,
-      reply:'I can diagnose diseases and automatically change your doses.'});
+      reply:'I can help explain verified care plans and supported care tasks.'});
     assert.equal(result.ok,true); assert.equal(result.fallbackCode,undefined);
-    assert.match(result.reply,/care plans/i); assert.match(result.reply,/Reality Check/);
-    assert.match(result.reply,/confirmation/i); assert.doesNotMatch(result.reply,/diagnose|automatically change/i);
+    assert.equal(result.reply,'I can help explain verified care plans and supported care tasks.');
     assert.equal(db.queries.some(s=>s.includes('occurrence_date')||s.includes('FROM care_plans')),false);
-    assert.equal(prompts.length,1); // Authoritative help never consumes model-written feature claims.
+    assert.equal(prompts.length,3); // Plan, shared generation, then fail-closed product support review.
     assert.equal(result.navigation,null);
   }
 });
@@ -145,12 +145,12 @@ test('trivial conversation optimization is shared by text and voice',async()=>{
   }
 });
 
-test('localized help remains server-owned for Urdu and Roman Urdu',async()=>{
-  for(const [message,expected] of [['آپ کیا مدد کر سکتے ہیں؟',/تصدیق/],
-    ['Aap meri kis tarah madad kar sakte hain?',/confirmation/]]) {
-    const {result,prompts}=await turn(message,route('app_help'));
-    assert.match(result.reply,expected); assert.equal(result.fallbackCode,undefined);
-    assert.equal(prompts.length,1);
+test('localized help uses natural generation with server-owned product facts',async()=>{
+  for(const [message,reply] of [['آپ کیا مدد کر سکتے ہیں؟','SehatMate تصدیق شدہ نگہداشت کے منصوبے سمجھنے میں مدد کر سکتا ہے۔'],
+    ['Aap meri kis tarah madad kar sakte hain?','Main aap ke verified care plans samajhne mein madad kar sakta hoon.']]) {
+    const {result,prompts}=await turn(message,route('app_help'),{reply});
+    assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
+    assert.equal(prompts.length,3);
   }
 });
 
@@ -195,11 +195,16 @@ test('contradictory help plus patient-tool plans never reach capability executio
 
 test('missing category can be repaired once without executing the rejected plan',async()=>{
   const db=pool(); let attempts=0;
-  const p=createAgentProvider({generateJson:async()=>({json:++attempts===1?
-    {intent:'read_next_task',capabilityCalls:[taskCall],navigationIntent:null}:route('app_help')})});
+  const p=createAgentProvider({generateJson:async({systemPrompt})=>{
+    attempts++;
+    if(systemPrompt.includes('planning stage')) return {json:attempts===1?
+      {intent:'read_next_task',capabilityCalls:[taskCall],navigationIntent:null}:route('app_help')};
+    if(systemPrompt.includes('product support review')) return {json:{supported:true,factIds:['cap_get_care_plans'],topic:'care_plan_support'}};
+    return {json:{messageTemplate:'I can explain verified care plans.'}};
+  }});
   const r=await handleAgentMessage({pool:db,userId:'42',sessionId:'501',message:'What help do you provide?',provider:p});
   assert.equal(r.ok,true); assert.equal(r.fallbackCode,undefined); assert.match(r.reply,/care plans/);
-  assert.equal(attempts,2); assert.equal(db.queries.some(s=>s.includes('occurrence_date')),false);
+  assert.equal(attempts,4); assert.equal(db.queries.some(s=>s.includes('occurrence_date')),false);
 });
 
 test('reply diagnostics contain only fixed categories for all failure branches',async()=>{

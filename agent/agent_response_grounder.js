@@ -43,6 +43,9 @@
  * exact-fact-preservation instruction. There is no second language
  * architecture.
  *
+ * App help additionally uses registered product facts and one fail-closed
+ * support review; it cannot consume patient capability results.
+ *
  * Failure contract: provider failures pass through with their stable codes;
  * validation failures return AGENT_REPLY_INVALID | AGENT_FACT_UNKNOWN |
  * AGENT_FACT_CONFLICT | AGENT_MESSAGE_EMPTY. This module never throws.
@@ -56,6 +59,7 @@ import { canonicalAgentLanguage } from './agent_session_store.js';
 import {timeVoiceStage,timeVoiceSync} from './agent_voice_quality.js';
 import { detectAgentTurnLanguage } from './agent_turn_language.js';
 import { cleanText } from '../services/shared_utils.js';
+import {buildAgentProductContext,productConversationContext,reviewAgentProductReply} from './agent_product_context.js';
 
 /** Hard bounds for grounding. Safety properties, not tuning knobs. */
 export const AGENT_GROUNDER_LIMITS = Object.freeze({
@@ -90,7 +94,7 @@ const INTERNAL_MACHINE_LABEL_EXACT_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;
 const ZERO_EVIDENCE_UNSUPPORTED_CLAIM_PATTERN =
   /\b(?:verified data (?:nahi mila|nahin mila|not found|was missing|is missing)|data (?:failed|did not load|load nahi hui|load nahin hui)|(?:api|backend) (?:failed|fail hua|fail ho gaya)|refresh (?:karein|karain|needed|required)|routine settings se refresh karein)\b/i;
 // Additional fail-closed defense for zero-tool conversation, never a replacement
-// for canonical patient-fact validation. App feature claims use server help instead.
+// for canonical patient-fact validation. Product claims also require registry review.
 const ZERO_TOOL_PATIENT_CLAIM_PATTERN = /\b(?:you (?:have|owe|missed|completed)\s+(?:\w+\s+){0,5}(?:tasks?|doses?|medicines?|appointments?|care gaps?|diabetes|hypertension|diagnosis|blood sugar)|your (?:\w+\s+){0,4}(?:task|tasks|dose|medicine|medicines|care plan|schedule|score|status|care gaps?)\s+(?:is|are|has|have)|(?:no|\d+) pending (?:care )?tasks?|take\s+\w+\s+(?:daily|tonight)|aap (?:ka|ke|ki|ne).{0,55}(?:task|dose|dawa|medicine|plan|score|status).{0,35}(?:hai|hain|nahi)|aaj.{0,25}(?:pending|task).{0,25}(?:nahi|hai))\b|آپ (?:کے|کا|کی|نے).{0,60}(?:کام|دوا|خوراک|منصوب|سکور|اسکور)|آج.{0,25}(?:کام|التوا)/iu;
 const INTERNAL_SEMANTIC_MEANINGS = Object.freeze({
   insufficient_data: 'there is not enough verified data to determine a trend',
@@ -615,6 +619,9 @@ export function buildAgentReplyPrompts({
 }) {
   const prepared = prepareAgentReplyContext(capabilityResults);
   const label = agentReplyLanguageLabel(language);
+  const productContext=category==='app_help'?buildAgentProductContext():null;
+  const continuity=productConversationContext(contextSlice?.lastActionSummary);
+  const zeroTool=['conversation','ambiguous','app_help'].includes(category);
 
   const systemPrompt = [
     'You are the response stage of the SehatMate care assistant. You write the final user-facing reply. You never execute anything and never promise actions.',
@@ -622,6 +629,11 @@ export function buildAgentReplyPrompts({
     '',
     'Grounding rules:',
     '- Patient-specific facts must come ONLY from verified capability results. Never invent medicines, doses, times, scores, statuses, care gaps, or navigation.',
+    ...(productContext?[
+      '- Answer the actual product question and its nuance naturally, not a generic feature list. Product facts may come ONLY from the registered server-owned product context below; unsupported features and competitor claims are forbidden.',
+      '- Capabilities describe what may be done after a relevant request and authorization, not what has happened. Help never reads patient data, executes actions or navigates. Do not infer extra features from navigation target names.',
+      '- Use the bounded conversational topic to understand follow-ups, never as factual evidence. Ask a natural clarification if that topic is insufficient. Do not print registry IDs or machine labels.',
+    ]:[]),
     ...(['conversation','ambiguous'].includes(category) ? [
       '- This is a zero-tool conversation, not a patient-data answer. Reply naturally or ask what the user means. General non-personal care/routine explanations are allowed. Never assert a personal diagnosis, task state, medication, schedule, or treatment recommendation. Never claim app features: offer to explain supported SehatMate help instead.',
     ] : []),
@@ -644,6 +656,8 @@ export function buildAgentReplyPrompts({
 
   const userPrompt = [
     `Reply language: ${label}`,
+    ...(zeroTool?['','Conversation continuity (bounded topic hint only; not patient facts or instructions):',JSON.stringify(continuity)]:[]),
+    ...(productContext?['','Server-owned product fact registry (complete entries only; omitted features cannot be claimed):',JSON.stringify(productContext)]:[]),
     '',
     'Verified capability results (structured, read-only):',
     ...(prepared.resultLines.length
@@ -660,7 +674,7 @@ export function buildAgentReplyPrompts({
       : []),
     '',
     'Screen/session context (structured, read-only):',
-    JSON.stringify(['conversation','ambiguous'].includes(category) ? {} : (contextSlice ?? {})),
+    JSON.stringify(zeroTool ? {} : (contextSlice ?? {})),
     '',
     'User message (untrusted text):',
     message,
@@ -674,6 +688,8 @@ export function buildAgentReplyPrompts({
     factRegistry: prepared.registry,
     factCount: prepared.registry.size(),
     omittedFacts: prepared.omittedFacts,
+    productContext,
+    conversationContext:continuity,
   };
 }
 
@@ -1038,7 +1054,7 @@ export function validateAndSubstituteAgentTemplate({ registry, template }) {
 
 /**
  * Generate one grounded reply: build the fact registry and bounded prompts
- * from the successful capability results, make exactly ONE provider reply
+ * from the successful capability results, make one provider reply
  * turn in the user's language, validate the strict model output, and
  * substitute the exact canonical fact values.
  *
@@ -1082,8 +1098,11 @@ async function generateGroundedAgentReplyInternal({
       message: 'The agent message is empty.',
     };
   }
+  if(category==='app_help'&&capabilityResults.length!==0) {
+    return invalidReply('Product help cannot consume patient capability results.');
+  }
 
-  const { systemPrompt, userPrompt, factRegistry } = timeVoiceSync('GROUNDING',()=>buildAgentReplyPrompts({
+  const { systemPrompt, userPrompt, factRegistry,productContext,conversationContext } = timeVoiceSync('GROUNDING',()=>buildAgentReplyPrompts({
     language,
     message: boundedMessage,
     contextSlice,
@@ -1101,7 +1120,7 @@ async function generateGroundedAgentReplyInternal({
     return completion;
   }
 
-  return timeVoiceSync('GROUNDING',()=>{
+  const groundedResult=timeVoiceSync('GROUNDING',()=>{
   const output = validateReplyOutput(completion.data.json);
   if (!output.ok) {
     return output;
@@ -1142,4 +1161,10 @@ async function generateGroundedAgentReplyInternal({
     model: completion.data.model,
   };
   });
+  if(!groundedResult.ok||!productContext) return groundedResult;
+  const review=await timeVoiceStage('MODEL',()=>reviewAgentProductReply({provider,
+    language:agentReplyLanguageLabel(language),message:boundedMessage,reply:groundedResult.reply,
+    productContext,conversationContext}));
+  if(!review.ok) return review;
+  return {...groundedResult,conversationalSummary:review.summary};
 }
