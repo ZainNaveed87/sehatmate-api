@@ -121,6 +121,7 @@ import { nextTaskFromTodayState } from '../services/performance_summary_service.
 import { resolveAgentTurnLanguage } from './agent_turn_language.js';
 import { localizedAiFallbackText } from '../language_support.js';
 import {voiceConversationReply,recordVoiceLatency,runVoiceTiming,timeVoiceStage,timeVoiceSync} from './agent_voice_quality.js';
+import {readProfileLanguage} from './agent_profile_language.js';
 import {assistantHelpReply,unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic_routes.js';
 import {
   cleanText,
@@ -591,20 +592,11 @@ const DECLINE_INTENT_PATTERN = /^decline/;
 /** Length bound for entity titles surfaced in referencedEntities. */
 const ENTITY_TITLE_MAX_LENGTH = 200;
 
-/** Server-side app/UI/default language source. */
-const PROFILE_LANGUAGE_SQL =
-  'SELECT preferred_language FROM patient_profiles WHERE user_id = ? LIMIT 1';
-
 const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
 const CLARIFICATION_TTL_MS = 5 * 60 * 1000;
 const CONFIRMATION_DECISIONS = new Set(['confirm', 'cancel']);
 const DRAFT_KINDS = new Set(['task_outcome', 'schedule_time']);
 const OPAQUE_CLIENT_ID_PATTERN = /^[A-Za-z0-9._:-]{1,80}$/;
-
-async function readProfileLanguage(pool, userId) {
-  const [rows] = await pool.execute(PROFILE_LANGUAGE_SQL, [userId]);
-  return canonicalAgentLanguage(rows[0]?.preferred_language);
-}
 
 export function canonicalAgentClientToday(value) {
   if (value == null) return null;
@@ -1196,7 +1188,9 @@ async function handleAgentMessageInternal({
 
     const profileLanguage = await readProfileLanguage(pool, userId);
     const turnLanguage = input => {
-      const detected=resolveAgentTurnLanguage(input).language;
+      const detected=resolveAgentTurnLanguage(voiceReply
+        ? {...input,lastTurnLanguage:profileLanguage}
+        : input).language;
       // Roman Urdu is an output preference; Urdu-script STT must not erase it.
       return voiceReply && profileLanguage==='roman_ur' && detected==='ur' ? 'roman_ur' : detected;
     };

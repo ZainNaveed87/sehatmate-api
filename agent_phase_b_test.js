@@ -1986,4 +1986,36 @@ await test('timing remains fixed and content-free on failures and does not leak 
   } finally {logging.mock.restore();}
 });
 
+await test('voice ambiguity uses current profile preference while text retains last-turn fallback',async()=>{
+  for(const [profile,previous,voiceExpected] of [['ur','en','ur'],['roman_ur','en','roman_ur'],['en','ur','en']]) {
+    for(const voiceReply of [true,false]) {
+      const pool=createFakePool({preferredLanguage:profile}); const execute=pool.execute;
+      pool.execute=async(sql,params)=>{
+        const value=await execute(sql,params);
+        if(normalizeSql(sql).includes('FROM agent_sessions WHERE id = ? AND user_id = ? AND expires_at')) {
+          value[0]=value[0].map(row=>({...row,language:previous,state_json:JSON.stringify({...emptyAgentSessionState(),lastTurnLanguage:previous})}));
+        }
+        return value;
+      };
+      const {provider}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+        replyTemplate:lang=>({'English':'How can I help?','Urdu':'میں آپ کی کیا مدد کر سکتا ہوں؟',
+          'Roman Urdu':'Main aap ki kya madad kar sakta hoon?'}[lang])});
+      const result=await handleAgentMessage({pool,userId:USER,sessionId:SESSION_ID,message:'...',provider,voiceReply});
+      assert.equal(result.language,voiceReply?voiceExpected:previous);
+      assert.equal(result.fallbackCode,undefined);
+    }
+  }
+});
+
+await test('Urdu speech preserves Urdu script preference and Roman Urdu output preference',async()=>{
+  for(const [profile,expected] of [['ur','ur'],['roman_ur','roman_ur']]) {
+    const {provider}=countingMockProvider({plan:{intent:'conversation',capabilityCalls:[],navigationIntent:null},
+      replyTemplate:lang=>lang==='Urdu'?'میں آپ کی مدد کر سکتا ہوں۔':'Main aap ki madad kar sakta hoon.'});
+    const result=await handleAgentMessage({pool:createFakePool({preferredLanguage:profile}),userId:USER,
+      sessionId:SESSION_ID,message:'میں آج بہتر محسوس کر رہا ہوں',provider,voiceReply:true});
+    assert.equal(result.language,expected);assert.equal(result.fallbackCode,undefined);
+    if(expected==='roman_ur') assert.doesNotMatch(result.reply,/[\u0600-\u06FF]/);
+  }
+});
+
 console.log(`Phase B Agent tests passed (${passed} tests).`);

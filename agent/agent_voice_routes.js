@@ -4,6 +4,7 @@ import {agentConfig} from './agent_config.js';
 import {voiceConfiguration,voiceSecrets} from './agent_voice_config.js';
 import {readAgentSession} from './agent_session_store.js';
 import {handleAgentMessage} from './agent_core.js';
+import {readProfileLanguage} from './agent_profile_language.js';
 import {createVoiceStore} from '../services/voice_store.js';
 import {createVoiceSessionService} from '../services/voice_session_service.js';
 import {createAgentTurnService} from '../services/agent_turn_service.js';
@@ -58,7 +59,8 @@ export function installVoiceBackend({app,pool,lockPool,sessionLockPool,authentic
     binding:async()=>false,revoke:async()=>{throw voiceError('VOICE_DISABLED',503);},
   };
   const readAgent=({userId,sessionId})=>readAgentSession({db:pool,userId,sessionId});
-  const sessions=createVoiceSessionService({store,config,secrets,livekit,readAgent,agentEnabled:()=>agentConfig().enabled});
+  const sessions=createVoiceSessionService({store,config,secrets,livekit,readAgent,
+    readProfileLanguage:({userId})=>readProfileLanguage(pool,userId),agentEnabled:()=>agentConfig().enabled});
   const turns=createAgentTurnService({store,sessions,config,receiptKey:secrets.receiptKey||Buffer.alloc(32).toString('base64'),
     readAgent,handleAgent:args=>handleAgentMessage({pool,...args})});
   mountVoiceRoutes({app,authenticate,sessions,turns});

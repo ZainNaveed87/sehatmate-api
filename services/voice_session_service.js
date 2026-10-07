@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import jwt from 'jsonwebtoken';
+import {voiceLanguageProfile} from '../agent/agent_profile_language.js';
 
 import {
   genericSpeechCatalog,
@@ -50,6 +51,7 @@ export function createVoiceSessionService({
   secrets,
   livekit,
   readAgent,
+  readProfileLanguage,
   agentEnabled,
   now = Date.now,
 }) {
@@ -1079,12 +1081,12 @@ export function createVoiceSessionService({
                 id,
                 db,
               ),
-              agent => {
-                // readAgent is scoped to the authenticated owner and normalizes
-                // stored Agent languages. Roman Urdu is an output preference.
-                sttLanguage = ['ur', 'roman_ur'].includes(agent.language) ? 'ur' : 'en';
-              },
             );
+
+          const profile=voiceLanguageProfile(await readProfileLanguage({userId:row.userId}));
+          sttLanguage=profile.sttLanguage;
+          console.info(`VOICE_LANGUAGE:PROFILE_${profile.language.toUpperCase()}`);
+          console.info(`VOICE_LANGUAGE:STT_${sttLanguage.toUpperCase()}`);
 
           if (
             row.epoch !==
