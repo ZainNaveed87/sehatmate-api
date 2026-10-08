@@ -29,12 +29,12 @@ function provider(plan,reply='How can I help with your care?',fail=false) {
     prompts.push(args);
     if(args.systemPrompt.includes('planning stage')) return {json:plan,model:'mock'};
     if(fail) throw new Error('PRIVATE_PROVIDER_BODY');
-    if(args.systemPrompt.includes('product support review')) return {json:{supported:true,factIds:['cap_get_care_plans'],topic:'care_plan_support'},model:'mock'};
     return {json:{messageTemplate:reply},model:'mock'};
   }});
   return {p,prompts};
 }
-function route(category,calls=[]) {return {category,intent:'arbitrary_descriptive_label',capabilityCalls:calls,navigationIntent:null};}
+function route(category,calls=[]) {return {category,intent:'arbitrary_descriptive_label',capabilityCalls:calls,navigationIntent:null,
+  ...(category==='app_help'?{productFactIds:['product_identity','boundary_evidence','cap_get_care_plans']}:{})};}
 const taskCall={name:'get_next_task',args:{}};
 async function turn(message,plan,options={}) {
   const db=options.db??pool(); const {p,prompts}=provider(plan,options.reply,options.fail);
@@ -53,7 +53,7 @@ for(const message of [
     assert.equal(result.ok,true); assert.equal(result.fallbackCode,undefined);
     assert.equal(result.reply,'I can help explain verified care plans and supported care tasks.');
     assert.equal(db.queries.some(s=>s.includes('occurrence_date')||s.includes('FROM care_plans')),false);
-    assert.equal(prompts.length,3); // Plan, shared generation, then fail-closed product support review.
+    assert.equal(prompts.length,2); // Plan and shared selected-fact generation.
     assert.equal(result.navigation,null);
   }
 });
@@ -150,7 +150,7 @@ test('localized help uses natural generation with server-owned product facts',as
     ['Aap meri kis tarah madad kar sakte hain?','Main aap ke verified care plans samajhne mein madad kar sakta hoon.']]) {
     const {result,prompts}=await turn(message,route('app_help'),{reply});
     assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
-    assert.equal(prompts.length,3);
+    assert.equal(prompts.length,2);
   }
 });
 
@@ -199,12 +199,11 @@ test('missing category can be repaired once without executing the rejected plan'
     attempts++;
     if(systemPrompt.includes('planning stage')) return {json:attempts===1?
       {intent:'read_next_task',capabilityCalls:[taskCall],navigationIntent:null}:route('app_help')};
-    if(systemPrompt.includes('product support review')) return {json:{supported:true,factIds:['cap_get_care_plans'],topic:'care_plan_support'}};
     return {json:{messageTemplate:'I can explain verified care plans.'}};
   }});
   const r=await handleAgentMessage({pool:db,userId:'42',sessionId:'501',message:'What help do you provide?',provider:p});
   assert.equal(r.ok,true); assert.equal(r.fallbackCode,undefined); assert.match(r.reply,/care plans/);
-  assert.equal(attempts,4); assert.equal(db.queries.some(s=>s.includes('occurrence_date')),false);
+  assert.equal(attempts,3); assert.equal(db.queries.some(s=>s.includes('occurrence_date')),false);
 });
 
 test('reply diagnostics contain only fixed categories for all failure branches',async()=>{

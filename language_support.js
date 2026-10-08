@@ -109,6 +109,9 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'Can you reach the clinic or laboratory at the stated time?',
     legacyMedicineAccessQuestion:
       'Have you obtained the medicines listed in this verified plan?',
+    agentConversationUnavailable: "I couldn't answer that right now. Please try again.",
+    agentConversationClarify: "Could you clarify which part you mean?",
+    agentProductUnverified: "I cannot verify that product detail. I can explain SehatMate's registered capabilities if you tell me which area interests you.",
     agentUnavailable:
       'I could not complete that request right now. Nothing was changed. Please try again in a little while.',
     agentDisabled:
@@ -161,6 +164,9 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'کیا آپ مقررہ وقت پر کلینک یا لیبارٹری پہنچ سکتے ہیں؟',
     legacyMedicineAccessQuestion:
       'کیا آپ نے اس تصدیق شدہ منصوبے میں لکھی دوائیں حاصل کر لی ہیں؟',
+    agentConversationUnavailable: "میں ابھی جواب نہیں دے سکا۔ براہ کرم دوبارہ کوشش کریں۔",
+    agentConversationClarify: "براہ کرم واضح کریں کہ آپ کس بات کے بارے میں پوچھ رہے ہیں؟",
+    agentProductUnverified: "میں اس خاص تفصیل کی تصدیق نہیں کر سکتا۔ آپ بتائیں کس پہلو میں دلچسپی ہے، میں SehatMate کی دستیاب صلاحیتیں سمجھا سکتا ہوں۔",
     agentUnavailable:
       'میں ابھی یہ درخواست مکمل نہیں کر سکا۔ کچھ بھی تبدیل نہیں ہوا۔ براہ کرم تھوڑی دیر بعد دوبارہ کوشش کریں۔',
     agentDisabled:
@@ -213,6 +219,9 @@ const AI_FALLBACK_TEXT = Object.freeze({
       'Kya aap stated time par clinic ya laboratory pohanch sakte hain?',
     legacyMedicineAccessQuestion:
       'Kya aap ne is verified plan mein listed medicines hasil kar li hain?',
+    agentConversationUnavailable: "Main abhi jawab nahi de saka. Dobara koshish karein.",
+    agentConversationClarify: "Aap kis baat ke bare mein pooch rahe hain? Thora wazeh karein.",
+    agentProductUnverified: "Main is khaas tafseel ki tasdeeq nahi kar sakta. Aap batayein kis pehlu mein dilchaspi hai, main SehatMate ki available salahiyatein samjha sakta hoon.",
     agentUnavailable:
       'Main abhi yeh request complete nahi kar saka. Kuch bhi change nahi hua. Please thori der baad dobara try karein.',
     agentDisabled:

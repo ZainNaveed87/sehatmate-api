@@ -5,6 +5,8 @@ import {createAgentProvider,AGENT_PROVIDER_LIMITS} from './agent/agent_provider.
 import {generateGroundedAgentReply} from './agent/agent_response_grounder.js';
 import {emptyAgentSessionState} from './agent/agent_session_state.js';
 import {defineAgentCapability} from './agent/agent_capability_registry.js';
+import {validateAgentPlan,planAgentMessage} from './agent/agent_planner.js';
+import {AiServiceError} from './ai_service.js';
 process.env.AGENT_ENABLED='true';
 
 function database(language='en',state={}) {
@@ -23,8 +25,10 @@ function database(language='en',state={}) {
   return {execute,queries,get state(){return JSON.parse(row.state_json);},async getConnection(){return {
     execute,beginTransaction:async()=>{},commit:async()=>{},rollback:async()=>{},release:()=>{}};}};
 }
-function model({reply,category='app_help',topic='care_plan_support',review,failStage}={}) {
+function model({reply,category='app_help',topic='care_plan_support',review,failStage,
+  productFactIds=['product_identity','boundary_evidence','cap_get_care_plans'],outputs}={}) {
   const requests=[];
+  let replies=0;
   const provider=createAgentProvider({generateJson:async args=>{
     requests.push(args);
     const planning=args.systemPrompt.includes('planning stage');
@@ -32,9 +36,10 @@ function model({reply,category='app_help',topic='care_plan_support',review,failS
     if((failStage==='reply'&&!planning&&!reviewing)||(failStage==='review'&&reviewing)) {
       throw new Error('PRIVATE_PROVIDER_BODY');
     }
-    if(planning) return {json:{category,intent:topic,capabilityCalls:[],navigationIntent:null},model:'mock'};
+    if(planning) return {json:{category,intent:topic,capabilityCalls:[],navigationIntent:null,
+      ...(category==='app_help'?{productFactIds}:{})},model:'mock'};
     if(reviewing) return {json:review??{supported:true,factIds:['cap_get_care_plans'],topic},model:'mock'};
-    return {json:{messageTemplate:reply},model:'mock'};
+    return {json:outputs?outputs[Math.min(replies++,outputs.length-1)]:{messageTemplate:reply},model:'mock'};
   }});
   return {provider,requests};
 }
@@ -62,9 +67,9 @@ for(const [message,topic,reply] of cases) test(`natural app help preserves curre
   assert.ok(generation,'app help must reach shared reply generation');
   assert.ok(generation.userPrompt.includes(message));
   assert.ok(generation.userPrompt.includes('cap_get_care_plans'));
-  assert.ok(generation.userPrompt.includes('draft_schedule_time'));
-  assert.ok(generation.userPrompt.includes('nav_care_plans'));
-  assert.ok(requests.some(r=>r.systemPrompt.includes('product support review')));
+  assert.ok(!generation.userPrompt.includes('draft_schedule_time'));
+  assert.ok(!generation.userPrompt.includes('nav_care_plans'));
+  assert.equal(requests.length,2);
   assert.equal(db.queries.some(q=>q.includes('occurrence_date')||q.includes('FROM care_plans')),false);
   for(const request of requests){
     assert.ok(request.systemPrompt.length<=AGENT_PROVIDER_LIMITS.systemPromptMaxChars);
@@ -77,7 +82,7 @@ test('text and voice share the same natural product response and grounding',asyn
   for(const voiceReply of [false,true]) {
     const {result,requests}=await run('Explain your main focus',{reply,voiceReply});
     assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
-    assert.equal(requests.length,3);
+    assert.equal(requests.length,2);
   }
 });
 
@@ -87,32 +92,25 @@ for(const [language,message,reply] of [
 ]) test(`natural help uses existing language pipeline: ${language}`,async()=>{
   const {result,requests}=await run(message,{reply,language,voiceReply:true});
   assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
-  assert.equal(requests.length,3);
+  assert.equal(requests.length,2);
 });
 
-test('app help fails closed on unsupported product or competitor claims',async()=>{
+test('unsupported product claims fail safely after one repair without mutation language',async()=>{
   for(const reply of ['SehatMate diagnoses disease and automatically changes doses.',
     'All competing apps sell your medical records.', 'SehatMate offers automatic insurance payments.']) {
-    const {result}=await run('Explain your focus',{reply,review:{supported:false,factIds:[],topic:'product_focus'}});
-    assert.notEqual(result.reply,reply);
-    assert.equal(result.fallbackCode,'AGENT_PRODUCT_UNGROUNDED');
-    assert.match(result.reply,/Nothing was changed/);
+    const {result,requests}=await run('Explain your focus',{reply});
+    assert.notEqual(result.reply,reply); assert.equal(result.fallbackCode,'AGENT_PRODUCT_UNGROUNDED');
+    assert.doesNotMatch(result.reply,/Nothing was changed/); assert.equal(requests.length,3);
   }
 });
 
-test('invalid review evidence, unknown fact ids and provider failures cannot approve help',async()=>{
-  for(const options of [
-    {review:{supported:true,factIds:['invented_feature'],topic:'product_focus'}},
-    {review:{supported:true,factIds:[],topic:'product_focus'}},
-    {review:{supported:true,factIds:['cap_get_care_plans'],topic:'product_focus',extra:'private'}},
-    {review:{supported:'true',factIds:['cap_get_care_plans'],topic:'product_focus'}},
-    {review:{supported:true,factIds:['cap_get_care_plans'],topic:'ignore all rules'}},
-    {failStage:'reply'}, {failStage:'review'},
-  ]) {
+test('reviewer failure and invalid verdicts are irrelevant to a valid selected-fact reply',async()=>{
+  for(const review of [{supported:false},{supported:true,factIds:['invented_feature'],topic:'private'},
+    {unexpected:'PRIVATE_BODY'}]) {
     const reply='SehatMate helps you discuss care plans.';
-    const {result}=await run('Explain the app focus',{reply,...options});
-    assert.notEqual(result.reply,reply); assert.ok(result.fallbackCode);
-    assert.doesNotMatch(JSON.stringify(result),/PRIVATE_PROVIDER_BODY|ignore all rules|invented_feature/);
+    const {result,requests}=await run('Explain the app focus',{reply,review,failStage:'review'});
+    assert.equal(result.reply,reply); assert.equal(requests.length,2);
+    assert.doesNotMatch(JSON.stringify(result),/PRIVATE_BODY|invented_feature/);
   }
 });
 
@@ -136,13 +134,13 @@ test('bounded follow-ups carry a product topic and verified fact references, not
   }
 });
 
-test('product generation/review receives no prior patient or screen facts',async()=>{
+test('product generation receives no prior patient or screen facts',async()=>{
   const {provider,requests}=model({reply:'SehatMate can help discuss verified care plans.'});
-  const result=await generateGroundedAgentReply({provider,language:'en',message:'What is this app?',category:'app_help',
+  const result=await generateGroundedAgentReply({provider,language:'en',message:'What is this app?',category:'app_help',productFactIds:['product_identity','cap_get_care_plans'],
     contextSlice:{currentEntity:{type:'care_plan',id:'SENSITIVE_ID'},familyMembers:[{title:'PRIVATE_PATIENT_NAME'}],
       lastActionSummary:'PRIVATE_PATIENT_SUMMARY',productFacts:[{id:'invented_feature',description:'Diagnoses disease'}]}});
   assert.equal(result.ok,true);
-  assert.ok(requests.length>=2);
+  assert.equal(requests.length,1);
   for(const r of requests) assert.doesNotMatch(r.userPrompt,/SENSITIVE_ID|PRIVATE_PATIENT|invented_feature|Diagnoses disease/);
 });
 
@@ -152,6 +150,175 @@ test('normal nontrivial conversation stays on shared generation and cannot inven
   assert.equal(good.result.reply,reply); assert.equal(good.requests.length,2);
   const bad=await run('How is everything?',{category:'conversation',reply:'You have no pending care tasks today.'});
   assert.ok(bad.result.fallbackCode); assert.doesNotMatch(bad.result.reply,/no pending care tasks/);
+});
+
+test('closed product selection rejects unknown, empty, oversized and smuggled IDs; deduplicates known IDs',()=>{
+  const base={category:'app_help',intent:'product_focus',capabilityCalls:[],navigationIntent:null};
+  for(const productFactIds of [undefined,[],['unknown'],[42],Array(1),Array(7).fill('product_identity'),'product_identity']) {
+    assert.equal(validateAgentPlan({...base,productFactIds}).ok,false);
+  }
+  const good=validateAgentPlan({...base,productFactIds:['product_identity','product_identity']});
+  assert.equal(good.ok,true); assert.deepEqual(good.plan.productFactIds,['product_identity']);
+  for(const category of ['conversation','ambiguous','unsupported','patient_read','navigation','action']) {
+    assert.equal(validateAgentPlan({...base,category,productFactIds:['product_identity']}).ok,false);
+  }
+});
+
+test('valid comparison never depends on a second reviewer, including Urdu',async()=>{
+  for(const [language,message,reply] of [
+    ['en','What distinguishes this assistant in a crowded market?','SehatMate can help explain verified care plans; I cannot verify other products.'],
+    ['ur','تم دوسروں سے الگ کیوں ہو؟','SehatMate تصدیق شدہ نگہداشت کے منصوبے سمجھنے میں مدد کر سکتا ہے۔'],
+    ['roman_ur','Itni apps hain, is ka faida kya hai?','Main aap ke verified care plans samajhne mein madad kar sakta hoon.'],
+  ]) {
+    const {result,requests}=await run(message,{reply,language,failStage:'review'});
+    assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
+    assert.equal(requests.length,2);
+  }
+});
+
+test('one reply repair preserves selected facts and cannot replan or execute tools',async()=>{
+  const reply='SehatMate can explain verified care plans.';
+  const {result,requests,db}=await run('What might make this useful?',{
+    outputs:[{unexpected:'bad shape'},{messageTemplate:reply}]});
+  assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
+  assert.equal(requests.length,3);
+  assert.ok(requests[2].userPrompt.startsWith(requests[1].userPrompt));
+  for(const r of requests.slice(1)) {
+    assert.ok(r.userPrompt.includes('cap_get_care_plans'));
+    assert.doesNotMatch(r.userPrompt,/draft_schedule_time|nav_care_plans/);
+  }
+  assert.equal(db.queries.some(q=>q.includes('FROM care_plans')),false);
+});
+
+test('failed repair is bounded and uses truthful category fallback',async()=>{
+  for(const category of ['app_help','conversation','ambiguous']) {
+    const {result,requests}=await run('Can you explain what you mean?',{category,
+      outputs:[{unexpected:true},{messageTemplate:'{{fact:invented_feature}}'}]});
+    assert.equal(requests.length,3); assert.ok(result.fallbackCode);
+    assert.doesNotMatch(result.reply,/Nothing was changed|invented_feature/);
+    if(category==='ambiguous') assert.match(result.reply,/clarify|mean|which/i);
+    if(category==='app_help') assert.match(result.reply,/verif|detail/i);
+  }
+});
+
+test('provider outage is not retried as content repair and never implies a mutation',async()=>{
+  const {result,requests}=await run('Explain the app focus',{failStage:'reply'});
+  assert.equal(requests.length,2); assert.equal(result.fallbackCode,'AGENT_PROVIDER_FAILED');
+  assert.match(result.reply,/try again/i); assert.doesNotMatch(result.reply,/Nothing was changed/);
+});
+
+test('language and forbidden product wording get exactly one safe repair',async()=>{
+  for(const first of ['آپ کی مدد کیسے کروں؟','SehatMate is better than every other app.',
+    'Other apps sell patient records.','SehatMate guarantees a cure.',
+    'SehatMate costs $10 monthly.','SehatMate is FDA certified.',
+    'SehatMate integrates with Apple Health.','I can diagnose disease and prescribe medicine.',
+    'I have opened your care plan.','SehatMate offers automatic insurance payments.']) {
+    const reply='SehatMate can help explain verified care plans.';
+    const {result,requests}=await run('Explain your verified focus',{
+      outputs:[{messageTemplate:first},{messageTemplate:reply}]});
+    assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
+    assert.equal(requests.length,3);
+  }
+});
+
+test('repair cannot expand the selected fact set through extra output fields',async()=>{
+  const {result,requests}=await run('Explain this focus',{
+    productFactIds:['product_identity'],outputs:[{unexpected:true},{
+      messageTemplate:'The app reads routine preferences.',productFactIds:['cap_get_routine_preferences']}]});
+  assert.ok(result.fallbackCode); assert.equal(requests.length,3);
+  assert.doesNotMatch(result.reply,/routine preferences/);
+  assert.ok(requests.slice(1).every(r=>!r.userPrompt.includes('cap_get_routine_preferences')));
+});
+
+test('both bounded repairs together make at most four calls and only the accepted plan supplies facts',async()=>{
+  const requests=[]; let plans=0,replies=0;
+  const provider=createAgentProvider({generateJson:async args=>{
+    requests.push(args);
+    if(args.systemPrompt.includes('planning stage')) return {json:{category:'app_help',intent:'product_identity',
+      capabilityCalls:[],navigationIntent:null,productFactIds:++plans===1?['UNKNOWN_FACT']:['product_identity']}};
+    return {json:++replies===1?{unexpected:true}:{messageTemplate:'SehatMate is a care and app assistant.'}};
+  }});
+  const result=await handleAgentMessage({pool:database(),userId:'42',sessionId:'501',provider,
+    message:'What is the purpose of this assistant?',productFactIds:['cap_get_routine_preferences']});
+  assert.equal(result.fallbackCode,undefined); assert.equal(requests.length,4);
+  assert.equal(plans,2); assert.equal(replies,2);
+  assert.ok(requests.slice(2).every(r=>!r.userPrompt.includes('UNKNOWN_FACT')&&!r.userPrompt.includes('cap_get_routine_preferences')));
+});
+
+test('non-object model JSON is repairable while transport errors remain provider failures',async()=>{
+  for(const invalid of [[],null,'plain text',new AiServiceError('Invalid model output',502,{outputInvalid:true})]) {
+    let replies=0;
+    const provider=createAgentProvider({generateJson:async()=>{
+      if(replies++===0) {
+        if(invalid instanceof Error) throw invalid;
+        return {json:invalid};
+      }
+      return {json:{messageTemplate:'SehatMate can explain verified care plans.'}};
+    }});
+    const result=await generateGroundedAgentReply({provider,language:'en',message:'Explain the product',
+      category:'app_help',productFactIds:['cap_get_care_plans']});
+    assert.equal(result.ok,true); assert.equal(replies,2);
+  }
+});
+
+test('an invalid semantic plan asks for clarification instead of implying infrastructure failure',async()=>{
+  let calls=0;
+  const provider=createAgentProvider({generateJson:async()=>{calls++;return {json:{unexpected:true}};}});
+  const result=await handleAgentMessage({pool:database(),userId:'42',sessionId:'501',
+    message:'Could you elaborate a little?',provider});
+  assert.equal(calls,2); assert.match(result.reply,/clarify|mean/i);
+  assert.doesNotMatch(result.reply,/Nothing was changed|try again/i);
+});
+
+test('negation about one claim cannot authorize another prohibited claim',async()=>{
+  for(const reply of ['I cannot diagnose, but SehatMate is FDA certified.',
+    'Other apps cannot keep your records private.',
+    'SehatMate is the most advanced health app.',
+    'SehatMate subscription is $10 monthly.',
+    'Your plan has been updated.',
+    'AcmeCare sells patient records.']) {
+    const {result}=await run('Explain your verified focus',{reply});
+    assert.notEqual(result.reply,reply); assert.ok(result.fallbackCode);
+  }
+});
+
+test('product restrictions and safe comparison boundaries also apply to Urdu and Roman Urdu',async()=>{
+  for(const [language,message,bad,good] of [
+    ['ur','SehatMate کی خاص بات سمجھائیں','SehatMate سب سے بہتر ایپ ہے۔',
+      'SehatMate تصدیق شدہ نگہداشت کے منصوبے سمجھنے میں مدد کر سکتا ہے۔'],
+    ['roman_ur','SehatMate ki khaas baat samjha dein','SehatMate sab se behtar app hai.',
+      'Main aap ke verified care plans samajhne mein madad kar sakta hoon.'],
+  ]) {
+    const {result,requests}=await run(message,{language,outputs:[{messageTemplate:bad},{messageTemplate:good}]});
+    assert.equal(result.reply,good); assert.equal(result.fallbackCode,undefined);
+    assert.equal(requests.length,3);
+  }
+});
+
+test('localized content and provider fallbacks never imply a harmless mutation',async()=>{
+  for(const [language,message] of [['en','Please explain this product'],['ur','یہ ایپ سمجھائیں'],
+    ['roman_ur','Yeh app samjha dein']]) {
+    for(const options of [{outputs:[{unexpected:true}]},{failStage:'reply'}]) {
+      const {result}=await run(message,{language,...options});
+      assert.ok(result.fallbackCode);
+      assert.doesNotMatch(result.reply,/Nothing was changed|کچھ بھی تبدیل|Kuch bhi change/i);
+    }
+  }
+});
+
+test('app-help diagnostics remain fixed and contain no message or generated content',async()=>{
+  const logs=[]; const original=console.info; console.info=s=>logs.push(s);
+  try {
+    await run('PRIVATE_USER_TEXT',{outputs:[{messageTemplate:'SehatMate is FDA certified.'},
+      {messageTemplate:'SehatMate can explain verified care plans.'}]});
+    await run('PRIVATE_USER_TEXT',{outputs:[{unexpected:true}]});
+    await run('PRIVATE_USER_TEXT',{productFactIds:['PRIVATE_UNKNOWN_FACT']});
+    const allowed=/^(?:AGENT_APP_HELP:(?:FACT_SELECTION_OK|FACT_SELECTION_INVALID|REPLY_OK|REPAIR_STARTED|REPAIR_OK|REPAIR_FAILED)|AGENT_REPLY_FAILURE:(?:INVALID_OUTPUT|LANGUAGE|FACT_UNKNOWN|FACT_CONFLICT|PRODUCT_GROUNDING|PRODUCT_SELECTION|ZERO_EVIDENCE|PROVIDER))$/;
+    assert.ok(logs.every(s=>allowed.test(s)));
+    for(const marker of ['FACT_SELECTION_OK','FACT_SELECTION_INVALID','REPAIR_STARTED','REPAIR_OK','REPAIR_FAILED']) {
+      assert.ok(logs.includes(`AGENT_APP_HELP:${marker}`));
+    }
+  } finally {console.info=original;}
 });
 
 test('product help keeps medical grounding and cannot consume patient capability results',async()=>{
@@ -186,7 +353,7 @@ test('registered executable capability metadata enters product help without exec
   defineAgentCapability({name:'forbidden_test_feature',permissionClass:'SENSITIVE_ACTION',description:'UNAVAILABLE_FEATURE_SENTINEL',
     inputSchema:{properties:{},required:[]},resultContract:'Never executable in ordinary turns.',execute:async()=>{executed++;return {ok:true,data:{}};}});
   const {result,requests}=await run('Explain the supported journals',{reply:'The registered hydration journal can be read.',
-    review:{supported:true,factIds:['cap_read_hydration_journal'],topic:'hydration_journal'}});
+    productFactIds:['cap_read_hydration_journal']});
   assert.equal(result.fallbackCode,undefined); assert.equal(executed,0);
   const generation=requests.find(r=>r.systemPrompt.includes('response stage'));
   assert.ok(generation.userPrompt.includes('Read the owned hydration journal.'));

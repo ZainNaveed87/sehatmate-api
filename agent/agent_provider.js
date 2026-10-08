@@ -157,10 +157,10 @@ export function createAgentProvider(overrides = {}) {
       });
 
       if (!isPlainObjectJson(completion?.json)) {
-        return providerFailure(
+        return {...providerFailure(
           'AGENT_PROVIDER_FAILED',
           'The AI provider returned invalid JSON.',
-        );
+        ),failureClass:'GROUNDING_REPAIRABLE'};
       }
 
       return {
@@ -181,7 +181,8 @@ export function createAgentProvider(overrides = {}) {
         typeof error.message === 'string' && error.message.trim()
         ? error.message
         : 'The AI provider request failed.';
-      return providerFailure('AGENT_PROVIDER_FAILED', sanitized);
+      return {...providerFailure('AGENT_PROVIDER_FAILED', sanitized),
+        ...(error?.name==='AiServiceError'&&error.outputInvalid===true?{failureClass:'GROUNDING_REPAIRABLE'}:{})};
     }
   }
 

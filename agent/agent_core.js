@@ -12,7 +12,7 @@
  *     -> validated capability executions (registry + safety gateway, max 3)
  *     -> audited READ results from authoritative backend services
  *     -> navigation authorization (ownership BEFORE emit)
- *     -> grounded reply (plus one product-support review for app_help)
+ *     -> grounded reply (at most one content repair for zero-tool conversation)
  *     -> bounded session state update (referenced entities + summary only)
  *
  * Safety properties (spec sections 8-22):
@@ -22,11 +22,9 @@
  *     when the safety gateway rejects a non-executable permission class
  *     outright. Nothing ever executes in either case.
  *   - The provider is called at most four times per message (up to two
- *     planning turns, one reply turn, and one app-help support review) through
+ *     planning turns and up to two zero-tool reply turns) through
  *     the injectable provider seam.
- *     Every unrepaired provider or model-output failure maps to the
- *     localized deterministic
- *     agentUnavailable fallback: the agent never claims an action happened,
+ *     Failures map to localized provider, conversational or action fallbacks: the agent never claims an action happened,
  *     never invents stats, medication facts, care gaps, or navigation
  *     (spec 22).
  *   - Every actual capability execution is audited via recordAgentAction
@@ -1494,7 +1492,10 @@ async function handleAgentMessageInternal({
         userId,
         session,
         reply: localizedAgentText(
-          denied ? 'agentPermissionDenied' : 'agentUnavailable',
+          denied ? 'agentPermissionDenied' :
+            (planned.code==='AGENT_PRODUCT_FACT_SELECTION_INVALID'?'agentProductUnverified':
+             (planned.failureClass!=='GROUNDING_REPAIRABLE'&&['AGENT_PROVIDER_FAILED','AGENT_PROVIDER_UNCONFIGURED','AGENT_PROMPT_TOO_LARGE'].includes(planned.code)
+              ?'agentConversationUnavailable':'agentConversationClarify')),
           language,
         ),
         fallbackCode: planned.code,
@@ -1742,6 +1743,8 @@ async function handleAgentMessageInternal({
         capabilityResults,
         voiceReply,
         category: plan.category,
+        productFactIds: plan.productFactIds,
+        productTopic: plan.intent,
       });
       if (voiceReply) recordVoiceLatency('GROUNDED_REPLY',replyStarted);
       if (replyResult.ok) {
@@ -1763,7 +1766,11 @@ async function handleAgentMessageInternal({
           // still returning the already-verified authoritative task facts.
           fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
         } else {
-          reply = localizedAgentText('agentUnavailable', language);
+          const zeroTool=['app_help','conversation','ambiguous'].includes(plan.category)&&capabilityResults.length===0;
+          const fallback= !zeroTool?'agentUnavailable':
+            replyResult.failureClass==='PROVIDER_UNAVAILABLE'?'agentConversationUnavailable':
+            plan.category==='app_help'?'agentProductUnverified':'agentConversationClarify';
+          reply = localizedAgentText(fallback, language);
           fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
         }
       }

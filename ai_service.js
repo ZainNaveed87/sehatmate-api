@@ -10,6 +10,7 @@ export class AiServiceError extends Error {
     super(message);
     this.name = 'AiServiceError';
     this.statusCode = statusCode;
+    this.outputInvalid = details.outputInvalid === true;
     this.upstreamStatus = details.upstreamStatus || null;
     this.providerCode = details.providerCode || null;
     this.providerName = details.providerName || null;
@@ -315,11 +316,11 @@ export async function generateAiJson({
   try {
     json = JSON.parse(completion.text);
   } catch {
-    throw new AiServiceError('The AI provider returned invalid JSON.');
+    throw new AiServiceError('The AI provider returned invalid JSON.',502,{outputInvalid:true});
   }
 
   if (!json || typeof json !== 'object' || Array.isArray(json)) {
-    throw new AiServiceError('The AI provider returned invalid JSON.');
+    throw new AiServiceError('The AI provider returned invalid JSON.',502,{outputInvalid:true});
   }
 
   return {

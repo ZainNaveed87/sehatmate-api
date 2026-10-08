@@ -64,6 +64,7 @@ import {
 import { defaultAgentProvider } from './agent_provider.js';
 import {timeVoiceStage} from './agent_voice_quality.js';
 import {AGENT_SEMANTIC_CATEGORIES,reviewSemanticRoute} from './agent_semantic_routes.js';
+import {buildAgentProductContext,selectAgentProductFacts} from './agent_product_context.js';
 import { cleanText, idPattern } from '../services/shared_utils.js';
 
 /** Defensive planner-side bound on the user message (endpoint bounds it too). */
@@ -87,6 +88,7 @@ const RESOLVED_REFERENCE_NAV_PARAM_BY_TYPE = Object.freeze({
 const RECOVERABLE_PLANNING_FAILURES = new Set([
   'AGENT_PROVIDER_FAILED',
   'AGENT_PLAN_INVALID',
+  'AGENT_PRODUCT_FACT_SELECTION_INVALID',
   'UNKNOWN_CAPABILITY',
   'INVALID_AGENT_CAPABILITY_CALLS',
   'INVALID_CAPABILITY_ARGS',
@@ -119,7 +121,7 @@ function capabilityCatalogLines() {
     .filter((capability) => isExecutableAgentPermissionClass(capability.permissionClass))
     .map(
       (capability) =>
-        `- ${capability.name}${argSummary(capability.inputSchema)} — ${capability.description}`,
+        `- ${capability.name}${argSummary(capability.inputSchema)}`,
     );
 }
 
@@ -227,8 +229,8 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     '- You can never plan direct changes to medicines, doses, units, routes, prescribed frequencies, prescribed durations, verified clinical instructions, or fixed verified exact medicine times. If the user asks for a forbidden clinical change, plan zero capability calls and use an intent label that says so (for example: decline_change_request).',
     '- Use only capability names from the provided catalog, at most 3 capability calls.',
     '- Capability args use only the declared argument names, never a userId. Entity ids are numeric strings.',
-    '- Phase E reference resolution is server-owned. When verified context contains referenceResolution.status="resolved", any entity-bearing capability/navigation MUST use exactly referenceResolution.entity.type/id. Never substitute another id.',
-    '- Explicit current-turn entity resolution overrides stale currentFocus. currentFocus is only a conversational pointer, never factual truth.',
+    '- Resolved references are server-owned: entity-bearing tools/navigation MUST use exactly referenceResolution.entity.type/id when status=resolved.',
+    '- Explicit current entity overrides stale currentFocus; pointers are never facts.',
     '- For ordinal wording such as "pehla wala" / "first one", use only the server-provided recentOrderedEntityList/referenceResolution. Never infer an id from an arbitrary number.',
     '- If referenceResolution is absent, you may use currentEntity/currentFocus/recentEntities only when the request is not ambiguous. Do not guess or invent ids.',
     '- Entity types are not interchangeable: care_gap ids can never be used as care_plan ids and vice versa.',
@@ -246,6 +248,7 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     '- Classify the full CURRENT request using the semantic categories below. Conversation/app_help/unsupported/ambiguous require zero tools and no navigation. Tools require actual data/action/navigation necessity; isolated words and old intents never justify task queries.',
     'Output exactly this JSON shape and nothing else:',
     '{"category":"semantic_category","intent":"short_snake_case_label","capabilityCalls":[{"name":"capability_name","args":{}}],"navigationIntent":null}',
+    'Only app_help MUST add productFactIds: 1-6 relevant IDs from the server product catalog, including boundary_evidence for comparisons. Other categories MUST omit productFactIds. Never invent facts or IDs.',
     'navigationIntent is null or {"target":"target_name","params":{}}.',
   ].join('\n');
 
@@ -261,6 +264,9 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     '- Generic help, today, what is happening, or app names alone are NOT task requests. Next-task/today-task tools require a request for actual tasks, pending work or schedule.',
     '- Use a brief descriptive snake_case intent label for the current meaning, including the topic of a follow-up; never store user text or patient details in the label.',
     '- Previous task queries do not convert an unrelated current message into a task follow-up. Category is mandatory; intent remains descriptive only.',
+    '',
+    'Server-owned product catalog (descriptions also explain tools; selection is metadata, never execution):',
+    JSON.stringify(buildAgentProductContext()),
     '',
     'Available normal-turn capabilities:',
     ...capabilityCatalogLines(),
@@ -325,6 +331,9 @@ export function buildAgentPlannerRepairPrompt({
     'conversation/app_help/unsupported/ambiguous use zero tools and no navigation. patient_read requires needed READ data; navigation requires a screen; action requires a DRAFT.',
     'Infer the full current meaning, not individual words or a stale task intent.',
     `Failure code: ${safeFailureCode(failureCode)}.`,
+    'Only app_help requires productFactIds (1-6 relevant registered IDs); all other categories omit it.',
+    'Server product catalog:',
+    JSON.stringify(buildAgentProductContext()),
     'Do not invent IDs.',
     'Do not include userId or user_id.',
     'Do not plan mutations or safety-sensitive changes.',
@@ -361,7 +370,7 @@ export function validateAgentPlan(rawPlan, {requireCategory=false} = {}) {
     return invalidPlan('Plan must be a plain object.');
   }
   for (const key of Object.keys(rawPlan)) {
-    if (key !== 'category' && key !== 'intent' && key !== 'capabilityCalls' && key !== 'navigationIntent') {
+    if (key !== 'category' && key !== 'intent' && key !== 'capabilityCalls' && key !== 'navigationIntent' && key !== 'productFactIds') {
       return invalidPlan(`Plan has an unknown field: ${key}.`);
     }
   }
@@ -369,6 +378,15 @@ export function validateAgentPlan(rawPlan, {requireCategory=false} = {}) {
   if ((requireCategory || rawPlan.category !== undefined) &&
       !AGENT_SEMANTIC_CATEGORIES.includes(rawPlan.category)) {
     return invalidPlan('A closed semantic category is required.');
+  }
+  let selection=null;
+  if(rawPlan.category==='app_help') {
+    selection=selectAgentProductFacts(rawPlan.productFactIds);
+    console.info(`AGENT_APP_HELP:FACT_SELECTION_${selection.ok?'OK':'INVALID'}`);
+    if(!selection.ok) return selection;
+  } else if(Object.hasOwn(rawPlan,'productFactIds')) {
+    console.info('AGENT_APP_HELP:FACT_SELECTION_INVALID');
+    return invalidPlan('Product fact selection is only allowed for app help.');
   }
   const intent = cleanText(rawPlan.intent, AGENT_PLANNER_LIMITS.intentMaxChars);
   if (!intent) {
@@ -429,7 +447,8 @@ export function validateAgentPlan(rawPlan, {requireCategory=false} = {}) {
   return {
     ok: true,
     plan: { intent, capabilityCalls, navigationIntent,
-      ...(rawPlan.category !== undefined ? {category:rawPlan.category} : {}) },
+      ...(rawPlan.category !== undefined ? {category:rawPlan.category} : {}),
+      ...(selection?{productFactIds:selection.productFactIds}:{}) },
   };
 }
 
