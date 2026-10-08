@@ -11,6 +11,8 @@ import jwt from 'jsonwebtoken';
 import mysql from 'mysql2/promise';
 import {installVoiceBackend,voiceHttpError} from './agent/agent_voice_routes.js';
 import {mountAgentSessionRoutes} from './agent/agent_session_routes.js';
+import {mountAgentCopilotRoutes} from './agent/agent_copilot_routes.js';
+import {validateCopilotClientContext} from './agent/agent_ui_protocol.js';
 
 import {
   AiServiceError,
@@ -1726,6 +1728,7 @@ app.post(
 
 const voiceBackend = installVoiceBackend({app,pool,lockPool:voiceLockPool,sessionLockPool:voiceLifecycleLockPool,authenticate});
 mountAgentSessionRoutes({app,pool,authenticate,limiter:agentLimiter});
+mountAgentCopilotRoutes({app,pool,authenticate,limiter:agentLimiter,validateContext:validateCopilotClientContext});
 
 app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next) => {
   try {
@@ -1795,6 +1798,9 @@ app.post('/api/agent/message', authenticate, agentLimiter, async (req, res, next
         clarification: result.clarification,
         actionStatus: result.actionStatus,
         referencedEntities: result.referencedEntities,
+        ...(result.uiPlan ? {uiPlan:result.uiPlan} : {}),
+        ...(result.memoryProposal ? {memoryProposal:result.memoryProposal} : {}),
+        ...(result.conflicts?.length ? {conflicts:result.conflicts} : {}),
         ...(speech ? { speech } : {}),
         ...(result.fallbackCode ? { fallbackCode: result.fallbackCode } : {}),
       },

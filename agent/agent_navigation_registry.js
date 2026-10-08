@@ -53,6 +53,7 @@ const ENTITY_TITLE_MAX_LENGTH = 200;
 export const AGENT_NAVIGATION_TARGETS = Object.freeze({
   home: Object.freeze({ params: Object.freeze({}) }),
   today: Object.freeze({ params: Object.freeze({}) }),
+  progress: Object.freeze({ params: Object.freeze({}) }),
   care_plans: Object.freeze({ params: Object.freeze({}) }),
   care_plan_detail: Object.freeze({
     params: Object.freeze({ carePlanId: 'required' }),
@@ -138,7 +139,7 @@ export function listAgentNavigationTargets() {
  */
 export function resolveAgentNavigationTarget(target) {
   if (typeof target !== 'string') return null;
-  return AGENT_NAVIGATION_TARGETS[target] || null;
+  return Object.hasOwn(AGENT_NAVIGATION_TARGETS, target) ? AGENT_NAVIGATION_TARGETS[target] : null;
 }
 
 /**

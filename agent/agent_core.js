@@ -124,6 +124,10 @@ import {voiceConversationReply,recordVoiceLatency,runVoiceTiming,timeVoiceStage,
 import {readProfileLanguage} from './agent_profile_language.js';
 import {productConversationContext,productConversationSummary} from './agent_product_context.js';
 import {unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic_routes.js';
+import {validateAgentUiContext,buildAgentUiPlan} from './agent_ui_protocol.js';
+import {readCopilotContext,saveCopilotPlan} from './agent_copilot_store.js';
+import {readRelevantAgentMemory,rememberVerifiedAgentPatterns} from './agent_memory.js';
+import {conflictsFromToolResults} from './agent_conflicts.js';
 import {
   cleanText,
   idPattern,
@@ -857,6 +861,9 @@ async function persistAgentTurn({
   actionStatus = null,
   language = session.language,
   conversationalSummary = null,
+  uiPlan = null,
+  memoryProposal = null,
+  conflicts = [],
 }) {
   const nextState = buildNextSessionState({
     sessionState: session.state,
@@ -922,6 +929,9 @@ async function persistAgentTurn({
     confirmation,
     clarification: clarification && stateUpdate?.ok === true ? clarification : null,
     actionStatus,
+    ...(uiPlan ? {uiPlan} : {}),
+    ...(memoryProposal ? {memoryProposal} : {}),
+    ...(conflicts.length ? {conflicts} : {}),
     referencedEntities: buildReferencedEntities({
       screenEntity,
       navigationEntity,
@@ -1373,7 +1383,23 @@ async function handleAgentMessageInternal({
       });
     }
 
-    const conversation=!isClarificationTurn
+    // Voice turns obtain exactly the same authenticated UI context as typing.
+    // No Worker transport changes or second intent model are involved.
+    if(!clientContext?.ui) {
+      const currentUi=await readCopilotContext({db:pool,userId,sessionId:session.id});
+      if(currentUi) clientContext=currentUi;
+    }
+    let clientUi=null;
+    if(clientContext?.ui!==undefined) {
+      const validatedUi=validateAgentUiContext(clientContext.ui);
+      if(!validatedUi.ok||validatedUi.context.screenId!==clientContext.screenId) {
+        console.info('AGENT_UI:STALE_CONTEXT');
+        return {ok:false,code:'AGENT_UI_INVALID_CONTEXT',message:'The current screen context is unavailable.'};
+      }
+      clientUi=validatedUi.context;
+      console.info('AGENT_UI:CONTEXT_ACCEPTED');
+    }
+    const conversation=!isClarificationTurn&&!clientUi
       ? timeVoiceSync('FAST_PATH',()=>voiceConversationReply({message,language,state:session.state,clientContext}))
       : null;
     if (conversation) {
@@ -1456,6 +1482,8 @@ async function handleAgentMessageInternal({
         referenceResolution: referenceResolutionContext(referenceResolution),
       }),
       conversationTopic: productConversationContext(session.state.lastActionSummary),
+      ...(clientUi?{clientUi}:{}),
+      relevantMemory:await readRelevantAgentMemory({db:pool,userId,screenId:clientUi?.screenId||context.screenContext?.screenId}),
     });
 
     // --- deterministic resolved-reference navigation or bounded planning ---
@@ -1718,6 +1746,10 @@ async function handleAgentMessageInternal({
     }
 
     if (voiceReply && plan.navigationIntent) recordVoiceLatency('TOOLS',navigationStarted);
+    const conflicts=conflictsFromToolResults({toolResults:capabilityResults,memory:contextSlice.relevantMemory});
+    // Optional longitudinal inference never changes or blocks the real action
+    // result. It requires actual multi-day server evidence, never client prose.
+    try {await rememberVerifiedAgentPatterns({db:pool,userId,toolResults:capabilityResults});} catch { /* storage unavailable: no inferred memory claim */ }
     // --- grounded reply (or the deterministic denial) ---
     let reply;
     let fallbackCode = null;
@@ -1739,7 +1771,7 @@ async function handleAgentMessageInternal({
         provider,
         language,
         message: boundedMessage,
-        contextSlice,
+        contextSlice:{...contextSlice,...(conflicts.length?{operationalConflicts:conflicts}:{})},
         capabilityResults,
         voiceReply,
         category: plan.category,
@@ -1776,6 +1808,21 @@ async function handleAgentMessageInternal({
       }
     }
 
+    let uiPlan=null;
+    if(plan.uiOperations?.length&&!fallbackCode&&!declined) {
+      const current=await readCopilotContext({db:pool,userId,sessionId:session.id});
+      if(current?.ui && (current.ui.version!==clientUi?.version||current.ui.screenId!==clientUi?.screenId)) {
+        console.info('AGENT_UI:STALE_CONTEXT'); fallbackCode='AGENT_UI_STALE_CONTEXT';
+      } else {
+        const proposal=buildAgentUiPlan({context:clientUi,operations:plan.uiOperations});
+        try {
+          if(!proposal) throw new Error();
+          const persisted=await saveCopilotPlan({db:pool,userId,sessionId:session.id,plan:proposal});
+          if(!persisted.ok) throw new Error();
+          uiPlan=proposal;
+        } catch {fallbackCode='AGENT_UI_PERSISTENCE_FAILED';}
+      }
+    }
     return finishAgentTurn({
       pool,
       userId,
@@ -1791,6 +1838,9 @@ async function handleAgentMessageInternal({
       screenEntity,
       language,
       conversationalSummary,
+      uiPlan,
+      memoryProposal:!fallbackCode?plan.memoryProposal:null,
+      conflicts,
     });
   } catch {
     return {

@@ -2,7 +2,7 @@ import {resolveAgentCapability} from './agent_capability_registry.js';
 import {canonicalAgentLanguage} from './agent_session_store.js';
 
 export const AGENT_SEMANTIC_CATEGORIES=Object.freeze([
-  'conversation','app_help','patient_read','navigation','action','unsupported','ambiguous',
+  'conversation','app_help','patient_read','navigation','action','unsupported','ambiguous','ui_guidance',
 ]);
 
 export function unsupportedAgentReply(language) {
@@ -11,8 +11,9 @@ export function unsupportedAgentReply(language) {
     roman_ur:'Main SehatMate ke supported care aur app sawalon mein madad kar sakta hoon. Aap ko kis cheez mein madad chahiye?'}[canonicalAgentLanguage(language)];
 }
 
-export function reviewSemanticRoute(category,calls,navigation) {
+export function reviewSemanticRoute(category,calls,navigation,uiOperations=[]) {
   if(!AGENT_SEMANTIC_CATEGORIES.includes(category)) return false;
+  if(category==='ui_guidance') return uiOperations.length>0&&!navigation&&calls.every(c=>resolveAgentCapability(c.name)?.permissionClass==='READ');
   if(['conversation','app_help','unsupported','ambiguous'].includes(category)) return calls.length===0&&!navigation;
   if(category==='patient_read') return calls.length>0&&!navigation&&calls.every(c=>resolveAgentCapability(c.name)?.permissionClass==='READ');
   if(category==='navigation') return Boolean(navigation)&&calls.every(c=>resolveAgentCapability(c.name)?.permissionClass==='READ');
