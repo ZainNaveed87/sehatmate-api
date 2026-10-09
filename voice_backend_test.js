@@ -201,6 +201,27 @@ test('rejects interim transcripts, forged identity, stale epoch and ambiguous co
   await expectCode(submit({...s.input,epoch:0}),'VOICE_STALE_EPOCH');
   await expectCode(submit({epoch:1,turnId:'c',confirmation:{confirmationId:'other',decision:'confirm'}}),'VOICE_CONFIRMATION_NOT_CURRENT');
 });
+for(const decision of ['confirm','cancel'])test(`voice ${decision} accepts the current care-plan workflow confirmation`,async()=>{
+  let calls=0;const s=await turnSetup(async()=>{calls++;return {ok:true,reply:'Reviewed',actionStatus:decision==='confirm'?'confirmed':'cancelled',taskWorkflow:s.agent.state.taskWorkflow};});
+  s.agent.state.pendingConfirmation=null;
+  s.agent.state.taskWorkflow={workflowId:'workflow-1',kind:'create_care_plan',revision:2,status:'awaiting_confirmation',fields:{title:'Ali'},confirmationId:'task-confirm',expiresAt:'2999-01-01T00:00:00.000Z'};
+  const input={epoch:1,turnId:`task-${decision}`,confirmation:{confirmationId:'task-confirm',decision}};
+  const result=await s.service.submit({userId:'1',id:s.a.id,input});
+  assert.equal(result.status,'completed');assert.equal(result.result.taskWorkflow.workflowId,'workflow-1');assert.equal(calls,1);
+  await s.service.submit({userId:'1',id:s.a.id,input:{...input,turnId:`task-${decision}-retry`}});assert.equal(calls,1);
+});
+test('voice can replay a matching text-completed task receipt but rejects wrong/expired/cancel decisions',async()=>{
+  let calls=0;const s=await turnSetup(async()=>{calls++;return {ok:true,reply:'Already created',taskWorkflow:s.agent.state.taskWorkflow};});
+  s.agent.state.pendingConfirmation=null;
+  const pending={workflowId:'workflow-1',kind:'create_care_plan',revision:2,status:'awaiting_confirmation',fields:{title:'Ali'},confirmationId:'task-confirm',expiresAt:'2999-01-01T00:00:00.000Z'};
+  const submit=(confirmationId,decision='confirm')=>s.service.submit({userId:'1',id:s.a.id,input:{epoch:1,turnId:`try-${confirmationId}-${decision}`,confirmation:{confirmationId,decision}}});
+  s.agent.state.taskWorkflow={...pending,expiresAt:'2000-01-01T00:00:00.000Z'};
+  await expectCode(submit('task-confirm'),'VOICE_CONFIRMATION_NOT_CURRENT');
+  s.agent.state.taskWorkflow={...pending,status:'completed',completedReceipt:{confirmationId:'task-confirm',planId:'17',title:'Ali'}};
+  await expectCode(submit('foreign'),'VOICE_CONFIRMATION_NOT_CURRENT');
+  await expectCode(submit('task-confirm','cancel'),'VOICE_CONFIRMATION_NOT_CURRENT');
+  assert.equal((await submit('task-confirm')).status,'completed');assert.equal(calls,1);
+});
 test('duplicate confirmation with another turn ID cannot execute again',async()=>{
   let calls=0;const s=await turnSetup(async()=>{calls++;s.agent.state.pendingConfirmation=null;return {ok:true,reply:'Done',actionStatus:'confirmed'};});
   const input={epoch:1,turnId:'confirm-a',confirmation:{confirmationId:'approve-1',decision:'confirm'}};

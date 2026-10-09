@@ -5,7 +5,7 @@ const token = value => typeof value==='string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0
 const object = value => value!==null && typeof value==='object' && !Array.isArray(value);
 const fields = (value,keys) => object(value) && Object.keys(value).every(k=>keys.includes(k));
 const fail = code => ({ok:false,code});
-const kinds = new Set(['read_current_screen','read_section','read_selection','highlight','focus','scroll_to','open_section','expand','collapse','select_option','next','previous','navigate_to_registered_route','open_entity']);
+const kinds = new Set(['read_current_screen','read_section','read_selection','highlight','focus','scroll_to','open_section','expand','collapse','select_option','next','previous','navigate_to_registered_route','open_entity','set_language','set_simple_care','sign_out','walkthrough_start','walkthrough_next','walkthrough_previous','walkthrough_repeat','walkthrough_stop','walkthrough_open_chat','walkthrough_continue']);
 const targetKinds = new Set(['section','question','option','control','button','entity','field','navigation']);
 export const AGENT_UI_LIMITS = Object.freeze({snapshotBytes:4096,targets:20,actions:20,operations:4});
 
@@ -22,15 +22,19 @@ export function validateCopilotClientContext(raw) {
 // These describe UI state only. They never authorize a backend patient-data write.
 export function validateAgentUiContext(raw) {
   if(!fields(raw,['screenId','route','version','focusedSectionId','entities','targets','actions'])) return fail('AGENT_UI_INVALID_CONTEXT');
-  if(!resolveAgentNavigationTarget(raw.screenId)||!resolveAgentNavigationTarget(raw.route)||!token(raw.version)) return fail('AGENT_UI_INVALID_CONTEXT');
+  if(!(resolveAgentNavigationTarget(raw.screenId)||raw.screenId==='document_viewer')||!(resolveAgentNavigationTarget(raw.route)||raw.route==='document_viewer')||!token(raw.version)) return fail('AGENT_UI_INVALID_CONTEXT');
   if(!Array.isArray(raw.targets)||raw.targets.length>20||!Array.isArray(raw.actions)||raw.actions.length>20||
     !Array.isArray(raw.entities)||raw.entities.length>6) return fail('AGENT_UI_INVALID_CONTEXT');
   if(Buffer.byteLength(JSON.stringify(raw))>AGENT_UI_LIMITS.snapshotBytes) return fail('AGENT_UI_CONTEXT_TOO_LARGE');
   const ids=new Set();
   for(const t of raw.targets) {
-    if(!fields(t,['id','kind','label','selected'])||!token(t.id)||ids.has(t.id)||!targetKinds.has(t.kind)||
+    if(!fields(t,['id','kind','label','selected','sectionId','help','value','visible','enabled'])||!token(t.id)||ids.has(t.id)||!targetKinds.has(t.kind)||
       typeof t.label!=='string'||t.label.length>480||/[\u0000-\u001f]/.test(t.label)||
-      t.selected!==undefined&&typeof t.selected!=='boolean') return fail('AGENT_UI_INVALID_TARGET');
+      t.selected!==undefined&&typeof t.selected!=='boolean'||
+      t.sectionId!==undefined&&!token(t.sectionId)||
+      t.help!==undefined&&(typeof t.help!=='string'||t.help.length>240||/[\u0000-\u001f]/.test(t.help))||
+      t.value!==undefined&&!(typeof t.value==='boolean'||typeof t.value==='number'&&Number.isFinite(t.value)||typeof t.value==='string'&&t.value.length<=80&&!/[\u0000-\u001f]/.test(t.value))||
+      ['visible','enabled'].some(k=>t[k]!==undefined&&typeof t[k]!=='boolean')) return fail('AGENT_UI_INVALID_TARGET');
     ids.add(t.id);
     if(t.kind==='navigation') {
       const definition=t.id.startsWith('navigation.')&&resolveAgentNavigationTarget(t.id.slice('navigation.'.length));
@@ -48,6 +52,13 @@ export function validateAgentUiContext(raw) {
     // This callback uses the loaded, authenticated gap's closed actionType and
     // related plan/question. Model arguments never select a route or entity.
     if(a.kind==='open_entity'&&(!['care_gaps','care_gap_detail'].includes(raw.screenId)||!/^care_gaps\.card\.[1-9]\d{0,19}$/.test(a.targetId))) return fail('AGENT_UI_ACTION_UNAVAILABLE');
+    if(['set_language','set_simple_care','sign_out'].includes(a.kind)) {
+      const allowed=raw.screenId==='settings'&&(
+        a.kind==='set_language'&&a.targetId==='settings.language'&&/^settings\.language\.(en|ur|roman_ur)$/.test(a.id)||
+        a.kind==='set_simple_care'&&a.targetId==='settings.simple_care'&&/^settings\.simple_care\.(on|off)$/.test(a.id)||
+        a.kind==='sign_out'&&a.targetId==='settings.sign_out'&&a.id==='settings.sign_out.execute');
+      if(!allowed)return fail('AGENT_UI_ACTION_UNAVAILABLE');
+    }
     actionIds.add(a.id);
   }
   for(const e of raw.entities) if(!fields(e,['type','id'])||!['care_plan','care_gap','family_member'].includes(e.type)||!token(e.id)) return fail('AGENT_UI_INVALID_ENTITY');
@@ -56,7 +67,9 @@ export function validateAgentUiContext(raw) {
 
 export function uiActionRiskTier(kind,screenId) {
   if(['read_current_screen','read_section','read_selection','highlight','focus','scroll_to'].includes(kind)) return 0;
-  if(screenId==='reality_check'&&['select_option','next'].includes(kind)) return 2;
+  if(kind.startsWith('walkthrough_'))return 0;
+  if(screenId==='reality_check'&&['select_option','next','previous'].includes(kind)) return 2;
+  if(screenId==='settings'&&['set_language','set_simple_care','sign_out'].includes(kind))return 2;
   return kinds.has(kind)?1:3;
 }
 

@@ -1,9 +1,9 @@
 /**
  * Bounded per-turn language resolution for Agent replies.
  *
- * patient_profiles.preferred_language is the app/UI/default language. It is
- * not authoritative for every Agent turn because the current user message may
- * be English, Urdu script, or Roman Urdu regardless of the selected UI.
+ * The authenticated patient_profiles.preferred_language is authoritative.
+ * Input detection is retained only as a fallback when no preference is present;
+ * the message and client cannot override a valid selected preference.
  *
  * This module is deterministic, closed to the three canonical Agent language
  * codes, and never accepts client-provided language authority.
@@ -191,6 +191,11 @@ export function resolveAgentTurnLanguage({
   profileLanguage = null,
 } = {}) {
   const detected = detectAgentTurnLanguage(message);
+  // The authenticated stored selection is response authority. ASR/detection is
+  // input metadata only; it cannot silently change the selected language.
+  if (profileLanguage) {
+    return { language: canonicalFallbackLanguage(profileLanguage), source: 'selected_profile' };
+  }
   if (detected.language) {
     return detected;
   }

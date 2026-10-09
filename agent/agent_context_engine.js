@@ -55,7 +55,7 @@ import { canonicalAgentLanguage } from './agent_session_store.js';
  * Allowlisted screen ids - exactly the registered navigation targets.
  * The frozen derived array keeps the two vocabularies in lockstep.
  */
-const AGENT_SCREEN_IDS = Object.freeze(Object.keys(AGENT_NAVIGATION_TARGETS));
+const AGENT_SCREEN_IDS = Object.freeze([...Object.keys(AGENT_NAVIGATION_TARGETS),'document_viewer']);
 
 /**
  * Allowlisted context entity types - exactly the entity types the Phase B
@@ -403,6 +403,7 @@ export function buildAgentContextSlice({
     : [];
 
   return Object.freeze({
+    ...(state.taskWorkflow?{taskWorkflow:state.taskWorkflow}:{}),
     language: canonicalAgentLanguage(language),
     screenId: screenContext?.screenId || null,
     currentEntity: screenContext?.entity || null,

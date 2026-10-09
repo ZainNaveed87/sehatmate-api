@@ -40,7 +40,7 @@
 
 import { verifyCarePlanOwnership } from '../services/plan_query_service.js';
 import { verifyCareGapOwnership } from '../services/care_gap_service.js';
-import { verifyFamilyRelationshipReference } from '../services/family_care_service.js';
+import { verifyFamilyRelationshipReference, readFamilyCarePlanDetail } from '../services/family_care_service.js';
 import { cleanText, idPattern } from '../services/shared_utils.js';
 
 const ENTITY_TITLE_MAX_LENGTH = 200;
@@ -52,6 +52,15 @@ const ENTITY_TITLE_MAX_LENGTH = 200;
  */
 export const AGENT_NAVIGATION_TARGETS = Object.freeze({
   home: Object.freeze({ params: Object.freeze({}) }),
+  calendar: Object.freeze({params:Object.freeze({})}),
+  family: Object.freeze({params:Object.freeze({})}),
+  care_plan_new: Object.freeze({params:Object.freeze({})}),
+  care_plan_upload: Object.freeze({params:Object.freeze({carePlanId:'required'})}),
+  care_plan_review: Object.freeze({params:Object.freeze({carePlanId:'required'})}),
+  family_member_new: Object.freeze({params:Object.freeze({})}),
+  doctor_questions: Object.freeze({params:Object.freeze({})}),
+  simple_care: Object.freeze({params:Object.freeze({})}),
+  teach_back: Object.freeze({params:Object.freeze({})}),
   today: Object.freeze({ params: Object.freeze({}) }),
   progress: Object.freeze({ params: Object.freeze({}) }),
   care_plans: Object.freeze({ params: Object.freeze({}) }),
@@ -75,7 +84,7 @@ export const AGENT_NAVIGATION_TARGETS = Object.freeze({
     params: Object.freeze({ relationshipId: 'required' }),
   }),
   family_member_care_plans: Object.freeze({
-    params: Object.freeze({ relationshipId: 'required' }),
+    params: Object.freeze({ relationshipId: 'required', carePlanId:'required' }),
   }),
   family_member_care_gaps: Object.freeze({
     params: Object.freeze({ relationshipId: 'required' }),
@@ -236,7 +245,7 @@ export async function authorizeAgentNavigationIntent({ intent, pool, userId }) {
   const { target, params } = validated.intent;
   let entity = null;
 
-  if (params.carePlanId !== undefined) {
+  if (params.carePlanId !== undefined && target !== 'family_member_care_plans') {
     const owned = await verifyCarePlanOwnership({
       pool,
       userId,
@@ -268,6 +277,10 @@ export async function authorizeAgentNavigationIntent({ intent, pool, userId }) {
   }
 
   if (params.relationshipId !== undefined) {
+    if(target==='family_member_care_plans') {
+      const plan=await readFamilyCarePlanDetail({pool,actorUserId:userId,relationshipId:params.relationshipId,planId:params.carePlanId});
+      if(!plan.ok)return plan;
+    }
     const verified = await verifyFamilyRelationshipReference({
       pool,
       userId,

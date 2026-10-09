@@ -2,6 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {validateAgentUiContext, validateAgentUiOperations, buildAgentUiPlan, uiActionRiskTier} from './agent/agent_ui_protocol.js';
 
+test('screen metadata is closed and persisted settings and Previous require confirmation',()=>{
+  const c={screenId:'settings',route:'settings',version:'test:1',entities:[],targets:[{id:'settings.language',kind:'control',label:'Language',sectionId:'language',help:'Choose the Agent reply language.',value:'roman_ur',visible:true,enabled:true}],actions:[{id:'settings.language.roman_ur',kind:'set_language',targetId:'settings.language'}]};
+  assert.equal(validateAgentUiContext(c).ok,true);
+  assert.equal(uiActionRiskTier('set_language','settings'),2);
+  assert.equal(uiActionRiskTier('previous','reality_check'),2);
+  assert.equal(validateAgentUiContext({...c,actions:[{...c.actions[0],id:'settings.language.invented'}]}).ok,false);
+  assert.equal(validateAgentUiContext({...c,targets:[{...c.targets[0],value:{secret:'no'}}]}).ok,false);
+});
+
 export const context = () => ({screenId:'reality_check',route:'reality_check',version:'mount-1:8',focusedSectionId:'reality_check.question.current',entities:[],
   targets:[{id:'reality_check.question.current',kind:'section',label:'Morning availability'},
     {id:'reality_check.option.timing_difficult',kind:'option',label:'This timing is difficult',selected:false},

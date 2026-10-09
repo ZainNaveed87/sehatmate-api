@@ -570,6 +570,16 @@ await test('confirm task completed works', async () => {
   assert.equal(calls.reply, 0);
 });
 
+for (const status of ['completed','cancelled']) for (const kind of ['outcome','reminder']) await test(`legacy ${kind} confirmation remains usable after ${status} care-plan workflow`,async()=>{
+  const state=kind==='outcome'?pendingTaskState():pendingScheduleState();
+  state.taskWorkflow={workflowId:'workflow-old',kind:'create_care_plan',revision:3,status,fields:{title:'Ali'},
+    ...(status==='completed'?{confirmationId:'task-old',completedReceipt:{confirmationId:'task-old',planId:'17',title:'Ali'}}:{})};
+  const pool=createFakePool({initialState:state});
+  const {provider}=fakeProvider({intent:'unused',capabilityCalls:[],navigationIntent:null});
+  const result=await handleWith({pool,provider,confirmation:{confirmationId:state.pendingConfirmation.confirmationId,decision:'confirm'}});
+  assert.equal(result.actionStatus,'confirmed');assert.equal(kind==='outcome'?pool.outcomeMutationCount:pool.scheduleMutationCount,1);
+});
+
 await test('confirm task skipped works', async () => {
   const pool = createFakePool({ initialState: pendingTaskState({ outcome: 'skipped' }) });
   const { provider } = fakeProvider({ intent: 'unused', capabilityCalls: [], navigationIntent: null });

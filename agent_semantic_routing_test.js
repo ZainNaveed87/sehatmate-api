@@ -7,13 +7,13 @@ import {generateGroundedAgentReply} from './agent/agent_response_grounder.js';
 import {emptyAgentSessionState} from './agent/agent_session_state.js';
 process.env.AGENT_ENABLED='true';
 
-function pool() {
+function pool(preferredLanguage='en') {
   const queries=[];
   let row={id:501,user_id:42,language:'en',state_json:JSON.stringify(emptyAgentSessionState()),
     created_at:'2026-09-03 10:00:00',last_active_at:'2026-09-03 10:00:00',expires_at:'2099-01-01 00:00:00'};
   const execute=async(sql,params=[])=>{
     const s=String(sql).replace(/\s+/g,' ').trim(); queries.push(s);
-    if(s.startsWith('SELECT preferred_language')) return [[{preferred_language:'en'}]];
+    if(s.startsWith('SELECT preferred_language')) return [[{preferred_language:preferredLanguage}]];
     if(s.includes('FROM agent_sessions WHERE id = ? AND user_id = ? AND expires_at')) return [[row]];
     if(s.startsWith('SELECT id FROM agent_sessions')) return [[{id:501}]];
     if(s.startsWith('UPDATE agent_sessions SET state_json')) row={...row,state_json:params[0]};
@@ -148,7 +148,7 @@ test('trivial conversation optimization is shared by text and voice',async()=>{
 test('localized help uses natural generation with server-owned product facts',async()=>{
   for(const [message,reply] of [['آپ کیا مدد کر سکتے ہیں؟','SehatMate تصدیق شدہ نگہداشت کے منصوبے سمجھنے میں مدد کر سکتا ہے۔'],
     ['Aap meri kis tarah madad kar sakte hain?','Main aap ke verified care plans samajhne mein madad kar sakta hoon.']]) {
-    const {result,prompts}=await turn(message,route('app_help'),{reply});
+    const {result,prompts}=await turn(message,route('app_help'),{reply,db:pool(message.includes('آپ')?'ur':'roman_ur')});
     assert.equal(result.reply,reply); assert.equal(result.fallbackCode,undefined);
     assert.equal(prompts.length,2);
   }

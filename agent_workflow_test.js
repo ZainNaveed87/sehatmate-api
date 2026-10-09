@@ -14,6 +14,7 @@ function fixture({receipt=true,depth=0,foreign=false,current=context(),operation
   const queries=[],prompts=[];
   const execute=async(sql,params=[])=>{
     const s=String(sql).replace(/\s+/g,' ');queries.push({sql:s,params});
+    if(s.startsWith('SELECT preferred_language')) return [[{preferred_language:'Roman Urdu'}]];
     if(s.startsWith('SELECT plan_json')) return [foreign?[]:[{plan_json:JSON.stringify(stored),screen_version:'screen:8'}]];
     if(s.startsWith('SELECT result_status')) return [receipt?[{result_status:'succeeded',screen_version_before:'screen:8',screen_version_after:'screen:9'}]:[]];
     if(s.includes('SELECT c.context_json')) return [current?[{context_json:JSON.stringify(current)}]:[]];

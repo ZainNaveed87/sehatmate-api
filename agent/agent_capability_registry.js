@@ -1,3 +1,4 @@
+import {validateCarePlanTitle} from '../services/care_plan_title_service.js';
 /**
  * Canonical Agent Capability Registry (Phase B).
  *
@@ -52,6 +53,7 @@ const PROPERTY_TYPES = new Set([
   'id',
   'date',
   'string',
+  'care_plan_title',
   'integer',
   'boolean',
   'enum',
@@ -236,6 +238,9 @@ function canonicalPropertyValue(spec, name, value) {
         return { error: `${name} must be a valid YYYY-MM-DD calendar date.` };
       }
       return { value: canonical };
+    }
+    case 'care_plan_title': {
+      const checked=validateCarePlanTitle(value);return checked.ok?{value:checked.title}:{error:'Invalid care plan title.'};
     }
     case 'string': {
       if (typeof value !== 'string') {

@@ -1,8 +1,9 @@
 import {createCipheriv,createDecipheriv,createHmac,randomBytes} from 'node:crypto';
 import {sessionSpeechPolicy} from '../agent/agent_voice_config.js';
 import {voiceError,strictObject,opaqueId,millis} from './voice_contract.js';
+import {validateTaskWorkflow} from '../agent/agent_task_workflow.js';
 
-const approvedFields=['sessionId','language','reply','navigation','confirmation','clarification','actionStatus','referencedEntities','fallbackCode','uiPlan','memoryProposal','conflicts'];
+const approvedFields=['sessionId','language','reply','navigation','confirmation','clarification','actionStatus','referencedEntities','fallbackCode','uiPlan','memoryProposal','conflicts','taskWorkflow'];
 const canonical=value=>JSON.stringify(value && typeof value==='object' ? Array.isArray(value) ? value.map(v=>JSON.parse(canonical(v))) : Object.fromEntries(Object.keys(value).sort().map(k=>[k,JSON.parse(canonical(value[k]))])) : value);
 export function createAgentTurnService({store,sessions,config,receiptKey,handleAgent,readAgent,now=Date.now}) {
   const key=Buffer.from(receiptKey,'base64');
@@ -84,8 +85,13 @@ export function createAgentTurnService({store,sessions,config,receiptKey,handleA
         }
         if(input.confirmation) {
           const agent=await readAgent({userId,sessionId:s.agentSessionId});
-          const pending=agent.ok && agent.data.session.state.pendingConfirmation;
-          if(!pending||pending.confirmationId!==input.confirmation.confirmationId||pending.expiresAt && millis(pending.expiresAt)<=now()) throw voiceError('VOICE_CONFIRMATION_NOT_CURRENT');
+          const state=agent.ok && agent.data.session.state;
+          const pending=state?.pendingConfirmation;
+          const task=validateTaskWorkflow(state?.taskWorkflow);
+          const legacyCurrent=pending?.confirmationId===input.confirmation.confirmationId&&(!pending.expiresAt||millis(pending.expiresAt)>now());
+          const taskCurrent=task?.confirmationId===input.confirmation.confirmationId&&
+            (task.status==='awaiting_confirmation'&&millis(task.expiresAt)>now()||task.status==='completed'&&input.confirmation.decision==='confirm');
+          if(!legacyCurrent&&!taskCurrent) throw voiceError('VOICE_CONFIRMATION_NOT_CURRENT');
         }
         r={voiceSessionId:id,userId,agentSessionId:s.agentSessionId,turnId:input.turnId,epoch:s.epoch,
           requestHash,confirmationId:input.confirmation?.confirmationId||null,confirmationHash,status:'processing',

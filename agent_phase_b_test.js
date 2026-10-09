@@ -280,6 +280,7 @@ await test('Agent Core import registers the Agent capability catalog', async () 
   assert.deepEqual(names, [
     'compare_performance',
     'confirm_schedule_item_time',
+    'create_care_plan',
     'draft_next_task_outcome',
     'draft_schedule_time',
     'draft_task_outcome',
@@ -976,7 +977,7 @@ await test('navigation-only turn returns deterministic localized reply without r
 await test('READ capability execution is audited and exact 14:00 facts are backend-grounded', async () => {
 
   const pool = createFakePool({
-    preferredLanguage: 'en',
+    preferredLanguage: 'roman_ur',
     activePlans: [{ id: 7, title: 'Demo Plan', readiness_score: 85 }],
     occurrenceRows: [
       {
@@ -1091,7 +1092,7 @@ await test(
   'successful get_next_task falls back to deterministic Roman Urdu reply when reply provider fails',
   async () => {
     const pool = createFakePool({
-      preferredLanguage: 'en',
+      preferredLanguage: 'roman_ur',
       activePlans: [{ id: 7, title: 'Demo Plan', readiness_score: 85 }],
       occurrenceRows: [
         {
@@ -1986,7 +1987,7 @@ await test('timing remains fixed and content-free on failures and does not leak 
   } finally {logging.mock.restore();}
 });
 
-await test('voice ambiguity uses current profile preference while text retains last-turn fallback',async()=>{
+await test('text and voice ambiguity both use current selected profile preference',async()=>{
   for(const [profile,previous,voiceExpected] of [['ur','en','ur'],['roman_ur','en','roman_ur'],['en','ur','en']]) {
     for(const voiceReply of [true,false]) {
       const pool=createFakePool({preferredLanguage:profile}); const execute=pool.execute;
@@ -2001,7 +2002,7 @@ await test('voice ambiguity uses current profile preference while text retains l
         replyTemplate:lang=>({'English':'How can I help?','Urdu':'میں آپ کی کیا مدد کر سکتا ہوں؟',
           'Roman Urdu':'Main aap ki kya madad kar sakta hoon?'}[lang])});
       const result=await handleAgentMessage({pool,userId:USER,sessionId:SESSION_ID,message:'...',provider,voiceReply});
-      assert.equal(result.language,voiceReply?voiceExpected:previous);
+      assert.equal(result.language,voiceExpected);
       assert.equal(result.fallbackCode,undefined);
     }
   }

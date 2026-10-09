@@ -1,3 +1,5 @@
+import {reduceTaskWorkflow,taskWorkflowResponse,taskWorkflowText} from './agent_task_workflow.js';
+import {executeConfirmedTaskWorkflow} from './agent_care_plan_tools.js';
 /**
  * Agent Core (Phase B) - single-turn orchestration of the text agent.
  *
@@ -409,12 +411,16 @@ function hasActivePendingDraft(state, now = Date.now()) {
   return Number.isFinite(expiresAt) && expiresAt > now;
 }
 
-function responseConfirmationFromDraft(draft) {
+function responseConfirmationFromDraft(draft, language = 'en') {
   if (!draft || !DRAFT_KINDS.has(draft.kind)) return null;
   return {
     confirmationId: draft.confirmationId,
     kind: draft.kind,
-    message: draft.message,
+    message: language === 'en' ? draft.message : draft.kind === 'task_outcome'
+      ? language === 'ur' ? `"${draft.targetLabel}" کو ${draft.outcome === 'completed' ? 'مکمل' : 'چھوڑ دیا گیا'} نشان زد کر دوں؟`
+        : `"${draft.targetLabel}" ko ${draft.outcome === 'completed' ? 'mukammal' : 'skip'} mark kar doon?`
+      : language === 'ur' ? `"${draft.targetLabel}" کی یاد دہانی ${draft.scheduleTime} پر مقرر کر دوں؟`
+        : `"${draft.targetLabel}" ki reminder ${draft.scheduleTime} par set kar doon?`,
     expiresAt: draft.expiresAt,
   };
 }
@@ -766,6 +772,7 @@ function buildNextSessionState({
 
   return {
     lastReferencedEntities,
+    ...(sessionState?.taskWorkflow?{taskWorkflow:sessionState.taskWorkflow}:{}),
     currentFocus:
       verifiedFocus === undefined
         ? sessionState?.currentFocus ?? null
@@ -897,7 +904,7 @@ async function persistAgentTurn({
   if (actionStatus === 'awaiting_confirmation' && confirmation && stateUpdate?.ok !== true) {
     const currentSession = stateUpdate?.data?.session || session;
     const currentConfirmation = hasActivePendingDraft(currentSession.state)
-      ? responseConfirmationFromDraft(currentSession.state?.pendingDraft)
+      ? responseConfirmationFromDraft(currentSession.state?.pendingDraft, language)
       : null;
     return {
       ok: true,
@@ -929,6 +936,7 @@ async function persistAgentTurn({
     confirmation,
     clarification: clarification && stateUpdate?.ok === true ? clarification : null,
     actionStatus,
+    ...(session.state?.taskWorkflow?{taskWorkflow:session.state.taskWorkflow}:{}),
     ...(uiPlan ? {uiPlan} : {}),
     ...(memoryProposal ? {memoryProposal} : {}),
     ...(conflicts.length ? {conflicts} : {}),
@@ -1004,7 +1012,7 @@ async function handleAgentConfirmation({
       language,
       reply: confirmationText(key, language),
       fallbackCode,
-      confirmation: clear ? null : responseConfirmationFromDraft(pendingDraft),
+      confirmation: clear ? null : responseConfirmationFromDraft(pendingDraft, language),
       actionStatus,
     });
   };
@@ -1204,13 +1212,7 @@ async function handleAgentMessageInternal({
     }
 
     const profileLanguage = await readProfileLanguage(pool, userId);
-    const turnLanguage = input => {
-      const detected=resolveAgentTurnLanguage(voiceReply
-        ? {...input,lastTurnLanguage:profileLanguage}
-        : input).language;
-      // Roman Urdu is an output preference; Urdu-script STT must not erase it.
-      return voiceReply && profileLanguage==='roman_ur' && detected==='ur' ? 'roman_ur' : detected;
-    };
+    const turnLanguage = input => resolveAgentTurnLanguage({...input,profileLanguage}).language;
     language = turnLanguage({
       message: boundedMessage,
       profileLanguage,
@@ -1251,8 +1253,7 @@ async function handleAgentMessageInternal({
     }
 
     if (!sessionCreated) {
-      // Session language is now the last verified Agent turn language, not
-      // the patient profile/UI language.
+      // Session response language follows the authenticated selected preference.
       if (session.language !== language) {
         const updated = await updateAgentSessionLanguage({
           db: pool,
@@ -1273,6 +1274,12 @@ async function handleAgentMessageInternal({
     }
 
     if (voiceReply) recordVoiceLatency('PREPARE',prepareStarted);
+    const taskConfirmation=session.state?.taskWorkflow;
+    const legacyConfirmationMatches=session.state?.pendingConfirmation?.confirmationId===confirmationRequest?.confirmationId;
+    if(isConfirmationTurn&&confirmationRequest?.ok&&taskConfirmation&&!legacyConfirmationMatches&&
+      (taskConfirmation.confirmationId===confirmationRequest.confirmationId||taskConfirmation.status==='awaiting_confirmation')) {
+      return handleTaskConfirmation({pool,userId,session,request:confirmationRequest,language});
+    }
     if (isConfirmationTurn) {
       return handleAgentConfirmation({
         pool,
@@ -1349,6 +1356,9 @@ async function handleAgentMessageInternal({
     const conversationalDecision = isClarificationTurn
       ? null
       : classifyBareConfirmationDecision(boundedMessage);
+    if(conversationalDecision&&session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
+      return handleTaskConfirmation({pool,userId,session,request:{ok:true,confirmationId:session.state.taskWorkflow.confirmationId,decision:conversationalDecision},language});
+    }
     if (conversationalDecision) {
       const pendingConfirmation = session.state?.pendingConfirmation;
       const confirmationId = pendingConfirmation?.confirmationId;
@@ -1399,7 +1409,7 @@ async function handleAgentMessageInternal({
       clientUi=validatedUi.context;
       console.info('AGENT_UI:CONTEXT_ACCEPTED');
     }
-    const conversation=!isClarificationTurn&&!clientUi
+    const conversation=!session.state?.taskWorkflow&&!isClarificationTurn&&!clientUi
       ? timeVoiceSync('FAST_PATH',()=>voiceConversationReply({message,language,state:session.state,clientContext}))
       : null;
     if (conversation) {
@@ -1425,6 +1435,11 @@ async function handleAgentMessageInternal({
       sessionState: session.state,
     });
 
+    let workflowPlan=null;
+    if(session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
+      workflowPlan=await planAgentMessage({provider,message:boundedMessage,contextSlice:{...buildAgentContextSlice({language,screenContext:context.screenContext,sessionState:session.state,conversationContext}),...(clientUi?{clientUi}:{}),taskWorkflow:session.state.taskWorkflow}});
+      if(workflowPlan.ok&&workflowPlan.plan.taskCommand)return handleTaskCommand({pool,userId,session,command:workflowPlan.plan.taskCommand,message:boundedMessage,language});
+    }
     const referenceResolution = selectedReferenceResolution ||
       await resolveAgentConversationReference({
         pool,
@@ -1492,13 +1507,13 @@ async function handleAgentMessageInternal({
       resolution: referenceResolution,
     });
     const plannerStarted=performance.now();
-    const planned = fastNavigationPlan
+    const planned = workflowPlan??(fastNavigationPlan
       ? validateAgentPlan(fastNavigationPlan)
       : await planAgentMessage({
           provider,
           message: boundedMessage,
           contextSlice,
-        });
+        }));
     if (voiceReply) recordVoiceLatency('PLANNER',plannerStarted);
     if (!planned.ok) {
       if (planned.code === 'AGENT_MESSAGE_EMPTY') {
@@ -1537,6 +1552,7 @@ async function handleAgentMessageInternal({
     }
 
     const plan = planned.plan;
+    if(plan.taskCommand)return handleTaskCommand({pool,userId,session,command:plan.taskCommand,message:boundedMessage,language});
     const referenceBinding = reviewPlanAgainstResolvedReference({
       plan,
       resolution: referenceResolution,
@@ -1566,7 +1582,7 @@ async function handleAgentMessageInternal({
       (call) => resolveAgentCapability(call.name)?.permissionClass === 'DRAFT',
     );
     if (plannedDraftCall && hasActivePendingDraft(session.state)) {
-      const pending = responseConfirmationFromDraft(session.state.pendingDraft);
+      const pending = responseConfirmationFromDraft(session.state.pendingDraft, language);
       return finishAgentTurn({
         pool,
         userId,
@@ -1690,9 +1706,9 @@ async function handleAgentMessageInternal({
         navigation: null,
         navigationEntity: null,
         screenEntity,
-        pendingConfirmation: responseConfirmationFromDraft(pendingDraft),
+        pendingConfirmation: responseConfirmationFromDraft(pendingDraft, language),
         pendingDraft,
-        confirmation: responseConfirmationFromDraft(pendingDraft),
+        confirmation: responseConfirmationFromDraft(pendingDraft, language),
         actionStatus: 'awaiting_confirmation',
         language,
       });
@@ -1849,4 +1865,24 @@ async function handleAgentMessageInternal({
       message: localizedAgentText('agentUnavailable', language),
     };
   }
+}
+
+async function handleTaskCommand({pool,userId,session,command,message,language}) {
+  const reduced=reduceTaskWorkflow({current:session.state?.taskWorkflow,command,message,language});
+  if(!reduced.ok)return {ok:true,sessionId:session.id,language,...(session.state?.taskWorkflow?taskWorkflowResponse(session.state.taskWorkflow,language):{}),reply:reduced.reply??taskWorkflowText('failed',language),fallbackCode:reduced.code,navigation:null};
+  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,taskWorkflow:reduced.workflow},expectedState:session.state});
+  if(!saved.ok)return {ok:false,code:saved.code,message:taskWorkflowText('failed',language)};
+  return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(reduced.workflow,language)};
+}
+async function handleTaskConfirmation({pool,userId,session,request,language}) {
+  const task=session.state.taskWorkflow;
+  if(!request?.ok||request.confirmationId!==task.confirmationId)return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(task,language),reply:taskWorkflowText('failed',language),fallbackCode:'AGENT_TASK_STALE_CONFIRMATION',navigation:null};
+  if(request.decision==='cancel') {
+    if(task.status!=='awaiting_confirmation')return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(task,language),reply:taskWorkflowText('failed',language),fallbackCode:'AGENT_TASK_STALE_CONFIRMATION',navigation:null};
+    return handleTaskCommand({pool,userId,session,command:{kind:'cancel'},message:'',language});
+  }
+  if(request.decision!=='confirm')return {ok:false,code:'INVALID_AGENT_CONFIRMATION_REQUEST',message:taskWorkflowText('failed',language)};
+  const result=await executeConfirmedTaskWorkflow({pool,userId,sessionId:session.id,confirmationId:request.confirmationId,workflowId:task.workflowId,revision:task.revision});
+  if(!result.ok)return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(task,language),reply:taskWorkflowText(result.code==='CARE_PLAN_TITLE_EXISTS'?'duplicate':'failed',language),fallbackCode:result.code,navigation:null};
+  return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(result.workflow,language)};
 }

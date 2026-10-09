@@ -704,7 +704,7 @@ await test('real two-turn ordinal reference stores list then opens first care pl
     navigationIntent: null,
   }, {
     replyTemplate:
-      'Aap ke care plans mein {{fact:c1_plans_1_title}} aur {{fact:c1_plans_2_title}} shamil hain.',
+      'Your care plans include {{fact:c1_plans_1_title}} and {{fact:c1_plans_2_title}}.',
   });
 
   const first = await handleAgentMessage({
@@ -716,7 +716,7 @@ await test('real two-turn ordinal reference stores list then opens first care pl
   });
 
   assert.equal(first.ok, true);
-  assert.equal(first.language, 'roman_ur');
+  assert.equal(first.language, 'en');
   assert.equal(first.fallbackCode, undefined);
   assert.doesNotMatch(first.reply, /complete nahi kar saka|could not complete/i);
   assert.deepEqual(pool.state.recentOrderedEntityList, {
@@ -726,7 +726,7 @@ await test('real two-turn ordinal reference stores list then opens first care pl
       { type: 'care_plan', id: '21' },
     ],
   });
-  assert.equal(pool.sessionLanguage, 'roman_ur');
+  assert.equal(pool.sessionLanguage, 'en');
 
   const openProvider = zeroCallProvider();
 
@@ -739,7 +739,7 @@ await test('real two-turn ordinal reference stores list then opens first care pl
   });
 
   assert.equal(second.ok, true);
-  assert.equal(second.language, 'roman_ur');
+  assert.equal(second.language, 'en');
   assert.equal(second.fallbackCode, undefined);
   assert.deepEqual(second.navigation, {
     target: 'care_plan_detail',

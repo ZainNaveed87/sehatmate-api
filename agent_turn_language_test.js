@@ -314,53 +314,53 @@ await test('profile English + English message resolves English', () => {
   );
 });
 
-await test('profile English + Roman Urdu message resolves Roman Urdu', () => {
+await test('profile English + Roman Urdu input retains English', () => {
   assert.equal(
     resolveAgentTurnLanguage({
       message: 'mere care plans dikhao',
       profileLanguage: 'English',
     }).language,
-    'roman_ur',
+    'en',
   );
 });
 
-await test('profile English + Urdu-script message resolves Urdu', () => {
+await test('profile English + Urdu input retains English', () => {
   assert.equal(
     resolveAgentTurnLanguage({
       message: 'میرے کیئر پلان دکھاؤ',
       profileLanguage: 'English',
     }).language,
-    'ur',
+    'en',
   );
 });
 
-await test('profile Urdu + English message resolves English', () => {
+await test('profile Urdu + English input retains Urdu', () => {
   assert.equal(
     resolveAgentTurnLanguage({
       message: 'Show my care plans',
       profileLanguage: 'Urdu',
     }).language,
-    'en',
+    'ur',
   );
 });
 
-await test('profile Urdu + Roman Urdu message resolves Roman Urdu', () => {
+await test('profile Urdu + Roman input retains Urdu', () => {
   assert.equal(
     resolveAgentTurnLanguage({
       message: 'mujhe mera next task batao',
       profileLanguage: 'Urdu',
     }).language,
-    'roman_ur',
+    'ur',
   );
 });
 
-await test('profile Roman Urdu + English message resolves English', () => {
+await test('profile Roman Urdu + English input retains Roman Urdu', () => {
   assert.equal(
     resolveAgentTurnLanguage({
       message: 'Show my progress',
       profileLanguage: 'Roman Urdu',
     }).language,
-    'en',
+    'roman_ur',
   );
 });
 
@@ -369,9 +369,9 @@ await test('detector does not classify every Latin sentence as Roman Urdu', () =
   assert.equal(detectAgentTurnLanguage('safe').language, null);
 });
 
-await test('Roman Urdu care-plan read succeeds when app/profile language is English', async () => {
+await test('selected Roman Urdu care-plan read succeeds', async () => {
   const capture = { planPrompts: [], replyLanguages: [] };
-  const pool = createPool({ preferredLanguage: 'English', sessionLanguage: 'en' });
+  const pool = createPool({ preferredLanguage: 'Roman Urdu', sessionLanguage: 'en' });
   const { provider } = planProvider(carePlanReadPlan, { capture });
   const result = await handleAgentMessage({
     pool,
@@ -391,9 +391,9 @@ await test('Roman Urdu care-plan read succeeds when app/profile language is Engl
   assert.match(capture.planPrompts[0], /"language":"roman_ur"/);
 });
 
-await test('Urdu-script care-plan read succeeds when app/profile language differs', async () => {
+await test('selected Urdu care-plan read succeeds', async () => {
   const capture = { planPrompts: [], replyLanguages: [] };
-  const pool = createPool({ preferredLanguage: 'Roman Urdu', sessionLanguage: 'roman_ur' });
+  const pool = createPool({ preferredLanguage: 'Urdu', sessionLanguage: 'roman_ur' });
   const { provider } = planProvider(carePlanReadPlan, { capture });
   const result = await handleAgentMessage({
     pool,
@@ -412,7 +412,7 @@ await test('Urdu-script care-plan read succeeds when app/profile language differ
 
 await test('grounded reply validation validates against detected turn language', async () => {
   const capture = { planPrompts: [], replyLanguages: [] };
-  const pool = createPool({ preferredLanguage: 'English', sessionLanguage: 'en' });
+  const pool = createPool({ preferredLanguage: 'Roman Urdu', sessionLanguage: 'en' });
   const { provider } = planProvider(carePlanReadPlan, { capture });
   const result = await handleAgentMessage({
     pool,
@@ -429,7 +429,7 @@ await test('grounded reply validation validates against detected turn language',
 
 await test('clear language mismatch from provider fails closed', async () => {
   const capture = { planPrompts: [], replyLanguages: [] };
-  const pool = createPool({ preferredLanguage: 'English', sessionLanguage: 'en' });
+  const pool = createPool({ preferredLanguage: 'Roman Urdu', sessionLanguage: 'en' });
   const { provider } = planProvider(carePlanReadPlan, {
     mismatch: true,
     capture,
@@ -480,14 +480,14 @@ await test('conversation language detection never mutates profile preferred lang
   assert.ok(!pool.calls.some((call) => /^UPDATE patient_profiles\b/i.test(call.sql)));
 });
 
-await test('ambiguous short turn falls back to last turn language then profile language', () => {
+await test('selected profile overrides ambiguous last-turn language', () => {
   assert.equal(
     resolveAgentTurnLanguage({
       message: 'ok',
       lastTurnLanguage: 'roman_ur',
       profileLanguage: 'English',
     }).language,
-    'roman_ur',
+    'en',
   );
   assert.equal(
     resolveAgentTurnLanguage({
@@ -498,9 +498,9 @@ await test('ambiguous short turn falls back to last turn language then profile l
   );
 });
 
-await test('Roman Urdu turn followed by haan retains language/context', async () => {
+await test('selected Roman Urdu haan retains context', async () => {
   const pool = createPool({
-    preferredLanguage: 'English',
+    preferredLanguage: 'Roman Urdu',
     sessionLanguage: 'en',
     initialState: { ...emptyAgentSessionState(), lastTurnLanguage: 'roman_ur' },
   });
@@ -519,9 +519,9 @@ await test('Roman Urdu turn followed by haan retains language/context', async ()
   assert.equal(provider.calls, 0);
 });
 
-await test('English turn followed by yes remains English', async () => {
+await test('selected English yes remains English', async () => {
   const pool = createPool({
-    preferredLanguage: 'Urdu',
+    preferredLanguage: 'English',
     sessionLanguage: 'ur',
     initialState: { ...emptyAgentSessionState(), lastTurnLanguage: 'en' },
   });
@@ -540,9 +540,9 @@ await test('English turn followed by yes remains English', async () => {
   assert.equal(provider.calls, 0);
 });
 
-await test('Urdu turn followed by Urdu-script haan remains Urdu', async () => {
+await test('selected Urdu haan remains Urdu', async () => {
   const pool = createPool({
-    preferredLanguage: 'English',
+    preferredLanguage: 'Urdu',
     sessionLanguage: 'en',
     initialState: { ...emptyAgentSessionState(), lastTurnLanguage: 'ur' },
   });
@@ -561,9 +561,9 @@ await test('Urdu turn followed by Urdu-script haan remains Urdu', async () => {
   assert.equal(provider.calls, 0);
 });
 
-await test('reference resolution works after Roman Urdu care-plan list memory', async () => {
+await test('reference resolution works in selected Roman Urdu', async () => {
   const pool = createPool({
-    preferredLanguage: 'English',
+    preferredLanguage: 'Roman Urdu',
     sessionLanguage: 'en',
     plans: [
       carePlanRow({ id: 7, title: 'Prescription Plan' }),
@@ -603,7 +603,7 @@ await test('reference resolution works after Roman Urdu care-plan list memory', 
 
 await test('ambiguous reference still asks clarification and does not guess', async () => {
   const pool = createPool({
-    preferredLanguage: 'English',
+    preferredLanguage: 'Roman Urdu',
     sessionLanguage: 'roman_ur',
     initialState: {
       ...emptyAgentSessionState(),
@@ -635,9 +635,9 @@ await test('ambiguous reference still asks clarification and does not guess', as
   assert.match(result.reply, /Aap kis wale ki baat kar rahe hain/i);
 });
 
-await test('Phase D pending confirmation safety works across language switching', async () => {
+await test('Phase D confirmation respects selected Roman Urdu', async () => {
   const pool = createPool({
-    preferredLanguage: 'English',
+    preferredLanguage: 'Roman Urdu',
     sessionLanguage: 'en',
     initialState: pendingTaskState({ lastTurnLanguage: 'en' }),
   });
@@ -657,8 +657,8 @@ await test('Phase D pending confirmation safety works across language switching'
   assert.equal(provider.calls, 0);
 });
 
-await test('voice transcript uses the same turn-language resolver', async () => {
-  const pool = createPool({ preferredLanguage: 'English', sessionLanguage: 'en' });
+await test('voice transcript respects selected Roman Urdu', async () => {
+  const pool = createPool({ preferredLanguage: 'Roman Urdu', sessionLanguage: 'en' });
   const { provider } = planProvider(carePlanReadPlan);
   const result = await handleAgentMessage({
     pool,

@@ -1,3 +1,4 @@
+import {validateAgentUiContext} from './agent_ui_protocol.js';
 /**
  * Agent Response Grounder (Phase B).
  *
@@ -677,7 +678,7 @@ export function buildAgentReplyPrompts({
       : []),
     '',
     'Screen/session context (structured, read-only):',
-    JSON.stringify(zeroTool ? {} : (contextSlice ?? {})),
+    JSON.stringify(zeroTool ? (validateAgentUiContext(contextSlice?.clientUi).ok?{clientUi:contextSlice.clientUi}:{}) : (contextSlice ?? {})),
     '',
     contextSlice?.uiContinuation ? 'Server workflow event (read-only continuation; no new user message):' : 'User message (untrusted text):',
     message,

@@ -1,3 +1,4 @@
+import {validateTaskCommand} from './agent_task_workflow.js';
 /**
  * Agent Planner (Phase B).
  *
@@ -277,7 +278,8 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     'Available navigation targets:',
     ...navigationCatalogLines(),
     '',
-    'UI guidance: when clientUi is supplied, use category ui_guidance and optional uiOperations (maximum 4), each exactly {actionId,targetId,args:{}} from its registered actions/targets. Explain the current question using its UI label, never as verified medical truth. Map natural answers to the available semantic choices, never a phrase table. If ambiguous, ask a question with no operations. Highlight when explaining or recommending. Choices/Next that persist require client confirmation; a proposal is not execution. Never claim an operation already succeeded. No arbitrary arguments, routes, coordinates or methods. UI actions must stop on stale context. Navigation uses navigationIntent and its existing server catalog. Memory hints are non-clinical context only, never treatment authority.',
+    'Task workflow: use category task_workflow with taskCommand {kind:start,workflowKind:create_care_plan} to collect only the required care plan name. Use update with fieldSpans {title:{start,end}} UTF-16 indices copied from CURRENT user message, excluding correction phrases and old/rejected names. Never fabricate fields. Resume/cancel use kind only. Active workflow must resolve before unrelated entity references; navigation/help preserve it. No capability calls/UI/navigation/memory in task workflow plans. Creation executes ONLY through explicit server confirmation, never a normal tool call.',
+    'UI guidance: walkthrough_start/next/previous/repeat/stop/open_chat/continue are read-only app walkthrough controls, distinct from questionnaire next/previous which save answers. Choose walkthrough_* to guide the screen step by step. Use actual target help/value/visibility only; never invent controls. When clientUi is supplied, use category ui_guidance and optional uiOperations (maximum 4), each exactly {actionId,targetId,args:{}} from its registered actions/targets. Explain the current question using its UI label, never as verified medical truth. Map natural answers to the available semantic choices, never a phrase table. If ambiguous, ask a question with no operations. Highlight when explaining or recommending. Choices/Next that persist require client confirmation; a proposal is not execution. Never claim an operation already succeeded. No arbitrary arguments, routes, coordinates or methods. UI actions must stop on stale context. Navigation uses navigationIntent and its existing server catalog. Memory hints are non-clinical context only, never treatment authority.',
     'Optional memoryProposal is a review proposal, NEVER execution. Use only explicit useful stable non-clinical user preferences/constraints, not temporary statements, guesses or medical facts. Shape {kind:CONFIRMED_FACT|USER_PREFERENCE,key,value}. Keys: communication.language {language:en|ur|roman_ur}; explanation.detail {level:brief|step_by_step}; voice.preference {enabled:boolean}; accessibility.reduced_motion {enabled:boolean}; availability.constraint {days:[0..6],startMinute:0..1439,endMinute:1..1440,available:boolean}; routine.barrier {category:timing|transport|reminder|accessibility|caregiver_support}; caregiver.preference {enabled:boolean}; workflow.preference {mode:guided|independent}. A client review confirmation is required before storage. Relevant memory is labelled by kind; inferred patterns never become facts. Omit uncertain or irrelevant proposals.',
     '',
     'Verified server context (structured, read-only):',
@@ -376,7 +378,7 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
     return invalidPlan('Plan must be a plain object.');
   }
   for (const key of Object.keys(rawPlan)) {
-    if (key !== 'category' && key !== 'intent' && key !== 'capabilityCalls' && key !== 'navigationIntent' && key !== 'productFactIds' && key !== 'uiOperations' && key !== 'memoryProposal') {
+    if (key !== 'category' && key !== 'intent' && key !== 'capabilityCalls' && key !== 'navigationIntent' && key !== 'productFactIds' && key !== 'uiOperations' && key !== 'memoryProposal' && key !== 'taskCommand') {
       return invalidPlan(`Plan has an unknown field: ${key}.`);
     }
   }
@@ -385,6 +387,8 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
       !AGENT_SEMANTIC_CATEGORIES.includes(rawPlan.category)) {
     return invalidPlan('A closed semantic category is required.');
   }
+  if(rawPlan.taskCommand!==undefined&&(!validateTaskCommand(rawPlan.taskCommand)||rawPlan.category!=='task_workflow'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal))return invalidPlan('Task command must use the closed task workflow route.');
+  if(rawPlan.category==='task_workflow'&&rawPlan.taskCommand===undefined)return invalidPlan('Task workflow command required.');
   let selection=null;
   if(rawPlan.category==='app_help') {
     selection=selectAgentProductFacts(rawPlan.productFactIds);
@@ -452,12 +456,13 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
   const memory=rawPlan.memoryProposal==null?null:validateAgentMemoryProposal(rawPlan.memoryProposal);
   if(memory&&!memory.ok) return invalidPlan('Memory proposal is unsupported.');
   if(ui.operations.length&&rawPlan.category!=='ui_guidance') return invalidPlan('UI operations require UI guidance.');
-  if (rawPlan.category !== undefined && !reviewSemanticRoute(rawPlan.category,capabilityCalls,navigationIntent,ui.operations)) {
+  if (rawPlan.category !== undefined && !reviewSemanticRoute(rawPlan.category,capabilityCalls,navigationIntent,ui.operations,rawPlan.taskCommand)) {
     return invalidPlan('Semantic category conflicts with planned capability/navigation use.');
   }
   return {
     ok: true,
     plan: { intent, capabilityCalls, navigationIntent,
+      ...(rawPlan.taskCommand?{taskCommand:rawPlan.taskCommand}:{}),
       ...(rawPlan.category !== undefined ? {category:rawPlan.category} : {}),
       ...(ui.operations.length?{uiOperations:ui.operations}:{}),
       ...(memory?{memoryProposal:memory.proposal}:{}),

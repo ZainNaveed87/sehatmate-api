@@ -1,3 +1,4 @@
+import {readProfileLanguage} from './agent_profile_language.js';
 // A UI transition event reuses the existing planner/grounder. It is never a
 // new user utterance, backend mutation authority, or autonomous navigation.
 import './agent_read_tools.js';
@@ -31,7 +32,9 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
   if(!plan||plan.id!==planId||!Array.isArray(plan.operations)) reject('AGENT_WORKFLOW_NOT_FOUND',404);
   const current=await readCopilotContext({db,userId,sessionId});
   if(!current||canonical(current)!==canonical(checked.context)) reject('AGENT_UI_STALE_CONTEXT');
+  const language=await readProfileLanguage(db,userId);
   if(plan.continuationResult) {
+    if(plan.continuationResult.language!==language)reject('AGENT_WORKFLOW_LANGUAGE_CHANGED');
     if(plan.continuationResult.ok!==true) reject(plan.continuationResult.code||'AGENT_WORKFLOW_FAILED',503);
     return plan.continuationResult;
   }
@@ -53,8 +56,9 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
     if(saved.affectedRows!==1) reject('AGENT_WORKFLOW_PERSISTENCE_FAILED',503);
   };
   try {
+
     const screen=await readAgentScreenContext({pool:db,userId,clientContext:current});
-    const contextSlice={...buildAgentContextSlice({language:session.language,screenContext:screen.screenContext}),
+    const contextSlice={...buildAgentContextSlice({language,screenContext:screen.screenContext}),
       clientUi:current.ui,relevantMemory:await readRelevantAgentMemory({db,userId,screenId:current.screenId}),
       uiContinuation:{event:'client-claimed UI transition',depth:depth+1,noNewUserMessage:true,allowedActionKinds:[...readKinds]}};
     const planned=await planAgentMessage({provider,message:instruction,contextSlice});
@@ -62,7 +66,7 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
     const next=planned.plan;
     if(next.capabilityCalls.length||next.navigationIntent||next.memoryProposal||!['ui_guidance','ambiguous'].includes(next.category)||
       (next.uiOperations||[]).some(op=>!readKinds.has(current.ui.actions.find(a=>a.id===op.actionId&&a.targetId===op.targetId)?.kind))) reject('AGENT_WORKFLOW_ACTION_NOT_ALLOWED',422);
-    const grounded=await generateGroundedAgentReply({provider,language:session.language,message:instruction,contextSlice,capabilityResults:[],voiceReply:source==='voice',category:next.category});
+    const grounded=await generateGroundedAgentReply({provider,language,message:instruction,contextSlice,capabilityResults:[],voiceReply:source==='voice',category:next.category});
     if(!grounded.ok) reject('AGENT_WORKFLOW_REPLY_UNAVAILABLE',503);
     const latest=await readCopilotContext({db,userId,sessionId});
     if(!latest||canonical(latest)!==canonical(current)) reject('AGENT_UI_STALE_CONTEXT');
@@ -71,7 +75,7 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
       uiPlan.continuationDepth=depth+1;
       await saveCopilotPlan({db,userId,sessionId,plan:uiPlan});
     }
-    const result={ok:true,sessionId,language:session.language,reply:grounded.reply,navigation:null,confirmation:null,clarification:null,actionStatus:null,referencedEntities:[],...(uiPlan?{uiPlan}:{})};
+    const result={ok:true,sessionId,language,reply:grounded.reply,navigation:null,confirmation:null,clarification:null,actionStatus:null,referencedEntities:[],...(uiPlan?{uiPlan}:{})};
     await persist(result);
     console.info('AGENT_WORKFLOW:COMPLETED');
     return result;

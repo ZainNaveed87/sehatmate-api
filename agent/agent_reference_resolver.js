@@ -9,7 +9,7 @@ import { cleanText, idPattern } from '../services/shared_utils.js';
 import { canonicalAgentLanguage } from './agent_session_store.js';
 
 const CONFIRM_PHRASES = new Set([
-  'yes', 'confirm', 'okay', 'ok', 'do it', 'haan', 'han', 'ji', 'theek hai',
+  'yes', 'confirm', 'confirm karo', 'okay', 'ok', 'do it', 'haan', 'han', 'ji', 'theek hai',
   'ہاں', 'جی', 'ٹھیک ہے', 'تصدیق کریں',
 ]);
 const CANCEL_PHRASES = new Set([
