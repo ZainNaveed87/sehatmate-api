@@ -3,7 +3,7 @@ import {sessionSpeechPolicy} from '../agent/agent_voice_config.js';
 import {voiceError,strictObject,opaqueId,millis} from './voice_contract.js';
 import {validateTaskWorkflow} from '../agent/agent_task_workflow.js';
 
-const approvedFields=['sessionId','language','reply','navigation','confirmation','clarification','actionStatus','referencedEntities','fallbackCode','uiPlan','memoryProposal','conflicts','taskWorkflow'];
+const approvedFields=['sessionId','language','reply','navigation','confirmation','clarification','actionStatus','referencedEntities','fallbackCode','uiPlan','memoryProposal','conflicts','taskWorkflow','displayTranscript'];
 const canonical=value=>JSON.stringify(value && typeof value==='object' ? Array.isArray(value) ? value.map(v=>JSON.parse(canonical(v))) : Object.fromEntries(Object.keys(value).sort().map(k=>[k,JSON.parse(canonical(value[k]))])) : value);
 export function createAgentTurnService({store,sessions,config,receiptKey,handleAgent,readAgent,now=Date.now}) {
   const key=Buffer.from(receiptKey,'base64');

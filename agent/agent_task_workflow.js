@@ -32,6 +32,7 @@ export function validateTaskCommand(command) {
 export function taskWorkflowText(key,language,title='') {
  const texts={
   name:{en:'What name should I give the care plan?',ur:'کیئر پلان کا کیا نام رکھوں؟',roman_ur:'Care plan ka naam kya rakhoon?'},
+  continue:{en:'Go ahead. First, what name should I give the care plan?',ur:'جی، بتاتے جائیں۔ پہلے کیئر پلان کا نام بتا دیں۔',roman_ur:'Theek hai, aap batate jayein. Pehle care plan ka naam bata dein.'},
   confirm:{en:`Create a draft care plan named “${title}”?`,ur:`“${title}” نام کا ڈرافٹ کیئر پلان بناؤں؟`,roman_ur:`“${title}” naam ka draft care plan bana doon?`},
   done:{en:`The draft care plan “${title}” was created. Upload its documents next.`,ur:`ڈرافٹ کیئر پلان “${title}” بن گیا۔ اب اس کے دستاویزات اپ لوڈ کریں۔`,roman_ur:`Draft care plan “${title}” ban gaya. Ab is ke documents upload karein.`},
   cancelled:{en:'Care plan creation cancelled.',ur:'کیئر پلان بنانا منسوخ کر دیا۔',roman_ur:'Care plan banana cancel kar diya.'},

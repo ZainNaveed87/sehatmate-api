@@ -1153,7 +1153,15 @@ async function handleAgentConfirmation({
  * reply turns without any real provider credentials.
  */
 export async function handleAgentMessage(input) {
-  return runVoiceTiming(input.voiceReply===true,()=>handleAgentMessageInternal(input));
+  return runVoiceTiming(input.voiceReply===true,async()=>{
+    const presentation={};
+    const result=await handleAgentMessageInternal({...input,presentation});
+    // A planner receives a bounded message. Never label a rendering of only its
+    // prefix as the complete original ASR transcript.
+    const fullMessageFits=typeof input.message==='string'&&input.message.trim().length<=AGENT_PLANNER_LIMITS.messageMaxChars;
+    return result.ok && result.language==='roman_ur' && fullMessageFits && presentation.text
+      ? {...result,displayTranscript:presentation.text} : result;
+  });
 }
 
 async function handleAgentMessageInternal({
@@ -1167,6 +1175,7 @@ async function handleAgentMessageInternal({
   clientToday = null,
   provider = defaultAgentProvider,
   voiceReply = false,
+  presentation = {},
 }) {
   let language = 'en';
   const prepareStarted=performance.now();
@@ -1438,6 +1447,14 @@ async function handleAgentMessageInternal({
     let workflowPlan=null;
     if(session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
       workflowPlan=await planAgentMessage({provider,message:boundedMessage,contextSlice:{...buildAgentContextSlice({language,screenContext:context.screenContext,sessionState:session.state,conversationContext}),...(clientUi?{clientUi}:{}),taskWorkflow:session.state.taskWorkflow}});
+      if(workflowPlan.ok) {
+        presentation.text=workflowPlan.plan.displayTranscript;
+        // Acknowledgement/uncertain continuation cannot escape an active server
+        // collection into a generic reply. No fields or consent are inferred.
+        if(['conversation','ambiguous'].includes(workflowPlan.plan.category)&&!workflowPlan.plan.memoryProposal) {
+          return handleTaskCommand({pool,userId,session,command:{kind:'resume'},message:boundedMessage,language});
+        }
+      }
       if(workflowPlan.ok&&workflowPlan.plan.taskCommand)return handleTaskCommand({pool,userId,session,command:workflowPlan.plan.taskCommand,message:boundedMessage,language});
     }
     const referenceResolution = selectedReferenceResolution ||
@@ -1552,6 +1569,7 @@ async function handleAgentMessageInternal({
     }
 
     const plan = planned.plan;
+    presentation.text=plan.displayTranscript;
     if(plan.taskCommand)return handleTaskCommand({pool,userId,session,command:plan.taskCommand,message:boundedMessage,language});
     const referenceBinding = reviewPlanAgainstResolvedReference({
       plan,
@@ -1872,7 +1890,8 @@ async function handleTaskCommand({pool,userId,session,command,message,language})
   if(!reduced.ok)return {ok:true,sessionId:session.id,language,...(session.state?.taskWorkflow?taskWorkflowResponse(session.state.taskWorkflow,language):{}),reply:reduced.reply??taskWorkflowText('failed',language),fallbackCode:reduced.code,navigation:null};
   const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,taskWorkflow:reduced.workflow},expectedState:session.state});
   if(!saved.ok)return {ok:false,code:saved.code,message:taskWorkflowText('failed',language)};
-  return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(reduced.workflow,language)};
+  return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(reduced.workflow,language),
+    ...(command.kind==='resume'&&reduced.workflow.status==='collecting'?{reply:taskWorkflowText('continue',language)}:{})};
 }
 async function handleTaskConfirmation({pool,userId,session,request,language}) {
   const task=session.state.taskWorkflow;
