@@ -62,7 +62,7 @@ import {
   isExecutableAgentPermissionClass,
   reviewAgentCapabilityCalls,
 } from './agent_safety_gateway.js';
-import { defaultAgentProvider } from './agent_provider.js';
+import { AGENT_PROVIDER_LIMITS, defaultAgentProvider } from './agent_provider.js';
 import {timeVoiceStage} from './agent_voice_quality.js';
 import {AGENT_SEMANTIC_CATEGORIES,reviewSemanticRoute} from './agent_semantic_routes.js';
 import {buildAgentProductContext,selectAgentProductFacts} from './agent_product_context.js';
@@ -137,6 +137,53 @@ function navigationCatalogLines() {
       : '()';
     return `- ${target.target}${params}`;
   });
+}
+
+// One columnar registration catalog instead of advertising tools/routes twice.
+// The planner selects fact IDs; the reply stage separately loads their complete
+// descriptions from the server catalog. Boundary descriptions remain here.
+function plannerProductCatalog() {
+  const capabilities = new Map(listAgentCapabilities()
+    .filter(c => isExecutableAgentPermissionClass(c.permissionClass))
+    .map(c => [`cap_${c.name}`, c]));
+  return {
+    columns: ['id', 'permissionClassOrKind', 'description', 'argsOrParams', 'supportedChoices'],
+    facts: buildAgentProductContext().facts.map(fact => fact.id.startsWith('nav_') ? [fact.id] : [
+      fact.id, fact.permissionClass ?? fact.kind ?? 'navigation', capabilities.has(fact.id) ? '' : fact.description ?? '',
+      capabilities.has(fact.id) ? argSummary(capabilities.get(fact.id).inputSchema) : fact.params ?? null,
+      fact.supportedChoices ?? null,
+    ]),
+    // Product help may omit whole entries at its own bound. Those omissions must
+    // never hide supported navigation from the independent closed route registry.
+    navigation: listAgentNavigationTargets().map(({target,params}) => [target,params]),
+  };
+}
+
+function plannerContext(contextSlice) {
+  const context = {...(contextSlice ?? {})};
+  // Storage/audit metadata is not reasoning evidence. Preserve typed memory and
+  // explicit/inferred provenance, without timestamps or long evidence references.
+  if (Array.isArray(context.relevantMemory)) context.relevantMemory = context.relevantMemory.map(
+    item => ({kind:item.kind,key:item.key,value:item.value,confirmedByUser:item.confirmedByUser,confidence:item.confidence}));
+  return context;
+}
+
+function boundedPlanningUserPrompt({sections, message, contextSlice, ending = 'Return the JSON plan now.'}) {
+  const context = plannerContext(contextSlice);
+  const assemble = () => [...sections, 'Verified server context (structured, read-only):',
+    JSON.stringify(context), contextSlice?.uiContinuation
+      ? 'Server workflow event (read-only continuation; no new user message):'
+      : 'User message (untrusted text):', message, ending].join('\n\n');
+  // Optional continuity hints are omitted whole and deterministically, never
+  // sliced into misleading fragments. Current UI, workflow, language, entity,
+  // focus and resolved-reference authority are always retained. Validators still
+  // receive the original context, so compaction cannot widen execution authority.
+  for (const key of ['lastActionSummary','familyMembers','relevantMemory',
+    'lastCapabilityNames','lastIntent','conversationTopic','recentEntities','recentOrderedEntityList']) {
+    if (assemble().length <= AGENT_PROVIDER_LIMITS.userPromptMaxChars) break;
+    delete context[key];
+  }
+  return assemble();
 }
 
 function isPlainObject(value) {
@@ -256,40 +303,24 @@ export function buildAgentPlannerPrompts({ message, contextSlice = null }) {
     'navigationIntent is null or {"target":"target_name","params":{}}.',
   ].join('\n');
 
-  const userPrompt = [
+  const sections = [
     'Server-owned semantic routing rules (all paraphrases; never phrase matching):',
-    '- conversation: acknowledgement, social conversation or general supported-domain explanation with no patient-specific facts. Zero tools; a normal model reply is allowed.',
-    '- app_help: product identity, benefits, objections, comparisons or supported feature explanations. Zero tools; a natural reply uses only registered server-owned product facts, never patient data or remembered app claims. Interpret arbitrary follow-ups using conversationTopic as a continuity hint, not evidence.',
-    '- patient_read: requested personal/changing care facts. Use relevant authoritative READ capabilities; no guessing.',
-    '- navigation: explicit request to open a supported screen; READ only if needed for that request.',
-    '- action: request for a supported change; use a DRAFT, never execute a mutation.',
-    '- unsupported: outside supported app/care assistance or forbidden clinical changes. Zero tools.',
-    '- ambiguous: insufficient meaning/context to answer safely. Zero tools; ask a concise clarification, do not invent task intent.',
-    '- Generic help, today, what is happening, or app names alone are NOT task requests. Next-task/today-task tools require a request for actual tasks, pending work or schedule.',
-    '- Use a brief descriptive snake_case intent label for the current meaning, including the topic of a follow-up; never store user text or patient details in the label.',
-    '- Previous task queries do not convert an unrelated current message into a task follow-up. Category is mandatory; intent remains descriptive only.',
+    'Categories: conversation=social/acknowledgement/general supported explanation without personal facts; app_help=identity/benefits/objections/comparisons/features grounded ONLY in registered product facts. Both use zero tools. conversationTopic hints continuity, never evidence.',
+    'patient_read=personal/changing care facts requiring owned READs; navigation=explicit supported screen opening (READ only if needed); action=supported change through DRAFT only; unsupported=outside scope/clinical changes, zero tools; ambiguous=clarify insufficient meaning, zero tools.',
+    'Generic help, today, app names or isolated words are not task queries. Next/today-task tools require actual tasks/pending work/schedule. Old task intent cannot convert an unrelated current request. Category is mandatory; intent is a brief descriptive snake_case label, without user text/patient details.',
     '',
     'Server-owned product catalog (descriptions also explain tools; selection is metadata, never execution):',
-    JSON.stringify(buildAgentProductContext()),
+    JSON.stringify(plannerProductCatalog()),
     '',
-    'Available normal-turn capabilities:',
-    ...capabilityCatalogLines(),
+    'Available normal-turn capabilities: cap_ fact IDs name tools (remove cap_); args and permission classes are in the catalog. The navigation table lists every allowed target and required/optional entity params. nav_ IDs identify registered product facts only. No other tools or routes exist.',
     '',
-    'Available navigation targets:',
-    ...navigationCatalogLines(),
-    '',
-    'Task workflow: use category task_workflow with taskCommand {kind:start,workflowKind:create_care_plan} to collect only the required care plan name. Use update with fieldSpans {title:{start,end}} UTF-16 indices copied from CURRENT user message, excluding correction phrases and old/rejected names. Never fabricate fields. Resume/cancel use kind only. Active workflow must resolve before unrelated entity references; navigation/help preserve it. No capability calls/UI/navigation/memory in task workflow plans. Creation executes ONLY through explicit server confirmation, never a normal tool call.',
+    'Task workflow: category task_workflow, taskCommand {kind:start,workflowKind:create_care_plan} collects care plan title only; update uses fieldSpans {title:{start,end}} copied UTF-16 indices from CURRENT message, excluding correction phrases/old/rejected names. Never fabricate fields. resume/cancel use kind only. Active workflow precedes unrelated references; help/navigation preserve it. No capability calls/UI/navigation/memory in task plans. Creation requires explicit server confirmation, never a tool call.',
     'UI guidance: walkthrough_start/next/previous/repeat/stop/open_chat/continue are read-only app walkthrough controls, distinct from questionnaire next/previous which save answers. Choose walkthrough_* to guide the screen step by step. Use actual target help/value/visibility only; never invent controls. When clientUi is supplied, use category ui_guidance and optional uiOperations (maximum 4), each exactly {actionId,targetId,args:{}} from its registered actions/targets. Explain the current question using its UI label, never as verified medical truth. Map natural answers to the available semantic choices, never a phrase table. If ambiguous, ask a question with no operations. Highlight when explaining or recommending. Choices/Next that persist require client confirmation; a proposal is not execution. Never claim an operation already succeeded. No arbitrary arguments, routes, coordinates or methods. UI actions must stop on stale context. Navigation uses navigationIntent and its existing server catalog. Memory hints are non-clinical context only, never treatment authority.',
     'Optional memoryProposal is a review proposal, NEVER execution. Use only explicit useful stable non-clinical user preferences/constraints, not temporary statements, guesses or medical facts. Shape {kind:CONFIRMED_FACT|USER_PREFERENCE,key,value}. Keys: communication.language {language:en|ur|roman_ur}; explanation.detail {level:brief|step_by_step}; voice.preference {enabled:boolean}; accessibility.reduced_motion {enabled:boolean}; availability.constraint {days:[0..6],startMinute:0..1439,endMinute:1..1440,available:boolean}; routine.barrier {category:timing|transport|reminder|accessibility|caregiver_support}; caregiver.preference {enabled:boolean}; workflow.preference {mode:guided|independent}. A client review confirmation is required before storage. Relevant memory is labelled by kind; inferred patterns never become facts. Omit uncertain or irrelevant proposals.',
     '',
-    'Verified server context (structured, read-only):',
-    JSON.stringify(contextSlice ?? {}),
-    '',
-    contextSlice?.uiContinuation ? 'Server workflow event (read-only continuation; no new user message):' : 'User message (untrusted text):',
-    message,
-    '',
-    'Return the JSON plan now.',
-  ].join('\n');
+  ];
+
+  const userPrompt = boundedPlanningUserPrompt({sections, message, contextSlice});
 
   return { systemPrompt, userPrompt };
 }
@@ -332,7 +363,8 @@ export function buildAgentPlannerRepairPrompt({
   contextSlice = null,
   failureCode,
 }) {
-  return [
+  return boundedPlanningUserPrompt({message, contextSlice: {...contextSlice,
+    referenceResolution: compactReferenceResolution(contextSlice)}, sections: [
     'The previous planning attempt was rejected by server validation.',
     'Return corrected JSON only.',
     `Required category: one of ${AGENT_SEMANTIC_CATEGORIES.join(', ')}.`,
@@ -341,7 +373,7 @@ export function buildAgentPlannerRepairPrompt({
     `Failure code: ${safeFailureCode(failureCode)}.`,
     'Only app_help requires productFactIds (1-6 relevant registered IDs); all other categories omit it.',
     'Server product catalog:',
-    JSON.stringify(buildAgentProductContext()),
+    JSON.stringify(plannerProductCatalog()),
     'Do not invent IDs.',
     'Do not include userId or user_id.',
     'Do not plan mutations or safety-sensitive changes.',
@@ -351,10 +383,8 @@ export function buildAgentPlannerRepairPrompt({
     navigationNameList(),
     'Reference resolution:',
     JSON.stringify(compactReferenceResolution(contextSlice)),
-    'Original user message:',
-    cleanText(message, 500),
     'If referenceResolution.status=resolved, use exactly the server-provided entity type/id.',
-  ].join('\n');
+  ]});
 }
 
 /**
