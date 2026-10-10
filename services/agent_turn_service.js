@@ -2,6 +2,7 @@ import {createCipheriv,createDecipheriv,createHmac,randomBytes} from 'node:crypt
 import {sessionSpeechPolicy} from '../agent/agent_voice_config.js';
 import {voiceError,strictObject,opaqueId,millis} from './voice_contract.js';
 import {validateTaskWorkflow} from '../agent/agent_task_workflow.js';
+import {traceVoiceTurn} from './voice_turn_trace.js';
 
 const approvedFields=['sessionId','language','reply','navigation','confirmation','clarification','actionStatus','referencedEntities','fallbackCode','uiPlan','memoryProposal','conflicts','taskWorkflow','displayTranscript', 'conversationLanguage'];
 const canonical=value=>JSON.stringify(value && typeof value==='object' ? Array.isArray(value) ? value.map(v=>JSON.parse(canonical(v))) : Object.fromEntries(Object.keys(value).sort().map(k=>[k,JSON.parse(canonical(value[k]))])) : value);
@@ -46,6 +47,7 @@ export function createAgentTurnService({store,sessions,config,receiptKey,handleA
       try {response.result=decrypt(r);} catch {response.status='recovery_required';}
     } else if(status==='completed') response.status='receipt_expired';
     if(response.status==='completed' && response.result) response.speechPolicy=sessionSpeechPolicy(config,s,r.turnId);
+    traceVoiceTurn('BACKEND_RESPONSE',r.turnId,{status:response.status});
     return response;
   }
   async function receipt({userId,id,turnId}) {
@@ -54,6 +56,7 @@ export function createAgentTurnService({store,sessions,config,receiptKey,handleA
   }
   async function submit({userId,id,input,workerAuth=null}) {
     validate(input);userId=String(userId);
+    traceVoiceTurn('BACKEND_REQUEST',input.turnId);
     const initial=await sessions.owned(userId,id);
     if(workerAuth) await sessions.authorizeWorker(workerAuth,id);
     if(initial.epoch!==input.epoch) throw voiceError('VOICE_STALE_EPOCH');
@@ -108,8 +111,10 @@ export function createAgentTurnService({store,sessions,config,receiptKey,handleA
           voiceReply:true});
         // The core may report a mutation failure after a partial write; this is uncertain.
         if(!result?.ok||result.fallbackCode==='AGENT_CAPABILITY_FAILED') throw voiceError('VOICE_AGENT_UNCERTAIN');
+        traceVoiceTurn('REPLY_EXTRACTED',r.turnId);
+        traceVoiceTurn('ACTIONS_EXTRACTED',r.turnId);
         r.encryptedResult=encrypt(result,r);r.status='completed';
-      } catch {r.status='recovery_required';r.encryptedResult=null;}
+      } catch {traceVoiceTurn('FAILED',r.turnId,{error:'AGENT'});r.status='recovery_required';r.encryptedResult=null;}
       r.finishedAt=new Date(now()).toISOString();
       try {
         await store.transaction(userId,async db=>{
@@ -119,7 +124,7 @@ export function createAgentTurnService({store,sessions,config,receiptKey,handleA
           if(r.status!=='recovery_required' && s.activeTurnId===r.turnId) {s.activeTurnId=null;await db.saveSession(s);}
         });
         return await view(r,await sessions.owned(userId,id));
-      } catch {return {turnId:r.turnId,status:'recovery_required',epoch:r.epoch};}
+      } catch {traceVoiceTurn('FAILED',r.turnId,{error:'PERSIST'});return {turnId:r.turnId,status:'recovery_required',epoch:r.epoch};}
       finally {await unlock();}
     })();
     // Timeout does not cancel the Agent or release its lock. Poll the same receipt; never replay.

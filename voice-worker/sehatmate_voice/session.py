@@ -4,6 +4,7 @@ import json
 from uuid import uuid4
 from .bridge import BridgeError
 from .fish_adapter import FishError
+from .turn_trace import trace
 
 class TranscriptTurn:
     def __init__(self): self.parts=[]
@@ -57,7 +58,10 @@ class VoiceSession:
     async def speech_event(self,kind,text=''):
         if self.closed or not self.listening or self.blocked: return
         if kind=='start':
-            self.last_activity=self.clock();await self.interrupt();return
+            self.last_activity=self.clock()
+            if self.play_task and not self.play_task.done() or self.playback_id is not None:
+                await self.interrupt()
+            return
         if kind=='interim':
             self.last_activity=self.clock();self.state='transcribing'
             await self.events.emit('transcript_interim',text=text[:4000]);return
@@ -69,6 +73,7 @@ class VoiceSession:
                 # Do not queue potentially ambiguous confirmations behind another turn.
                 await self.events.emit('recovering',code='TURN_BUSY');return
             turn_id=str(uuid4())
+            trace('TRANSCRIPT_FINAL',turn_id)
             await self.events.emit('transcript_final',turn_id=turn_id,text=final)
             self.turn_task=asyncio.create_task(self._turn(turn_id,final))
 
@@ -76,7 +81,12 @@ class VoiceSession:
         generation=self.audio_generation
         self.state='processing';await self.events.emit('processing',turn_id=turn_id)
         try:
-            receipt=await self.bridge.turn(turn_id,text)
+            trace('BACKEND_REQUEST',turn_id)
+            try: receipt=await self.bridge.turn(turn_id,text)
+            except Exception:
+                trace('FAILED',turn_id,error='BACKEND')
+                raise
+            trace('BACKEND_RESPONSE',turn_id,status=receipt.get('status'))
             await self.apply_receipt(receipt,generation)
         except BridgeError as error:
             if not self.closed:
@@ -99,36 +109,49 @@ class VoiceSession:
         finally: self.receipt_pending.discard(turn_id)
 
     async def apply_receipt(self,receipt,generation):
-        async with self.result_lock:
-            if self.closed: return
-            status=receipt['status']
-            if status!='completed':
-                self.blocked=True;await self.fallback('backend',status,turn_id=receipt.get('turnId'));return
-            actual_id=receipt['turnId']
-            if actual_id in self.completed: return
-            result=receipt.get('result')
-            if not isinstance(result,dict): raise BridgeError('INVALID_RECEIPT')
-            self.completed.add(actual_id)
-            if len(self.completed)>100: raise BridgeError('TURN_LIMIT')
-            if len(json.dumps(result).encode())>10000:
-                await self.events.emit('agent_result',turn_id=actual_id,resultViaUserApi=True,
-                    receiptPath=f'/api/agent/voice-sessions/{self.events.session_id}/turns/{actual_id}')
-            else: await self.events.emit('agent_result',turn_id=actual_id,result=result)
-            if self.on_language and result.get('language') in ('en','ur','roman_ur'):
-                try: await self.on_language(result['language'])
-                except Exception:
-                    # Keep the completed Agent result authoritative. Recognition
-                    # cannot continue with an unconfirmed language configuration.
-                    await self.fallback('stt','STT_LANGUAGE_UPDATE_FAILED')
-                    return
-            self.state='awaiting_confirmation' if result.get('confirmation') else 'awaiting_clarification' if result.get('clarification') else 'listening'
-            if self.state.startswith('awaiting_'): await self.events.emit(self.state,turn_id=actual_id)
-            if self.listening and generation==self.audio_generation and isinstance(result.get('reply'),str) and result['reply']:
-                self.play_task=asyncio.create_task(self.speak(result['reply'],actual_id,receipt.get('speechPolicy')))
+        try:
+            async with self.result_lock:
+                if self.closed: return
+                status=receipt['status']
+                if status!='completed':
+                    self.blocked=True;await self.fallback('backend',status,turn_id=receipt.get('turnId'));return
+                actual_id=receipt['turnId']
+                if actual_id in self.completed: return
+                result=receipt.get('result')
+                if not isinstance(result,dict): raise BridgeError('INVALID_RECEIPT')
+                trace('REPLY_EXTRACTED',actual_id)
+                trace('ACTIONS_EXTRACTED',actual_id)
+                self.completed.add(actual_id)
+                if len(self.completed)>100: raise BridgeError('TURN_LIMIT')
+                if len(json.dumps(result).encode())>10000:
+                    await self.events.emit('agent_result',turn_id=actual_id,resultViaUserApi=True,
+                        receiptPath=f'/api/agent/voice-sessions/{self.events.session_id}/turns/{actual_id}')
+                else: await self.events.emit('agent_result',turn_id=actual_id,result=result)
+                trace('UI_EVENT_SENT',actual_id)
+                if self.on_language and result.get('language') in ('en','ur','roman_ur'):
+                    try: await self.on_language(result['language'])
+                    except Exception:
+                        # Keep the completed Agent result authoritative. Recognition
+                        # cannot continue with an unconfirmed language configuration.
+                        trace('TTS_SUPPRESSED',actual_id,status='STT_LANGUAGE_UPDATE_FAILED')
+                        await self.fallback('stt','STT_LANGUAGE_UPDATE_FAILED')
+                        return
+                self.state='awaiting_confirmation' if result.get('confirmation') else 'awaiting_clarification' if result.get('clarification') else 'listening'
+                if self.state.startswith('awaiting_'): await self.events.emit(self.state,turn_id=actual_id)
+                if self.listening and generation==self.audio_generation and isinstance(result.get('reply'),str) and result['reply']:
+                    trace('TTS_ENQUEUED',actual_id)
+                    self.play_task=asyncio.create_task(self.speak(result['reply'],actual_id,receipt.get('speechPolicy')))
+                else:
+                    trace('TTS_SUPPRESSED',actual_id,status='NOT_LISTENING' if not self.listening else
+                        'GENERATION_CHANGED' if generation!=self.audio_generation else 'NO_REPLY')
+        except Exception:
+            trace('FAILED',receipt.get('turnId'),error='RESULT')
+            raise
 
     async def speak(self,text,turn_id=None,speech_policy=None):
         self.playback_id=str(uuid4());generation=self.playback_id
         try:
+            trace('TTS_STARTED',turn_id)
             async def audio_chunks():
                 if hasattr(self.fish,'audio_for_reply'):
                     async for audio in self.fish.audio_for_reply(text,speech_policy,
@@ -141,19 +164,29 @@ class VoiceSession:
             started=False
             async for audio in audio_chunks():
                 if self.closed or generation!=self.playback_id: return
+                trace('TTS_AUDIO_READY',turn_id)
                 if not started:
                     await self.events.emit('speaking',turn_id=turn_id,provider='fish',playbackId=generation)
                     started=True
                 await self.playback.play(audio)
+                trace('TTS_PUBLISHED',turn_id)
                 self.last_activity=self.clock()
             if not self.closed and generation==self.playback_id:
                 self.playback_id=None;await self.events.emit('playback_complete',turn_id=turn_id,playbackId=generation)
+                trace('COMPLETE',turn_id,status='completed')
         except FishError as error:
+            trace('TTS_FAILED',turn_id,error=error.code)
             await self.playback.stop()
             if not self.closed and generation==self.playback_id:
                 # Half duplex for device TTS; explicit ack/resume is required.
                 await self.pause();await self.fallback('tts',error.code,turn_id=turn_id,
                     text=getattr(error,'remaining_text',text),text_offset=getattr(error,'text_offset',0))
+        except asyncio.CancelledError:
+            trace('TTS_INTERRUPTED',turn_id)
+            raise
+        except Exception:
+            trace('TTS_FAILED',turn_id,error='TTS')
+            raise
         finally:
             if generation==self.playback_id and self.closed: self.playback_id=None
 
