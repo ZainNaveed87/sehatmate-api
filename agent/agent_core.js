@@ -1494,6 +1494,39 @@ async function handleAgentMessageInternal({
       });
 
     if (voiceReply) recordVoiceLatency('PREPARE',contextStarted);
+    const contextSlice = Object.freeze({
+      ...buildAgentContextSlice({
+        language,
+        screenContext: context.screenContext,
+        sessionState: session.state,
+        conversationContext,
+        referenceResolution: referenceResolutionContext(referenceResolution),
+      }),
+      conversationTopic: productConversationContext(session.state.lastActionSummary),
+      ...(clientUi?{clientUi}:{}),
+      relevantMemory:await readRelevantAgentMemory({db:pool,userId,screenId:clientUi?.screenId||context.screenContext?.screenId}),
+    });
+
+    // --- deterministic resolved-reference navigation or bounded planning ---
+    const fastNavigationPlan = resolvedReferenceNavigationPlan({
+      message: boundedMessage,
+      resolution: referenceResolution,
+    });
+    const plannerStarted=performance.now();
+    const planned = workflowPlan??(fastNavigationPlan
+      ? validateAgentPlan(fastNavigationPlan)
+      : await planAgentMessage({
+          provider,
+          message: boundedMessage,
+          contextSlice,
+        }));
+    if (voiceReply) recordVoiceLatency('PLANNER',plannerStarted);
+    // Current semantic creation takes precedence over unrelated pointers.
+    // Other plans still fail closed on the same reference checks below.
+    if(planned.ok&&planned.plan.taskCommand?.kind==='start') {
+      presentation.text=planned.plan.displayTranscript;
+      return handleTaskCommand({pool,userId,session,command:planned.plan.taskCommand,message:boundedMessage,language});
+    }
     if (
       referenceResolution.status === 'ambiguous' ||
       referenceResolution.status === 'missing'
@@ -1529,33 +1562,6 @@ async function handleAgentMessageInternal({
       });
     }
 
-    const contextSlice = Object.freeze({
-      ...buildAgentContextSlice({
-        language,
-        screenContext: context.screenContext,
-        sessionState: session.state,
-        conversationContext,
-        referenceResolution: referenceResolutionContext(referenceResolution),
-      }),
-      conversationTopic: productConversationContext(session.state.lastActionSummary),
-      ...(clientUi?{clientUi}:{}),
-      relevantMemory:await readRelevantAgentMemory({db:pool,userId,screenId:clientUi?.screenId||context.screenContext?.screenId}),
-    });
-
-    // --- deterministic resolved-reference navigation or bounded planning ---
-    const fastNavigationPlan = resolvedReferenceNavigationPlan({
-      message: boundedMessage,
-      resolution: referenceResolution,
-    });
-    const plannerStarted=performance.now();
-    const planned = workflowPlan??(fastNavigationPlan
-      ? validateAgentPlan(fastNavigationPlan)
-      : await planAgentMessage({
-          provider,
-          message: boundedMessage,
-          contextSlice,
-        }));
-    if (voiceReply) recordVoiceLatency('PLANNER',plannerStarted);
     if (!planned.ok) {
       if (planned.code === 'AGENT_MESSAGE_EMPTY') {
         return {
@@ -1911,9 +1917,20 @@ async function handleAgentMessageInternal({
 }
 
 async function handleTaskCommand({pool,userId,session,command,message,language}) {
+  if(command.kind==='start'&&session.state?.taskWorkflow?.status==='awaiting_confirmation') {
+    return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(session.state.taskWorkflow,language),
+      reply:confirmationText('alreadyAwaiting',language),navigation:null};
+  }
+  if(command.kind==='start'&&hasActivePendingDraft(session.state)) {
+    return {ok:true,sessionId:session.id,language,reply:confirmationText('alreadyAwaiting',language),
+      fallbackCode:'AGENT_CONFIRMATION_ALREADY_PENDING',confirmation:responseConfirmationFromDraft(session.state.pendingDraft,language),
+      actionStatus:'awaiting_confirmation',navigation:null,clarification:null,referencedEntities:[],
+      ...(session.state.taskWorkflow?{taskWorkflow:session.state.taskWorkflow}:{})};
+  }
   const reduced=reduceTaskWorkflow({current:session.state?.taskWorkflow,command,message,language});
   if(!reduced.ok)return {ok:true,sessionId:session.id,language,...(session.state?.taskWorkflow?taskWorkflowResponse(session.state.taskWorkflow,language):{}),reply:reduced.reply??taskWorkflowText('failed',language),fallbackCode:reduced.code,navigation:null};
-  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:null,taskWorkflow:reduced.workflow},expectedState:session.state});
+  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:null,
+    ...(command.kind==='start'?{pendingClarification:null}:{}),taskWorkflow:reduced.workflow},expectedState:session.state});
   if(!saved.ok)return {ok:false,code:saved.code,message:taskWorkflowText('failed',language)};
   return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(reduced.workflow,language),
     ...(command.kind==='start'?{navigation:{target:'care_plan_new',params:{}}}:{}),

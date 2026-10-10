@@ -338,7 +338,7 @@ function ambiguousCarePlanPool({
 }
 
 async function requestCarePlanClarification(pool, message = 'us wala dikhao') {
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const result = await handleAgentMessage({
     pool,
     userId: USER,
@@ -348,7 +348,8 @@ async function requestCarePlanClarification(pool, message = 'us wala dikhao') {
   });
   assert.equal(result.ok, true);
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
   assert.ok(result.clarification);
   return result.clarification;
 }
@@ -835,7 +836,7 @@ await test('real two-turn pronoun reference with two care plans asks clarificati
     '21',
   ]);
 
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const second = await handleAgentMessage({
     pool,
     userId: USER,
@@ -861,7 +862,8 @@ await test('real two-turn pronoun reference with two care plans asks clarificati
   assert.equal(pool.state.pendingClarification.clarificationId, second.clarification.clarificationId);
   assert.equal(pool.state.pendingConfirmation, null);
   assert.equal(pool.state.pendingDraft, null);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
 await test('valid clarification choice resolves exact care plan navigation without provider calls', async () => {
@@ -1149,7 +1151,7 @@ await test('pending clarification is separate from pending confirmation and draf
       ],
     },
   });
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const result = await handleAgentMessage({
     pool,
     userId: USER,
@@ -1164,7 +1166,8 @@ await test('pending clarification is separate from pending confirmation and draf
   assert.equal(pool.state.pendingConfirmation.confirmationId, 'phase-e-confirm');
   assert.equal(pool.state.pendingDraft.confirmationId, 'phase-e-confirm');
   assert.equal(result.confirmation, null);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
 await test('larger ambiguous candidate sets do not become truncated structured choices', async () => {
@@ -1186,7 +1189,7 @@ await test('larger ambiguous candidate sets do not become truncated structured c
       },
     },
   });
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
 
   const result = await handleAgentMessage({
     pool,
@@ -1200,7 +1203,8 @@ await test('larger ambiguous candidate sets do not become truncated structured c
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(result.clarification, null);
   assert.equal(pool.state.pendingClarification, null);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
 await test('two-turn ordinal read rejects planner substitution of another plan', async () => {
@@ -1471,7 +1475,7 @@ await test('stale ordered-list entity fails ownership revalidation before ordina
     },
     plans: [{ id: '17', title: 'Prescription Plan' }],
   });
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
 
   const result = await handleAgentMessage({
     pool,
@@ -1485,7 +1489,8 @@ await test('stale ordered-list entity fails ownership revalidation before ordina
   assert.equal(result.language, 'roman_ur');
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_NOT_FOUND');
   assert.equal(result.navigation, null);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
 await test('fresh ordered list keeps us wala ambiguous with multiple candidates', async () => {
@@ -1506,7 +1511,7 @@ await test('fresh ordered list keeps us wala ambiguous with multiple candidates'
   assert.equal(first.ok, true);
   assertOrderedIds(pool, 'care_plan', ['17', '21']);
 
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const second = await handleAgentMessage({
     pool,
     userId: USER,
@@ -1520,10 +1525,11 @@ await test('fresh ordered list keeps us wala ambiguous with multiple candidates'
   assert.equal(second.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(second.navigation, null);
   assert.match(second.reply, /kis wale/i);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
-await test('core ambiguous us wala asks clarification with zero provider calls', async () => {
+await test('core ambiguous us wala asks clarification after semantic routing', async () => {
   const pool = createPool({
     plans: [
       { id: '17', title: 'Prescription Plan' },
@@ -1537,14 +1543,15 @@ await test('core ambiguous us wala asks clarification with zero provider calls',
       ],
     },
   });
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const result = await handleAgentMessage({
     pool, userId: USER, sessionId: SESSION_ID, message: 'us wala kholo', provider: provider.provider,
   });
   assert.equal(result.ok, true);
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(result.navigation, null);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
 await test('core resolves explicit care-plan title navigation without provider calls', async () => {
@@ -1577,7 +1584,7 @@ await test('core resolves explicit care-plan title navigation without provider c
   assert.equal(provider.calls, 0);
 });
 
-await test('core duplicate explicit care-plan title asks clarification without provider calls', async () => {
+await test('core duplicate explicit care-plan title asks clarification after semantic routing', async () => {
   const pool = createPool({
     plans: [
       { id: '17', title: 'Morning Plan' },
@@ -1591,7 +1598,7 @@ await test('core duplicate explicit care-plan title asks clarification without p
       ],
     },
   });
-  const provider = zeroCallProvider();
+  const provider = plannedProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const result = await handleAgentMessage({
     pool, userId: USER, sessionId: SESSION_ID, message: 'Morning Plan dikhao', provider: provider.provider,
   });
@@ -1599,7 +1606,8 @@ await test('core duplicate explicit care-plan title asks clarification without p
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(result.navigation, null);
   assert.match(result.reply, /kis wale/i);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
 });
 
 await test('core rejects planner id that disagrees with resolved currentFocus', async () => {

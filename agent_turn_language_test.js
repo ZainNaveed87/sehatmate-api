@@ -618,7 +618,7 @@ await test('ambiguous reference still asks clarification and does not guess', as
       carePlanRow({ id: 9, title: 'Exercise Plan' }),
     ],
   });
-  const provider = zeroProvider();
+  const provider = planProvider({category:'ambiguous',intent:'clarify_reference',capabilityCalls:[],navigationIntent:null});
   const result = await handleAgentMessage({
     pool,
     userId: USER,
@@ -631,7 +631,8 @@ await test('ambiguous reference still asks clarification and does not guess', as
   assert.equal(result.language, 'roman_ur');
   assert.equal(result.fallbackCode, 'AGENT_REFERENCE_AMBIGUOUS');
   assert.equal(result.navigation, null);
-  assert.equal(provider.calls, 0);
+  assert.equal(provider.calls.plan, 1);
+  assert.equal(provider.calls.reply, 0);
   assert.match(result.reply, /Aap kis wale ki baat kar rahe hain/i);
 });
 
