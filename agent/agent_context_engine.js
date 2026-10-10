@@ -404,6 +404,7 @@ export function buildAgentContextSlice({
 
   return Object.freeze({
     ...(state.taskWorkflow?{taskWorkflow:state.taskWorkflow}:{}),
+    ...(state.languageQuestion?{languageQuestion:state.languageQuestion}:{}),
     language: canonicalAgentLanguage(language),
     screenId: screenContext?.screenId || null,
     currentEntity: screenContext?.entity || null,

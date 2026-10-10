@@ -1,3 +1,4 @@
+import {validateLanguageCommand,validateConversationLanguage} from './agent_language_control.js';
 import {validateTaskWorkflow} from './agent_task_workflow.js';
 /**
  * Canonical bounded state contract for agent sessions (Phase A2).
@@ -322,7 +323,11 @@ export function sanitizeAgentSessionState(input, { maxStateBytes = 16384 } = {})
   }
 
   if(input.taskWorkflow!=null&&!validateTaskWorkflow(input.taskWorkflow))return {ok:false,code:'INVALID_AGENT_TASK_WORKFLOW'};
+  if(input.conversationLanguage!=null&&!validateConversationLanguage(input.conversationLanguage))return {ok:false,code:'INVALID_AGENT_LANGUAGE_STATE'};
+  if(input.languageQuestion!=null&&(!validateLanguageCommand(input.languageQuestion)||input.languageQuestion.language!==null))return {ok:false,code:'INVALID_AGENT_LANGUAGE_STATE'};
   const state = {
+    ...(input.conversationLanguage?{conversationLanguage:{...input.conversationLanguage}}:{}),
+    ...(input.languageQuestion?{languageQuestion:{...input.languageQuestion,options:[...input.languageQuestion.options]}}:{}),
     version: AGENT_SESSION_STATE_VERSION,
     ...(input.taskWorkflow!=null?{taskWorkflow:validateTaskWorkflow(input.taskWorkflow)}:{}),
     lastReferencedEntities: entities,

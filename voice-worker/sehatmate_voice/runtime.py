@@ -32,6 +32,17 @@ class Microphone:
         self.retired=set()
         self.readers=set()
 
+    async def set_language(self,language):
+        if language not in ('en','ur','roman_ur'): raise ValueError('STT_LANGUAGE_INVALID')
+        selected='en' if language=='en' else 'ur'
+        async with self.lock:
+            if self.session.closed or selected==self.config.language: return
+            # SDK updates its existing streams internally. The RTC room/track,
+            # credentials, model and recognition safety options stay unchanged.
+            self.recognizer.update_options(language=selected,endpointing_ms=500 if selected=='en' else 700)
+            self.config=replace(self.config,language=selected)
+            self.session.transcript.clear() # No partial utterance crosses a language boundary.
+
     async def start(self,track):
         async with self.lock:
             await self._stop();self.track=track
@@ -164,6 +175,7 @@ async def _run_job(ctx):
             if config.stt_enabled and claimed['providers']['deepgram']:
                 microphone=Microphone(session,create_recognizer(config,http),config)
                 session.stop_input=microphone.stop
+                session.on_language=microphone.set_language
             ended=asyncio.Event(); mic_muted=True;recovering=False
             def spawn(coro):
                 task=asyncio.create_task(coro);tasks.add(task)
@@ -176,6 +188,12 @@ async def _run_job(ctx):
             def authorized(publication,participant):
                 return participant.identity==expected and publication.source==rtc.TrackSource.SOURCE_MICROPHONE
             async def resume():
+                if microphone:
+                    # Manual text/UI actions have no Worker turn result. Resume
+                    # reads the existing authenticated binding claim so their next
+                    # spoken turn uses the effective server language as well.
+                    refreshed=await bridge.claim()
+                    await microphone.set_language(refreshed['sttLanguage'])
                 await resume_input(session,microphone,muted=mic_muted,recovering=recovering)
             session.on_resume=resume
             def subscribed(remote_track,publication,participant):

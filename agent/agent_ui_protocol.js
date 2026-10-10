@@ -53,7 +53,7 @@ export function validateAgentUiContext(raw) {
     // related plan/question. Model arguments never select a route or entity.
     if(a.kind==='open_entity'&&(!['care_gaps','care_gap_detail'].includes(raw.screenId)||!/^care_gaps\.card\.[1-9]\d{0,19}$/.test(a.targetId))) return fail('AGENT_UI_ACTION_UNAVAILABLE');
     if(['set_language','set_simple_care','sign_out'].includes(a.kind)) {
-      const allowed=raw.screenId==='settings'&&(
+      const allowed=a.kind==='set_language'&&a.targetId==='app.language'&&/^app\.language\.(en|ur|roman_ur)$/.test(a.id)||raw.screenId==='settings'&&(
         a.kind==='set_language'&&a.targetId==='settings.language'&&/^settings\.language\.(en|ur|roman_ur)$/.test(a.id)||
         a.kind==='set_simple_care'&&a.targetId==='settings.simple_care'&&/^settings\.simple_care\.(on|off)$/.test(a.id)||
         a.kind==='sign_out'&&a.targetId==='settings.sign_out'&&a.id==='settings.sign_out.execute');
@@ -69,7 +69,7 @@ export function uiActionRiskTier(kind,screenId) {
   if(['read_current_screen','read_section','read_selection','highlight','focus','scroll_to'].includes(kind)) return 0;
   if(kind.startsWith('walkthrough_'))return 0;
   if(screenId==='reality_check'&&['select_option','next','previous'].includes(kind)) return 2;
-  if(screenId==='settings'&&['set_language','set_simple_care','sign_out'].includes(kind))return 2;
+  if(kind==='set_language'||screenId==='settings'&&['set_simple_care','sign_out'].includes(kind))return 2;
   return kinds.has(kind)?1:3;
 }
 

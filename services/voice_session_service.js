@@ -1,3 +1,4 @@
+import {effectiveConversationLanguage} from '../agent/agent_language_control.js';
 import {randomUUID} from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import {voiceLanguageProfile} from '../agent/agent_profile_language.js';
@@ -1083,7 +1084,10 @@ export function createVoiceSessionService({
               ),
             );
 
-          const profile=voiceLanguageProfile(await readProfileLanguage({userId:row.userId}));
+          const preference=voiceLanguageProfile(await readProfileLanguage({userId:row.userId})).language;
+          const agent=await readAgent({userId:row.userId,sessionId:row.agentSessionId});
+          if(!agent.ok)throw voiceError(agent.code==='AGENT_SESSION_NOT_FOUND'?'VOICE_AGENT_SESSION_NOT_FOUND':'VOICE_UNAVAILABLE');
+          const profile=voiceLanguageProfile(effectiveConversationLanguage(agent.data?.session?.state,preference));
           sttLanguage=profile.sttLanguage;
           console.info(`VOICE_LANGUAGE:PROFILE_${profile.language.toUpperCase()}`);
           console.info(`VOICE_LANGUAGE:STT_${sttLanguage.toUpperCase()}`);

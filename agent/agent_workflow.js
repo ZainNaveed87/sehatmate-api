@@ -1,3 +1,5 @@
+import {effectiveConversationLanguage,languageAppliedText} from './agent_language_control.js';
+import {updateAgentSessionState} from './agent_session_store.js';
 import {readProfileLanguage} from './agent_profile_language.js';
 // A UI transition event reuses the existing planner/grounder. It is never a
 // new user utterance, backend mutation authority, or autonomous navigation.
@@ -32,7 +34,11 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
   if(!plan||plan.id!==planId||!Array.isArray(plan.operations)) reject('AGENT_WORKFLOW_NOT_FOUND',404);
   const current=await readCopilotContext({db,userId,sessionId});
   if(!current||canonical(current)!==canonical(checked.context)) reject('AGENT_UI_STALE_CONTEXT');
-  const language=await readProfileLanguage(db,userId);
+  const profileLanguage=await readProfileLanguage(db,userId);
+  const languageOperation=plan.operations.length===1&&plan.operations[0];
+  const languageMatch=languageOperation&&/^(app|settings)\.language\.(en|ur|roman_ur)$/.exec(languageOperation.actionId);
+  const appLanguage=languageMatch&&languageOperation.targetId===`${languageMatch[1]}.language`?languageMatch[2]:null;
+  const language=appLanguage?profileLanguage:effectiveConversationLanguage(session.state,profileLanguage);
   if(plan.continuationResult) {
     if(plan.continuationResult.language!==language)reject('AGENT_WORKFLOW_LANGUAGE_CHANGED');
     if(plan.continuationResult.ok!==true) reject(plan.continuationResult.code||'AGENT_WORKFLOW_FAILED',503);
@@ -41,9 +47,10 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
   if(plan.continuationClaimed) reject('AGENT_WORKFLOW_ALREADY_RUNNING');
   const depth=plan.continuationDepth??0;
   if(!Number.isInteger(depth)||depth<0||depth>=AGENT_WORKFLOW_MAX_CONTINUATIONS) reject('AGENT_WORKFLOW_LIMIT');
-  if(plan.version===current.ui.version) reject('AGENT_WORKFLOW_RECEIPT_REQUIRED');
-  const [receipts]=await db.execute(`SELECT result_status, screen_version_before, screen_version_after FROM agent_copilot_receipts WHERE user_id = ? AND session_id = ? AND plan_id = ? AND result_status = 'succeeded' ORDER BY id DESC LIMIT 4`,[userId,sessionId,planId]);
+  if(!appLanguage&&plan.version===current.ui.version) reject('AGENT_WORKFLOW_RECEIPT_REQUIRED');
+  const [receipts]=await db.execute(`SELECT result_status, screen_version_before, screen_version_after, action_id, target_id, client_confirmation_ref FROM agent_copilot_receipts WHERE user_id = ? AND session_id = ? AND plan_id = ? AND result_status = 'succeeded' ORDER BY id DESC LIMIT 4`,[userId,sessionId,planId]);
   if(!receipts.some(r=>r.result_status==='succeeded'&&r.screen_version_before===plan.version&&r.screen_version_after===current.ui.version)) reject('AGENT_WORKFLOW_RECEIPT_REQUIRED');
+  if(appLanguage&&(!receipts.some(r=>r.result_status==='succeeded'&&r.screen_version_before===plan.version&&r.screen_version_after===current.ui.version&&r.action_id===languageOperation.actionId&&r.target_id===languageOperation.targetId&&typeof r.client_confirmation_ref==='string'&&r.client_confirmation_ref.length>0)||profileLanguage!==appLanguage))reject('AGENT_LANGUAGE_NOT_APPLIED');
   const claimed={...plan,continuationClaimed:true};
   // Atomic compare-and-swap: concurrent requests can never call the provider twice.
   const [claim]=await db.execute(`UPDATE agent_copilot_plans SET plan_json = ? WHERE user_id = ? AND session_id = ? AND plan_id = ? AND BINARY plan_json = BINARY ? AND expires_at > CURRENT_TIMESTAMP`,[JSON.stringify(claimed),userId,sessionId,planId,rows[0].plan_json]);
@@ -56,7 +63,12 @@ export async function continueAgentWorkflow({db,userId,sessionId,planId,context,
     if(saved.affectedRows!==1) reject('AGENT_WORKFLOW_PERSISTENCE_FAILED',503);
   };
   try {
-
+    if(appLanguage) {
+      const saved=await updateAgentSessionState({db,userId,sessionId,state:{...session.state,conversationLanguage:null,languageQuestion:null},expectedState:session.state});
+      if(!saved.ok)reject(saved.code);
+      const result={ok:true,sessionId,language:profileLanguage,reply:languageAppliedText(profileLanguage),navigation:null,confirmation:null,clarification:null,actionStatus:null,referencedEntities:[]};
+      await persist(result);return result;
+    }
     const screen=await readAgentScreenContext({pool:db,userId,clientContext:current});
     const contextSlice={...buildAgentContextSlice({language,screenContext:screen.screenContext}),
       clientUi:current.ui,relevantMemory:await readRelevantAgentMemory({db,userId,screenId:current.screenId}),

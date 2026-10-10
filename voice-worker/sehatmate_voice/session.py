@@ -22,7 +22,7 @@ class VoiceSession:
         self.clock=clock;self.last_activity=clock();self.started=clock()
         self.state='listening';self.listening=True;self.closed=False;self.blocked=False
         self.transcript=TranscriptTurn();self.turn_task=None;self.play_task=None
-        self.playback_id=None;self.completed=set();self.stop_input=None;self.on_resume=None
+        self.playback_id=None;self.completed=set();self.stop_input=None;self.on_resume=None;self.on_language=None
         self.audio_generation=0;self.control_lock=asyncio.Lock()
         self.close_task=None
         self.receipt_tasks=set();self.receipt_pending=set();self.result_lock=asyncio.Lock()
@@ -114,6 +114,13 @@ class VoiceSession:
                 await self.events.emit('agent_result',turn_id=actual_id,resultViaUserApi=True,
                     receiptPath=f'/api/agent/voice-sessions/{self.events.session_id}/turns/{actual_id}')
             else: await self.events.emit('agent_result',turn_id=actual_id,result=result)
+            if self.on_language and result.get('language') in ('en','ur','roman_ur'):
+                try: await self.on_language(result['language'])
+                except Exception:
+                    # Keep the completed Agent result authoritative. Recognition
+                    # cannot continue with an unconfirmed language configuration.
+                    await self.fallback('stt','STT_LANGUAGE_UPDATE_FAILED')
+                    return
             self.state='awaiting_confirmation' if result.get('confirmation') else 'awaiting_clarification' if result.get('clarification') else 'listening'
             if self.state.startswith('awaiting_'): await self.events.emit(self.state,turn_id=actual_id)
             if self.listening and generation==self.audio_generation and isinstance(result.get('reply'),str) and result['reply']:

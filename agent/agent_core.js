@@ -1,3 +1,5 @@
+import {pendingTitleCommand} from './agent_task_workflow.js';
+import {effectiveConversationLanguage,languageQuestionText,languageChangedText,languageProposalText,selectedLanguageOption} from './agent_language_control.js';
 import {reduceTaskWorkflow,taskWorkflowResponse,taskWorkflowText} from './agent_task_workflow.js';
 import {executeConfirmedTaskWorkflow} from './agent_care_plan_tools.js';
 /**
@@ -773,6 +775,7 @@ function buildNextSessionState({
   return {
     lastReferencedEntities,
     ...(sessionState?.taskWorkflow?{taskWorkflow:sessionState.taskWorkflow}:{}),
+    ...(sessionState?.conversationLanguage?{conversationLanguage:sessionState.conversationLanguage}:{}),
     currentFocus:
       verifiedFocus === undefined
         ? sessionState?.currentFocus ?? null
@@ -1261,6 +1264,12 @@ async function handleAgentMessageInternal({
       });
     }
 
+    if(session.state?.conversationLanguage&&session.state.conversationLanguage.profileLanguage!==profileLanguage) {
+      const cleared=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,conversationLanguage:null},expectedState:session.state});
+      if(!cleared.ok)return cleared;
+      session=cleared.data.session;
+    }
+    language=effectiveConversationLanguage(session.state,profileLanguage);
     if (!sessionCreated) {
       // Session response language follows the authenticated selected preference.
       if (session.language !== language) {
@@ -1365,7 +1374,20 @@ async function handleAgentMessageInternal({
     const conversationalDecision = isClarificationTurn
       ? null
       : classifyBareConfirmationDecision(boundedMessage);
-    if(conversationalDecision&&session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
+    const languageQuestion=session.state?.languageQuestion;
+    const languageDecision=conversationalDecision??(/^yeah[.!]?$/i.test(boundedMessage.trim())?'confirm':null);
+    if(languageQuestion&&session.state?.taskWorkflow?.status!=='collecting'&&!session.state?.pendingConfirmation&&session.state?.taskWorkflow?.status!=='awaiting_confirmation') {
+      const selected=selectedLanguageOption(boundedMessage,languageQuestion,languageDecision);
+      if(selected)return handleLanguageCommand({pool,userId,session,command:{scope:languageQuestion.scope,language:selected},language,profileLanguage,clientContext});
+      if(languageDecision==='confirm')return {ok:true,sessionId:session.id,language,reply:languageQuestionText(languageQuestion.options,language),navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
+      if(languageDecision==='cancel') {
+        const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:null},expectedState:session.state});
+        if(!saved.ok)return saved;
+        return {ok:true,sessionId:session.id,language,reply:{en:'Language selection cancelled.',ur:'زبان کا انتخاب منسوخ کر دیا۔',roman_ur:'Language ka intikhab cancel kar diya.'}[language],navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
+      }
+    }
+    if(conversationalDecision&&session.state?.taskWorkflow?.status==='collecting')return handleTaskCommand({pool,userId,session,command:{kind:conversationalDecision==='cancel'?'cancel':'resume'},message:boundedMessage,language});
+    if(conversationalDecision&&session.state?.taskWorkflow?.status==='awaiting_confirmation') {
       return handleTaskConfirmation({pool,userId,session,request:{ok:true,confirmationId:session.state.taskWorkflow.confirmationId,decision:conversationalDecision},language});
     }
     if (conversationalDecision) {
@@ -1418,7 +1440,7 @@ async function handleAgentMessageInternal({
       clientUi=validatedUi.context;
       console.info('AGENT_UI:CONTEXT_ACCEPTED');
     }
-    const conversation=!session.state?.taskWorkflow&&!isClarificationTurn&&!clientUi
+    const conversation=!session.state?.taskWorkflow&&!session.state?.languageQuestion&&!isClarificationTurn&&!clientUi
       ? timeVoiceSync('FAST_PATH',()=>voiceConversationReply({message,language,state:session.state,clientContext}))
       : null;
     if (conversation) {
@@ -1447,11 +1469,13 @@ async function handleAgentMessageInternal({
     let workflowPlan=null;
     if(session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
       workflowPlan=await planAgentMessage({provider,message:boundedMessage,contextSlice:{...buildAgentContextSlice({language,screenContext:context.screenContext,sessionState:session.state,conversationContext}),...(clientUi?{clientUi}:{}),taskWorkflow:session.state.taskWorkflow}});
+      const titleCommand=pendingTitleCommand(session.state.taskWorkflow,boundedMessage,workflowPlan.ok?workflowPlan.plan:null);
+      if(titleCommand)return handleTaskCommand({pool,userId,session,command:titleCommand,message:boundedMessage,language});
       if(workflowPlan.ok) {
         presentation.text=workflowPlan.plan.displayTranscript;
         // Acknowledgement/uncertain continuation cannot escape an active server
         // collection into a generic reply. No fields or consent are inferred.
-        if(['conversation','ambiguous'].includes(workflowPlan.plan.category)&&!workflowPlan.plan.memoryProposal) {
+        if(['conversation','ambiguous'].includes(workflowPlan.plan.category)&&!workflowPlan.plan.memoryProposal&&!workflowPlan.plan.languageCommand&&workflowPlan.plan.taskInput!=='change_topic') {
           return handleTaskCommand({pool,userId,session,command:{kind:'resume'},message:boundedMessage,language});
         }
       }
@@ -1570,6 +1594,7 @@ async function handleAgentMessageInternal({
 
     const plan = planned.plan;
     presentation.text=plan.displayTranscript;
+    if(plan.languageCommand)return handleLanguageCommand({pool,userId,session,command:plan.languageCommand,language,profileLanguage,clientContext});
     if(plan.taskCommand)return handleTaskCommand({pool,userId,session,command:plan.taskCommand,message:boundedMessage,language});
     const referenceBinding = reviewPlanAgainstResolvedReference({
       plan,
@@ -1888,9 +1913,10 @@ async function handleAgentMessageInternal({
 async function handleTaskCommand({pool,userId,session,command,message,language}) {
   const reduced=reduceTaskWorkflow({current:session.state?.taskWorkflow,command,message,language});
   if(!reduced.ok)return {ok:true,sessionId:session.id,language,...(session.state?.taskWorkflow?taskWorkflowResponse(session.state.taskWorkflow,language):{}),reply:reduced.reply??taskWorkflowText('failed',language),fallbackCode:reduced.code,navigation:null};
-  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,taskWorkflow:reduced.workflow},expectedState:session.state});
+  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:null,taskWorkflow:reduced.workflow},expectedState:session.state});
   if(!saved.ok)return {ok:false,code:saved.code,message:taskWorkflowText('failed',language)};
   return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(reduced.workflow,language),
+    ...(command.kind==='start'?{navigation:{target:'care_plan_new',params:{}}}:{}),
     ...(command.kind==='resume'&&reduced.workflow.status==='collecting'?{reply:taskWorkflowText('continue',language)}:{})};
 }
 async function handleTaskConfirmation({pool,userId,session,request,language}) {
@@ -1904,4 +1930,28 @@ async function handleTaskConfirmation({pool,userId,session,request,language}) {
   const result=await executeConfirmedTaskWorkflow({pool,userId,sessionId:session.id,confirmationId:request.confirmationId,workflowId:task.workflowId,revision:task.revision});
   if(!result.ok)return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(task,language),reply:taskWorkflowText(result.code==='CARE_PLAN_TITLE_EXISTS'?'duplicate':'failed',language),fallbackCode:result.code,navigation:null};
   return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(result.workflow,language)};
+}
+
+async function handleLanguageCommand({pool,userId,session,command,language,profileLanguage,clientContext}) {
+ if(command.language===null) {
+  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:command},expectedState:session.state});
+  if(!saved.ok)return saved;
+  return {ok:true,sessionId:session.id,language,reply:languageQuestionText(command.options,language),navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
+ }
+ if(command.scope==='conversation') {
+  const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:null,conversationLanguage:{language:command.language,profileLanguage}},expectedState:session.state});
+  if(!saved.ok)return saved;
+  return {ok:true,sessionId:session.id,language:command.language,conversationLanguage:command.language,reply:languageChangedText(command.language),navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
+ }
+ // Only registered callbacks may apply persisted app changes, with confirmation.
+ const current=clientContext?.ui?clientContext:await readCopilotContext({db:pool,userId,sessionId:session.id});
+ const target=current?.ui?.screenId==='settings'?'settings.language':'app.language';
+ const actionId=`${target}.${command.language}`;
+ const uiPlan=buildAgentUiPlan({context:current?.ui,operations:[{actionId,targetId:target,args:{}}]});
+ if(!uiPlan)return {ok:true,sessionId:session.id,language,reply:languageQuestionText([command.language],language),fallbackCode:'AGENT_UI_ACTION_UNAVAILABLE',navigation:{target:'settings',params:{}},confirmation:null,clarification:null,referencedEntities:[]};
+ const latest=await readCopilotContext({db:pool,userId,sessionId:session.id});
+ if(latest?.ui&&(latest.ui.version!==current.ui.version||latest.ui.screenId!==current.ui.screenId))return {ok:false,code:'AGENT_UI_STALE_CONTEXT'};
+ const saved=await saveCopilotPlan({db:pool,userId,sessionId:session.id,plan:uiPlan});
+ if(!saved.ok)return {ok:false,code:'AGENT_UI_PERSISTENCE_FAILED'};
+ return {ok:true,sessionId:session.id,language,reply:languageProposalText(language),uiPlan,navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
 }

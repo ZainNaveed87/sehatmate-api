@@ -56,7 +56,7 @@ export function reduceTaskWorkflow({current=null,command,message='',language='en
  if(current!=null&&!previous)return fail('AGENT_TASK_WORKFLOW_INVALID');
  let workflow=previous;
  if(command.kind==='start') {
-  if(workflow&&['collecting','awaiting_confirmation'].includes(workflow.status))return fail('AGENT_TASK_ALREADY_ACTIVE');
+  if(workflow&&['collecting','awaiting_confirmation'].includes(workflow.status))return {ok:true,workflow,...taskWorkflowResponse(workflow,language)};
   workflow={workflowId:randomUUID(),kind:'create_care_plan',revision:1,status:'collecting',fields:{},awaitingField:'title'};
  } else if(!workflow||!['collecting','awaiting_confirmation'].includes(workflow.status))return fail('AGENT_TASK_NOT_ACTIVE');
  if(command.kind==='cancel')workflow={workflowId:workflow.workflowId,kind:workflow.kind,revision:workflow.revision+1,status:'cancelled',fields:workflow.fields};
@@ -68,4 +68,21 @@ export function reduceTaskWorkflow({current=null,command,message='',language='en
   workflow={workflowId:workflow.workflowId,kind:workflow.kind,revision:workflow.revision+1,status:'awaiting_confirmation',fields:{title:title.title},confirmationId:randomUUID(),expiresAt:new Date(now.getTime()+600000).toISOString()};
  }
  return {ok:true,workflow,...taskWorkflowResponse(workflow,language)};
+}
+
+// The server's one outstanding slot is stronger context than generic ambiguity.
+// Spans always refer to the original message; presentation never supplies fields.
+export function pendingTitleCommand(workflow,message,plan) {
+ if(workflow?.status!=='collecting'||workflow.awaitingField!=='title')return null;
+ if(plan?.taskCommand||plan?.languageCommand||plan?.memoryProposal)return null;
+ if(plan&&(!['conversation','ambiguous'].includes(plan.category)||plan.taskInput==='continuation'||plan.taskInput==='change_topic'||/acknowledg|continuation|collection_ack/.test(plan.intent)))return null;
+ const raw=String(message);
+ const prefix=/^\s*(?:if\s+)?(?:the\s+)?(?:name(?:\s+of\s+(?:the\s+)?care\s+plan)?|care\s+plan\s+name|title)\s*(?:is|:|=)\s*/i.exec(raw);
+ const start=prefix?prefix[0].length:raw.length-raw.trimStart().length;
+ const end=raw.trimEnd().length;
+ const title=raw.slice(start,end);
+ // Clear questions/commands cannot be silently collected when model is uncertain.
+ if(!prefix&&(/[?؟]/u.test(title)||/^(?:please\s+)?(?:cancel|stop|don't|do not|change|switch|open|show|explain|help|delete|remove|save|confirm|yes|no)\b/i.test(title)))return null;
+ if(!validateCarePlanTitle(title).ok)return null;
+ return {kind:'update',fieldSpans:{title:{start,end}}};
 }
