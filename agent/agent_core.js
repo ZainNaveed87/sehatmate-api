@@ -1373,7 +1373,9 @@ async function handleAgentMessageInternal({
     // server-stored Phase D pending confirmation in this owned session.
     const conversationalDecision = isClarificationTurn
       ? null
-      : classifyBareConfirmationDecision(boundedMessage);
+      : classifyBareConfirmationDecision(boundedMessage) ??
+        (session.state?.taskWorkflow?.status === 'awaiting_confirmation' &&
+         /^create it[.!]?$/i.test(boundedMessage.trim()) ? 'confirm' : null);
     const languageQuestion=session.state?.languageQuestion;
     const languageDecision=conversationalDecision??(/^yeah[.!]?$/i.test(boundedMessage.trim())?'confirm':null);
     if(languageQuestion&&session.state?.taskWorkflow?.status!=='collecting'&&!session.state?.pendingConfirmation&&session.state?.taskWorkflow?.status!=='awaiting_confirmation') {
