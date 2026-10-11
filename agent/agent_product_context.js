@@ -16,6 +16,8 @@ export function buildAgentProductContext() {
     {id:'boundary_confirmation',kind:'boundary',description:'Only registered confirmed actions may change data, after owned explicit confirmation and existing safety guards. Help text never executes an action.'},
     {id:'boundary_clinical',kind:'boundary',description:'The assistant cannot prescribe, diagnose, change verified medicines/doses/instructions, bypass ownership, or act as a clinician.'},
     {id:'boundary_evidence',kind:'boundary',description:'Personal care facts require authoritative owned READ results. Product help has none. Other apps, superiority, clinical outcomes, pricing, integrations and certifications are not established by these registrations.'},
+    {id:'feature_care_plan_name',kind:'feature',description:'New Care Plan title input/create_care_plan collects a title; owned draft creation requires confirmation. Backend rename exists; existing-plan rename UI/Agent action is not mounted or registered. No rename menu/external approval rule is established.'},
+    {id:'boundary_global_context',kind:'boundary',description:'Global app catalog: route guides relevance/mounted UI, never limits global help/account memory. No provider/admin rule is established.'},
     {id:'boundary_navigation',kind:'boundary',description:'Navigation entries are supported screen targets only, not proof of additional features. Opening a screen requires server authorization, and help does not open it.'},
   ];
   const add=fact=>{
@@ -73,10 +75,32 @@ export function selectAgentProductFacts(ids) {
 // Defense in depth for explicit prohibited claim classes, NOT a semantic verifier.
 // The primary grounding is the selected closed context and the response instructions.
 export function hasDisallowedProductClaim(reply) {
+  if (hasInventedCapabilityRestriction(reply)) return true;
   const clauses=String(reply).split(/[.!?;\n۔؟]+|\b(?:but|however|lekin|magar)\b|لیکن|مگر/iu);
   const risk=/\b(?:other apps?|competitors?|competing apps?|better than|best|superior|unmatched|unrivalled|outperforms?|most advanced|only app|guarantee[sd]?|cures?|costs?|prices?|free|paid|certifi(?:ed|cation)|FDA|ISO|approved by|integrat(?:es?|ion)|syncs? with|connects? (?:to|with)|diagnos(?:e[sd]?|is)|prescrib(?:e[sd]?|ing)|insurance payments?|automatically changes?|(?:have|has|already) (?:been )?(?:opened|changed|updated|saved|completed|scheduled)|I (?:opened|changed|updated|saved|completed|scheduled))\b|[$€£]|\b(?:USD|PKR|Rs)\s*\d|دوسر.{0,12}ایپ|سب سے بہتر|ضمانت|یقینی علاج|قیمت|مفت|تصدیق شدہ سند|انضمام|تشخیص|نسخہ|کھول دیا|تبدیل کر دیا|\b(?:doosr[ei]|dusri).{0,12}apps?|sab se behtar|guarantee|qeemat|muft|tashkhees|nuskha|khol diya|tabdeel kar diya\b/iu;
   const denial=/\b(?:(?:I|we|SehatMate) (?:cannot|can't|can not|do not|does not|don't|doesn't)|not verified|not established|no evidence|without evidence|without claiming|rather than claiming|not claim|(?:main|hum|SehatMate).{0,60}(?:nahi|nahin))\b|(?:میں|ہم|SehatMate).{0,80}نہیں|تصدیق نہیں/iu;
   // Catch explicit assertions about named outside products without a brand list.
   const outsideSubject=/\b(?!SehatMate\b)[A-Z][A-Za-z0-9]*(?: [A-Z][A-Za-z0-9]*)? (?:sells?|shares?|lacks?|offers?|supports?)\b/u;
   return clauses.some(clause=>(risk.test(clause)||outsideSubject.test(clause))&&!denial.test(clause));
+}
+
+// Defense in depth for invented restrictions. Selected facts remain the primary
+// authority; these guards do not infer capabilities from user phrases.
+export function hasInventedCapabilityRestriction(reply) {
+ return String(reply).split(/[.!?;\n]+|\b(?:but|however)\b/iu).some(t=> {
+ if (/SehatMate.{0,35}(?:cannot|can't|does not|doesn't).{0,35}(?:create|make).{0,25}care plans?/iu.test(t)) return true;
+ if (/\b(?:no need to|do not need to|don't need to|not required|no (?:provider|admin).{0,20}(?:approval|permission))\b/iu.test(t)) return false;
+ return /(?:contact|ask|requires?|need|only).{0,65}(?:care provider|administrator|admin\b)|(?:requires?|need).{0,45}(?:authorized access|admin permission)|(?:I|we).{0,15}(?:can only|only help|limited to).{0,45}(?:screen|page)|(?:provider|administrator).{0,35}(?:permission|required)|(?:provider|admin).{0,40}(?:ijazat|rabta|zaroor)|(?:اجازت|رابطہ).{0,40}(?:منتظم|معالج)/iu.test(t);
+ });
+}
+export function hasUnreceiptedMemoryClaim(reply) {
+ const clauses=String(reply).split(/[.!?;\n۔؟]+|\b(?:but|however|lekin|magar)\b/iu);
+ return clauses.some(t => !/\b(?:not|never|cannot|can't|could not|couldn't|nahi|nahin)\b|نہیں/iu.test(t) &&
+   /\bI(?:['’]ve| have|['’]ll| will)?\s+(?:(?:already|now)\s+)?(?:noted|saved|stored|remember(?:ed)?|added.{0,30}memory)\b|(?:name|preference|memory).{0,40}(?:has been|is now)\s+(?:saved|stored|noted)|\b(?:main|maine|mein ne|hum).{0,65}(?:yaad rakh|save kar|note kar)|(?:میں نے|میں).{0,60}(?:یاد رکھ|محفوظ کر|نوٹ کر)|(?:aap ka naam|memory|yaaddasht).{0,60}(?:save ho|yaad rakh liya|note ho)|(?:نام|یادداشت).{0,60}(?:محفوظ ہو|یاد رکھ لیا|نوٹ ہو)/iu.test(t));
+}
+export function agentAppNameClarification(language,specific=false) {
+ const texts=specific
+ ? {en:'Do you mean the name of your care plan?',roman_ur:'Kya aap apne care plan ka naam keh rahe hain?',ur:'کیا آپ اپنے کیئر پلان کا نام کہہ رہے ہیں؟'}
+ : {en:'Which name or item in SehatMate do you mean?',roman_ur:'SehatMate mein aap kis naam ya cheez ki baat kar rahe hain?',ur:'SehatMate میں آپ کس نام یا چیز کی بات کر رہے ہیں؟'};
+ return texts[language]||texts.en;
 }

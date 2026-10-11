@@ -1,3 +1,4 @@
+import {agentAppNameClarification} from './agent_product_context.js';
 import {pendingTitleCommand} from './agent_task_workflow.js';
 import {effectiveConversationLanguage,languageQuestionText,languageChangedText,languageProposalText,selectedLanguageOption} from './agent_language_control.js';
 import {reduceTaskWorkflow,taskWorkflowResponse,taskWorkflowText} from './agent_task_workflow.js';
@@ -130,7 +131,7 @@ import {productConversationContext,productConversationSummary} from './agent_pro
 import {unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic_routes.js';
 import {validateAgentUiContext,buildAgentUiPlan} from './agent_ui_protocol.js';
 import {readCopilotContext,saveCopilotPlan} from './agent_copilot_store.js';
-import {readRelevantAgentMemory,rememberVerifiedAgentPatterns} from './agent_memory.js';
+import {createAgentMemory,requestedAgentName,agentNameMemoryReply,readRelevantAgentMemory,rememberVerifiedAgentPatterns} from './agent_memory.js';
 import {conflictsFromToolResults} from './agent_conflicts.js';
 import {
   cleanText,
@@ -873,6 +874,7 @@ async function persistAgentTurn({
   conversationalSummary = null,
   uiPlan = null,
   memoryProposal = null,
+  memoryReceipt = null,
   conflicts = [],
 }) {
   const nextState = buildNextSessionState({
@@ -942,6 +944,7 @@ async function persistAgentTurn({
     ...(session.state?.taskWorkflow?{taskWorkflow:session.state.taskWorkflow}:{}),
     ...(uiPlan ? {uiPlan} : {}),
     ...(memoryProposal ? {memoryProposal} : {}),
+    ...(memoryReceipt ? {memoryReceipt} : {}),
     ...(conflicts.length ? {conflicts} : {}),
     referencedEntities: buildReferencedEntities({
       screenEntity,
@@ -1471,13 +1474,13 @@ async function handleAgentMessageInternal({
     let workflowPlan=null;
     if(session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
       workflowPlan=await planAgentMessage({provider,message:boundedMessage,contextSlice:{...buildAgentContextSlice({language,screenContext:context.screenContext,sessionState:session.state,conversationContext}),...(clientUi?{clientUi}:{}),taskWorkflow:session.state.taskWorkflow}});
-      const titleCommand=pendingTitleCommand(session.state.taskWorkflow,boundedMessage,workflowPlan.ok?workflowPlan.plan:null);
+      const titleCommand=workflowPlan.plan?.appHelpClarification?null:pendingTitleCommand(session.state.taskWorkflow,boundedMessage,workflowPlan.ok?workflowPlan.plan:null);
       if(titleCommand)return handleTaskCommand({pool,userId,session,command:titleCommand,message:boundedMessage,language});
       if(workflowPlan.ok) {
         presentation.text=workflowPlan.plan.displayTranscript;
         // Acknowledgement/uncertain continuation cannot escape an active server
         // collection into a generic reply. No fields or consent are inferred.
-        if(['conversation','ambiguous'].includes(workflowPlan.plan.category)&&!workflowPlan.plan.memoryProposal&&!workflowPlan.plan.languageCommand&&workflowPlan.plan.taskInput!=='change_topic') {
+        if(['conversation','ambiguous'].includes(workflowPlan.plan.category)&&!workflowPlan.plan.memoryProposal&&!workflowPlan.plan.languageCommand&&!workflowPlan.plan.appHelpClarification&&workflowPlan.plan.taskInput!=='change_topic') {
           return handleTaskCommand({pool,userId,session,command:{kind:'resume'},message:boundedMessage,language});
         }
       }
@@ -1504,6 +1507,7 @@ async function handleAgentMessageInternal({
         conversationContext,
         referenceResolution: referenceResolutionContext(referenceResolution),
       }),
+      ...(session.state.taskWorkflow?{taskWorkflow:{kind:session.state.taskWorkflow.kind,status:session.state.taskWorkflow.status}}:{}),
       conversationTopic: productConversationContext(session.state.lastActionSummary),
       ...(clientUi?{clientUi}:{}),
       relevantMemory:await readRelevantAgentMemory({db:pool,userId,screenId:clientUi?.screenId||context.screenContext?.screenId}),
@@ -1528,6 +1532,18 @@ async function handleAgentMessageInternal({
     if(planned.ok&&planned.plan.taskCommand?.kind==='start') {
       presentation.text=planned.plan.displayTranscript;
       return handleTaskCommand({pool,userId,session,command:planned.plan.taskCommand,message:boundedMessage,language});
+    }
+    if(planned.ok&&planned.plan.memoryCommand) {
+      presentation.text=planned.plan.displayTranscript;
+      return handleNameMemoryCommand({pool,userId,session,command:planned.plan.memoryCommand,message:boundedMessage,language});
+    }
+    if(planned.ok&&planned.plan.appHelpClarification) {
+      presentation.text=planned.plan.displayTranscript;
+      const topic=contextSlice.conversationTopic;
+      const workflow=session.state.taskWorkflow;
+      const namingContext=topic?.factIds.includes('feature_care_plan_name') || (workflow?.kind==='create_care_plan'&&['collecting','awaiting_confirmation'].includes(workflow.status));
+      const specific=planned.plan.appHelpClarification.featureId==='feature_care_plan_name'&&Boolean(namingContext);
+      return finishAgentTurn({pool,userId,session,language,reply:agentAppNameClarification(language,specific),intent:'clarify_app_name',capabilityCalls:[],navigation:null,navigationEntity:null,screenEntity,...pendingTaskConfirmationEnvelope(session,language),conversationalSummary:productConversationSummary({category:'ambiguous',topic:specific?'care_plan_name':'app_name',factIds:specific?['feature_care_plan_name']:[]})});
     }
     if (
       referenceResolution.status === 'ambiguous' ||
@@ -1973,4 +1989,37 @@ async function handleLanguageCommand({pool,userId,session,command,language,profi
  const saved=await saveCopilotPlan({db:pool,userId,sessionId:session.id,plan:uiPlan});
  if(!saved.ok)return {ok:false,code:'AGENT_UI_PERSISTENCE_FAILED'};
  return {ok:true,sessionId:session.id,language,reply:languageProposalText(language),uiPlan,navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
+}
+
+async function handleNameMemoryCommand({pool,userId,session,command,message,language}) {
+ const operation=command.kind;
+ let name='',status=operation==='remember'?'failed':'missing';
+ if(operation==='remember') {
+  name=requestedAgentName(command,message) || '';
+  if(name) {
+   const evidenceRef=`name:${randomUUID()}`;
+   try {
+    const receipt=await createAgentMemory({db:pool,userId,deduplicate:true,item:{kind:'CONFIRMED_FACT',key:'identity.name',value:{name},source:'user_api',evidenceRef,confirmedByUser:true},evidence:{explicitUser:true,ref:evidenceRef}});
+    if(receipt.ok===true) status='succeeded';
+   } catch { /* No receipt: fail closed, including timeout/ambiguous commit. */ }
+  }
+ } else {
+  try {
+   const items=await readRelevantAgentMemory({db:pool,userId,keys:['identity.name'],review:true,limit:1});
+   name=items.find(item=>item.kind==='CONFIRMED_FACT')?.value.name || '';
+   if(name)status='found';
+  } catch {status='failed';}
+ }
+ const reply=status==='failed'&&operation==='recall'
+  ? {en:'I could not read Agent Memory right now.',roman_ur:'Abhi Agent Memory parh nahi saka.',ur:'ابھی Agent Memory پڑھ نہیں سکا۔'}[language]
+  : agentNameMemoryReply({language,operation,status,name});
+ return finishAgentTurn({pool,userId,session,language,reply,intent:'agent_memory',capabilityCalls:[],navigation:null,navigationEntity:null,screenEntity:null,...pendingTaskConfirmationEnvelope(session,language),memoryReceipt:{operation,status,key:'identity.name'}});
+}
+
+// Keep the existing workflow/confirmation pair valid on these zero-tool routes.
+// This reuses its server-issued identity, never confirms or creates a new action.
+function pendingTaskConfirmationEnvelope(session,language) {
+ if(session.state.taskWorkflow?.status!=='awaiting_confirmation')return {};
+ const {confirmation,actionStatus}=taskWorkflowResponse(session.state.taskWorkflow,language);
+ return {confirmation,actionStatus};
 }

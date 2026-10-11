@@ -4,6 +4,7 @@ const exact = (value, fields) => value && typeof value === 'object' && !Array.is
 const choice = (value, choices) => choices.includes(value);
 const bool = value => exact(value, ['enabled']) && typeof value.enabled === 'boolean';
 export const AGENT_MEMORY_KEYS = Object.freeze({
+  'identity.name': { screens: ['*'], validate: v => exact(v, ['name']) && typeof v.name === 'string' && /^[\p{L}\p{M}][\p{L}\p{M} .’'-]{0,79}$/u.test(v.name) && v.name === v.name.trim() },
   'communication.language': { screens: ['*'], validate: v => exact(v, ['language']) && choice(v.language, ['en', 'ur', 'roman_ur']) },
   'explanation.detail': { screens: ['*'], validate: v => exact(v, ['level']) && choice(v.level, ['brief', 'step_by_step']) },
   'voice.preference': { screens: ['profile', 'settings'], validate: bool },
@@ -21,6 +22,7 @@ function validateMemory(input, evidence, now = Date.now()) {
   if (inferred) {
     if (input.source !== 'verified_event' || evidence?.verified !== true || evidence.ref !== input.evidenceRef || input.confirmedByUser === true || !input.expiresAt) throw new CopilotError('AGENT_MEMORY_VERIFIED_EVIDENCE_REQUIRED');
   } else if (!choice(input.source, ['user_selection', 'user_confirmation', 'user_api']) || input.confirmedByUser !== true || evidence?.explicitUser !== true || evidence.ref !== input.evidenceRef) throw new CopilotError('AGENT_MEMORY_CONFIRMATION_REQUIRED');
+  if (input.key === 'identity.name' && input.kind !== 'CONFIRMED_FACT') throw new CopilotError('INVALID_AGENT_MEMORY_KIND');
   if (input.key === 'routine.missed_pattern' && !inferred && input.source !== 'user_confirmation') throw new CopilotError('INVALID_AGENT_MEMORY_KIND');
   const confidence = inferred ? input.confidence : 1;
   if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new CopilotError('INVALID_AGENT_MEMORY_CONFIDENCE');
@@ -33,15 +35,23 @@ const fromRow = row => ({ id: String(row.id), kind: row.kind, key: row.memory_ke
 async function storage(work) {
   try { return await work(); } catch (error) { if (missingCopilotSchema(error)) throw new CopilotError('AGENT_MEMORY_STORAGE_UNAVAILABLE', 503); throw error; }
 }
-export async function createAgentMemory({ db, userId, item, evidence, supersedesId = null }) {
+export async function createAgentMemory({ db, userId, item, evidence, supersedesId = null, deduplicate = false }) {
   userId = requireId(userId);
   const safe = validateMemory(item, evidence);
   if (supersedesId) requireId(supersedesId);
   let supersededExisting = false;
+  let reused = false;
   const result = await storage(() => withCopilotTransaction(db, async connection => {
     // A user-row lock serializes same-user corrections, including first insert.
     const [users] = await connection.execute('SELECT id FROM users WHERE id = ? FOR UPDATE', [userId]);
     if (!users.length) throw new CopilotError('AGENT_MEMORY_NOT_FOUND', 404);
+    if (deduplicate && !supersedesId) {
+      const [current] = await connection.execute(`SELECT * FROM agent_memory WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) AND memory_key IN (?) ORDER BY id DESC LIMIT 1 FOR UPDATE`, [userId, safe.key]);
+      if (current.length && current[0].kind === safe.kind && JSON.stringify(fromRow(current[0]).value) === JSON.stringify(safe.value)) {
+        reused = true;
+        return {ok:true,memory:fromRow(current[0])};
+      }
+    }
     if (supersedesId) {
       const [old] = await connection.execute(`SELECT id, memory_key FROM agent_memory WHERE id = ? AND user_id = ? AND status = 'active' FOR UPDATE`, [String(supersedesId), userId]);
       if (!old.length || old[0].memory_key !== safe.key) throw new CopilotError('AGENT_MEMORY_NOT_FOUND', 404);
@@ -55,12 +65,12 @@ export async function createAgentMemory({ db, userId, item, evidence, supersedes
     return { ok: true, memory: { id, ...safe, status: 'active' } };
   }));
   // Fixed markers only, after the transaction committed. No IDs, values or evidence.
-  console.info(safe.kind === 'INFERRED_PATTERN' ? 'AGENT_MEMORY:INFERENCE' : supersededExisting ? 'AGENT_MEMORY:UPDATED' : 'AGENT_MEMORY:CREATED');
+  if (!reused) console.info(safe.kind === 'INFERRED_PATTERN' ? 'AGENT_MEMORY:INFERENCE' : supersededExisting ? 'AGENT_MEMORY:UPDATED' : 'AGENT_MEMORY:CREATED');
   return result;
 }
 export async function supersedeAgentMemory(args) { return createAgentMemory(args); }
 export function validateAgentMemoryProposal(raw) {
-  if (!exact(raw, ['kind', 'key', 'value']) || !['CONFIRMED_FACT', 'USER_PREFERENCE'].includes(raw.kind) || raw.key === 'routine.missed_pattern' || !Object.hasOwn(AGENT_MEMORY_KEYS,raw.key) || !AGENT_MEMORY_KEYS[raw.key].validate(raw.value)) return { ok: false, code: 'INVALID_AGENT_MEMORY_PROPOSAL' };
+  if (!exact(raw, ['kind', 'key', 'value']) || !['CONFIRMED_FACT', 'USER_PREFERENCE'].includes(raw.kind) || raw.key === 'routine.missed_pattern' || (raw.key === 'identity.name' && raw.kind !== 'CONFIRMED_FACT') || !Object.hasOwn(AGENT_MEMORY_KEYS,raw.key) || !AGENT_MEMORY_KEYS[raw.key].validate(raw.value)) return { ok: false, code: 'INVALID_AGENT_MEMORY_PROPOSAL' };
   return { ok: true, proposal: { kind: raw.kind, key: raw.key, value: JSON.parse(JSON.stringify(raw.value)) } };
 }
 export async function confirmAgentMemory({ db, userId, memoryId, evidenceRef }) {
@@ -110,4 +120,34 @@ export async function rememberVerifiedAgentPatterns({db,userId,toolResults=[]}) 
     await createAgentMemory({db,userId,item:{kind:'INFERRED_PATTERN',key:'routine.missed_pattern',value,source:'verified_event',evidenceRef,
       confidence:0.7,confirmedByUser:false,expiresAt:new Date(Date.now()+7*86400000).toISOString()},evidence:{verified:true,ref:evidenceRef}});
   }
+}
+
+// Semantic decisions come from the existing planner; this fence checks only
+// closed structure and explicit source evidence, never substitutes user text.
+export function validateAgentMemoryCommand(command) {
+  if (!exact(command, ['kind', 'nameSpan', 'requestSpan'])) return false;
+  if (command.kind === 'recall') return Object.keys(command).length === 1;
+  const span = s => exact(s, ['start','end']) && Number.isInteger(s.start) && Number.isInteger(s.end) && s.start >= 0 && s.end > s.start;
+  return command.kind === 'remember' && span(command.nameSpan) && span(command.requestSpan);
+}
+export function requestedAgentName(command, message) {
+  if (!validateAgentMemoryCommand(command) || command.kind !== 'remember' || typeof message !== 'string') return null;
+  const {nameSpan:n, requestSpan:r} = command;
+  if (n.end > message.length || r.end > message.length || (n.start < r.end && r.start < n.end)) return null;
+  const name = message.slice(n.start,n.end);
+  const request = message.slice(r.start,r.end);
+  // Fail closed on negated/hypothetical/quoted requests. No raw ASR rewriting.
+  if (/\b(?:not|never|don't|do not|cannot|can't|won't|if|pretend|example|nahi|nahin|mat|agar)\b|نہیں|مت|اگر|[“”"؟?]/iu.test(message)) return null;
+  const explicit = /\b(?:remember|memorize|save|note|yaad)\b|\badd\b.{0,60}\bmemory\b|یاد|محفوظ/iu.test(request);
+  return explicit && AGENT_MEMORY_KEYS['identity.name'].validate({name}) ? name : null;
+}
+export function agentNameMemoryReply({language,operation,status,name=''}) {
+  const text = operation === 'remember'
+    ? status === 'succeeded'
+      ? {en:`Your name, ${name}, has been saved in Agent Memory.`,roman_ur:`Aap ka naam ${name} Agent Memory mein save ho gaya hai.`,ur:`آپ کا نام ${name} Agent Memory میں محفوظ ہو گیا ہے۔`}
+      : {en:'I could not save your name in Agent Memory. Please try again.',roman_ur:'Aap ka naam Agent Memory mein save nahi ho saka. Dobara koshish karein.',ur:'آپ کا نام Agent Memory میں محفوظ نہیں ہو سکا۔ دوبارہ کوشش کریں۔'}
+    : name
+      ? {en:`Your saved name is ${name}.`,roman_ur:`Aap ka save kiya hua naam ${name} hai.`,ur:`آپ کا محفوظ نام ${name} ہے۔`}
+      : {en:'There is no saved name in your Agent Memory.',roman_ur:'Aap ki Agent Memory mein koi naam save nahi hai.',ur:'آپ کی Agent Memory میں کوئی نام محفوظ نہیں ہے۔'};
+  return text[language] || text.en;
 }
