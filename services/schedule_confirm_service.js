@@ -103,9 +103,10 @@ export async function validateScheduleItemConfirmation({
   itemId,
   displayTime,
   scheduleTime,
+  forUpdate = false,
 }) {
   const canonicalDisplayTime = cleanText(displayTime, 160);
-  const canonicalScheduleTime = cleanText(scheduleTime, 5);
+  const canonicalScheduleTime = typeof scheduleTime === 'string' ? scheduleTime.trim() : '';
   const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 
   if (!idPattern.test(itemId)) {
@@ -131,7 +132,7 @@ export async function validateScheduleItemConfirmation({
      FROM care_schedule_items s
      LEFT JOIN extracted_instructions i ON i.id = s.instruction_id
      WHERE s.id = ? AND s.user_id = ?
-     LIMIT 1`,
+     LIMIT 1${forUpdate ? ' FOR UPDATE' : ''}`,
     [itemId, userId],
   );
   if (rows.length === 0) {
@@ -284,6 +285,40 @@ export async function confirmScheduleItem({
   scheduleTime,
   learningSource,
 }) {
+  // Reject malformed requests without opening a transaction or touching data.
+  if (!idPattern.test(itemId) || typeof scheduleTime !== 'string' ||
+      !/^([01]\d|2[0-3]):[0-5]\d$/.test(scheduleTime.trim())) {
+    return validateScheduleItemConfirmation({pool,userId,itemId,displayTime,scheduleTime});
+  }
+  const connection = typeof pool.getConnection === 'function' ? await pool.getConnection() : pool;
+  try {
+    if (typeof connection.beginTransaction !== 'function' ||
+        typeof connection.commit !== 'function' || typeof connection.rollback !== 'function') {
+      throw new Error('SCHEDULE_STORAGE_TRANSACTION_REQUIRED');
+    }
+    await connection.beginTransaction();
+    try {
+      const result = await confirmScheduleItemInTransaction({pool:connection,userId,itemId,displayTime,scheduleTime,learningSource});
+      if (result.ok) await connection.commit();
+      else await connection.rollback();
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    }
+  } finally {
+    if (connection !== pool) connection.release();
+  }
+}
+
+async function confirmScheduleItemInTransaction({
+  pool,
+  userId,
+  itemId,
+  displayTime,
+  scheduleTime,
+  learningSource,
+}) {
   const canonicalLearningSource = cleanText(learningSource, 60);
   const validated = await validateScheduleItemConfirmation({
     pool,
@@ -291,6 +326,7 @@ export async function confirmScheduleItem({
     itemId,
     displayTime,
     scheduleTime,
+    forUpdate: true,
   });
   if (!validated.ok) return validated;
 

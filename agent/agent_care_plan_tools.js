@@ -5,7 +5,7 @@ import {parseAgentSessionState,sanitizeAgentSessionState,serializeAgentSessionSt
 import {validateTaskWorkflow} from './agent_task_workflow.js';
 import {agentConfig} from './agent_config.js';
 
-defineAgentCapability({name:'create_care_plan',permissionClass:'REVERSIBLE_USER_ACTION',description:'Create a named draft care plan only after explicit owned workflow confirmation.',inputSchema:{properties:{title:{type:'care_plan_title'}},required:['title']},resultContract:'Committed draft plan ID/title; documents are collected separately.',execute:({pool,userId,args})=>createCarePlan({db:pool,userId,title:args.title})});
+defineAgentCapability({name:'create_care_plan',permissionClass:'REVERSIBLE_USER_ACTION',effectContract:{confirmationKind:'create_care_plan',readTool:'get_care_plan',validateResult:(result,args,userId)=>/^\d{1,20}$/.test(String(result.data?.plan?.id))&&String(result.data.plan.user_id)===String(userId)&&result.data.plan.title===args.title},description:'Create a named draft care plan only after explicit owned workflow confirmation.',inputSchema:{properties:{title:{type:'care_plan_title'}},required:['title']},resultContract:'Committed draft plan ID/title; documents are collected separately.',execute:({pool,userId,args})=>createCarePlan({db:pool,userId,title:args.title})});
 
 export async function executeConfirmedTaskWorkflow({pool,userId,sessionId,confirmationId,workflowId,revision,now=new Date()}) {
  if(!/^\d{1,20}$/.test(String(userId))||!/^\d{1,20}$/.test(String(sessionId))||typeof confirmationId!=='string'||confirmationId.length>80||!workflowId||!Number.isInteger(revision))return {ok:false,code:'AGENT_TASK_CONFIRMATION_INVALID'};

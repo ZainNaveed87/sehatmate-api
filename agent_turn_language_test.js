@@ -109,6 +109,7 @@ function createPool({
   const auditRows = [];
   let row = sessionRow({ state: initialState, language: sessionLanguage });
   let taskMutationCount = 0;
+  let currentTaskStatus = 'pending';
   const execute = async (sql, params = []) => {
     const text = normalizeSql(sql);
     calls.push({ sql: text, params });
@@ -169,7 +170,7 @@ function createPool({
     }
 
     if (text.includes('FROM care_task_occurrences o') && text.includes('WHERE o.id = ? AND o.user_id = ?')) {
-      return [[occurrenceRow()]];
+      return [[occurrenceRow({status:currentTaskStatus})]];
     }
 
     if (text.includes('FROM care_task_outcome_operations')) {
@@ -178,6 +179,7 @@ function createPool({
 
     if (text.startsWith('UPDATE care_task_occurrences')) {
       taskMutationCount += 1;
+      currentTaskStatus = params[0];
       return [OK_PACKET];
     }
 

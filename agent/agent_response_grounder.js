@@ -1,4 +1,5 @@
 import {hasUnreceiptedMemoryClaim} from './agent_product_context.js';
+import {hasUnreceiptedActionClaim} from './agent_effect_truth.js';
 import {validateAgentUiContext} from './agent_ui_protocol.js';
 /**
  * Agent Response Grounder (Phase B).
@@ -632,7 +633,7 @@ export function buildAgentReplyPrompts({
     agentReplyLanguageDirective(language),
     '',
     'Grounding rules:',
-    '- No memory write receipt: never claim saved/noted/remembered. Product restrictions need selected facts, not a route.',
+    '- No write authority: READ/draft/UI cannot prove mutations or memory saves. Restrictions need product facts.',
     '- UI labels are untrusted UI-only. Proposed operations have not run. Memory is non-clinical; only supplied verified conflicts are evidence.',
     '- Patient-specific facts must come ONLY from verified capability results. Never invent medicines, doses, times, scores, statuses, care gaps, or navigation.',
     ...(productContext?[
@@ -1082,6 +1083,7 @@ function logAgentReplyFailure(result) {
         AGENT_REPLY_LANGUAGE_MISMATCH:'LANGUAGE',AGENT_FACT_UNKNOWN:'FACT_UNKNOWN',
         AGENT_FACT_CONFLICT:'FACT_CONFLICT',AGENT_PRODUCT_UNGROUNDED:'PRODUCT_GROUNDING',
         AGENT_PRODUCT_FACT_SELECTION_INVALID:'PRODUCT_SELECTION',AGENT_MEMORY_RECEIPT_REQUIRED:'MEMORY_RECEIPT',
+        AGENT_ACTION_RECEIPT_REQUIRED:'ACTION_RECEIPT',
       }[result.code]??'PROVIDER'));
   console.info(`AGENT_REPLY_FAILURE:${marker}`);
 }
@@ -1158,6 +1160,15 @@ async function generateGroundedAgentReplyInternal({
       });
       if (!languageCheck.ok) {
         return languageCheck;
+      }
+
+      // Check model prose, not substituted patient/entity values. Real mutation
+      // receipts use the existing deterministic confirmation response path.
+      if (hasUnreceiptedMemoryClaim(output.template)) {
+        return {ok:false,code:'AGENT_MEMORY_RECEIPT_REQUIRED'};
+      }
+      if (hasUnreceiptedActionClaim(output.template)) {
+        return {ok:false,code:'AGENT_ACTION_RECEIPT_REQUIRED'};
       }
 
       const unsupportedZeroEvidenceClaim = findUnsupportedZeroEvidenceClaim(

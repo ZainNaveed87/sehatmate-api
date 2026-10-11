@@ -247,6 +247,7 @@ try {
   defineAgentCapability({
     name: 'phase_e_test_action',
     permissionClass: 'REVERSIBLE_USER_ACTION',
+    effectContract: {confirmationKind:'task_outcome',readTool:'get_today_tasks',validateResult:(result,args)=>result.data?.status===args.outcome},
     description: 'Phase E test-only reversible action.',
     inputSchema: {
       properties: {

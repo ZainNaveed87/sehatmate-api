@@ -86,12 +86,6 @@ export const AGENT_NAVIGATION_TARGETS = Object.freeze({
   family_member_care_plans: Object.freeze({
     params: Object.freeze({ relationshipId: 'required', carePlanId:'required' }),
   }),
-  family_member_care_gaps: Object.freeze({
-    params: Object.freeze({ relationshipId: 'required' }),
-  }),
-  family_member_simulation: Object.freeze({
-    params: Object.freeze({ relationshipId: 'required' }),
-  }),
   routine_settings: Object.freeze({ params: Object.freeze({}) }),
   profile: Object.freeze({ params: Object.freeze({}) }),
   documents: Object.freeze({ params: Object.freeze({}) }),

@@ -34,7 +34,10 @@ export function buildAgentProductContext() {
         .filter(([,spec])=>spec.type==='enum').map(([name,spec])=>[name,spec.values]))}:{})});
   }
   for(const navigation of listAgentNavigationTargets()) {
-    add({id:`nav_${navigation.target}`,params:navigation.params});
+    // The planner already receives the complete parameter/authorization table.
+    // Help needs destination existence only; duplicate schemas previously pushed
+    // later real destinations outside this bounded catalog.
+    add({id:`nav_${navigation.target}`});
   }
   return {facts};
 }

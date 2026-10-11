@@ -35,7 +35,7 @@ const fromRow = row => ({ id: String(row.id), kind: row.kind, key: row.memory_ke
 async function storage(work) {
   try { return await work(); } catch (error) { if (missingCopilotSchema(error)) throw new CopilotError('AGENT_MEMORY_STORAGE_UNAVAILABLE', 503); throw error; }
 }
-export async function createAgentMemory({ db, userId, item, evidence, supersedesId = null, deduplicate = false }) {
+export async function createAgentMemory({ db, userId, item, evidence, supersedesId = null, deduplicate = true }) {
   userId = requireId(userId);
   const safe = validateMemory(item, evidence);
   if (supersedesId) requireId(supersedesId);
@@ -45,7 +45,7 @@ export async function createAgentMemory({ db, userId, item, evidence, supersedes
     // A user-row lock serializes same-user corrections, including first insert.
     const [users] = await connection.execute('SELECT id FROM users WHERE id = ? FOR UPDATE', [userId]);
     if (!users.length) throw new CopilotError('AGENT_MEMORY_NOT_FOUND', 404);
-    if (deduplicate && !supersedesId) {
+    if (deduplicate && !supersedesId && safe.kind !== 'INFERRED_PATTERN') {
       const [current] = await connection.execute(`SELECT * FROM agent_memory WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) AND memory_key IN (?) ORDER BY id DESC LIMIT 1 FOR UPDATE`, [userId, safe.key]);
       if (current.length && current[0].kind === safe.kind && JSON.stringify(fromRow(current[0]).value) === JSON.stringify(safe.value)) {
         reused = true;

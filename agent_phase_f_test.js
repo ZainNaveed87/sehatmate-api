@@ -84,6 +84,7 @@ function createFakePool({
   const auditRows = [];
   let row = sessionRow(initialState, 'roman_ur');
   let taskMutationCount = 0;
+  let currentTask = occurrence();
   const execute = async (sql, params = []) => {
     const text = normalizeSql(sql);
     calls.push({ sql: text, params });
@@ -132,13 +133,14 @@ function createFakePool({
       return [gap ? [{ id: Number(gap.id), care_plan_id: Number(gap.planId), title: gap.title }] : []];
     }
     if (text.includes('FROM care_task_occurrences o') && text.includes('WHERE o.id = ? AND o.user_id = ?')) {
-      return [[occurrence()]];
+      return [[currentTask]];
     }
     if (text.includes('FROM care_task_outcome_operations')) {
       return [[]];
     }
     if (text.startsWith('UPDATE care_task_occurrences')) {
       taskMutationCount += 1;
+      currentTask = {...currentTask,status:params[0]};
       return [{ affectedRows: 1 }];
     }
     if (/^SELECT|^WITH|^SHOW|^DESCRIBE/i.test(text)) return [[]];

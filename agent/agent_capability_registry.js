@@ -103,6 +103,14 @@ function assertDefinitionValid(definition) {
   if (typeof execute !== 'function') {
     throw new Error(`Agent capability ${name} must define an execute function.`);
   }
+  if (permissionClass === 'REVERSIBLE_USER_ACTION') {
+    const contract = definition.effectContract;
+    if (!contract || typeof contract.validateResult !== 'function' ||
+        !['task_outcome', 'schedule_time', 'create_care_plan'].includes(contract.confirmationKind) ||
+        typeof contract.readTool !== 'string' || !AGENT_TOOL_NAME_PATTERN.test(contract.readTool)) {
+      throw new Error('Confirmed capabilities require confirmation, readback and result contracts.');
+    }
+  }
   if (!inputSchema || typeof inputSchema !== 'object' || Array.isArray(inputSchema)) {
     throw new Error(`Agent capability ${name} needs an input schema object.`);
   }
@@ -169,6 +177,7 @@ export function defineAgentCapability(definition) {
   }
   const frozen = Object.freeze({
     ...definition,
+    ...(definition.effectContract ? {effectContract:Object.freeze({...definition.effectContract})} : {}),
     inputSchema: Object.freeze({
       properties: Object.freeze({ ...definition.inputSchema.properties }),
       required: Object.freeze([...(definition.inputSchema.required || [])]),
@@ -245,6 +254,9 @@ function canonicalPropertyValue(spec, name, value) {
     case 'string': {
       if (typeof value !== 'string') {
         return { error: `${name} must be a string.` };
+      }
+      if (value.length > (spec.maxLength || 200)) {
+        return { error: `${name} exceeds the allowed length.` };
       }
       const canonical = cleanText(value, spec.maxLength || 200);
       if (!canonical) {
@@ -368,12 +380,17 @@ async function executeRegisteredCapability({
     return validated;
   }
 
-  return capability.execute({
+  const result = await capability.execute({
     pool,
     userId,
     args: validated.args,
     clientToday,
   });
+  if (capability.permissionClass === 'REVERSIBLE_USER_ACTION' && result?.ok === true &&
+      capability.effectContract.validateResult(result, validated.args, userId) !== true) {
+    return {ok:false,code:'AGENT_ACTION_RESULT_UNVERIFIED'};
+  }
+  return result;
 }
 
 export async function executeAgentCapability({

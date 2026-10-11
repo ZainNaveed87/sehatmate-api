@@ -216,6 +216,11 @@ defineAgentCapability({
 defineAgentCapability({
   name: 'set_task_outcome',
   permissionClass: 'REVERSIBLE_USER_ACTION',
+  effectContract: {
+    confirmationKind: 'task_outcome', readTool: 'get_today_tasks',
+    validateResult: (result, args) => String(result.data?.occurrence?.id) === args.occurrenceId &&
+      result.data.occurrence.status === args.outcome,
+  },
   description:
     'Confirmed-only action to mark one owned task occurrence completed or skipped.',
   inputSchema: {
@@ -245,6 +250,10 @@ defineAgentCapability({
 defineAgentCapability({
   name: 'confirm_schedule_item_time',
   permissionClass: 'REVERSIBLE_USER_ACTION',
+  effectContract: {
+    confirmationKind: 'schedule_time', readTool: 'get_care_plan',
+    validateResult: (result, args) => result.data?.scheduleTime === args.scheduleTime,
+  },
   description:
     'Confirmed-only action to save an owned reminder exact time through schedule safety guards.',
   inputSchema: {
