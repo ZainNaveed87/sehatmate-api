@@ -231,14 +231,14 @@ test('Reality Check empty strings are unanswered while custom notes and choices 
 });
 test('audit markers contain fixed strings only and memory markers follow committed writes', async () => {
   const db = new CopilotTestDb(); const messages = []; const original = console.info;
-  console.info = (...args) => { assert.equal(db.snapshot, null); messages.push(args); };
+  console.info = (...args) => { if(String(args[0]).startsWith('AGENT_MEMORY:'))assert.equal(db.snapshot, null); messages.push(args); };
   try {
     await create(db);
     await create(db, preference({ value: { language: 'en' } }));
     const item = preference({ kind: 'INFERRED_PATTERN', source: 'verified_event', confirmedByUser: false, confidence: 0.7, expiresAt: new Date(Date.now() + 86400000).toISOString() });
     await createAgentMemory({ db, userId: '1', item, evidence: { verified: true, ref: item.evidenceRef } });
     detectAgentConflicts({ verifiedFacts: [task], memory: [constraint] });
-    assert.deepEqual(messages, [['AGENT_MEMORY:CREATED'], ['AGENT_MEMORY:UPDATED'], ['AGENT_MEMORY:INFERENCE'], ['AGENT_CONFLICT:DETECTED']]);
+    assert.deepEqual(messages, [['AGENT_MEMORY_WRITE_STAGE:TRANSACTION'], ['AGENT_MEMORY:CREATED'], ['AGENT_MEMORY_WRITE_STAGE:TRANSACTION'], ['AGENT_MEMORY:UPDATED'], ['AGENT_MEMORY_WRITE_STAGE:TRANSACTION'], ['AGENT_MEMORY:INFERENCE'], ['AGENT_CONFLICT:DETECTED']]);
   } finally { console.info = original; }
 });
 test('actual medicine task kind flags professional review for timing and overlapping schedules', () => {

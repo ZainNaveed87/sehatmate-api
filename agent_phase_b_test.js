@@ -1947,7 +1947,7 @@ await test('voice timing identifies two model waits without adding execution or 
     assert.equal(result.ok,true);assert.equal(plans,1);assert.equal(replies,1);
     assert.equal(logs.filter(line=>line==='VOICE_AGENT_LATENCY:MODEL:5_10S').length,2);
     assert.ok(logs.includes('VOICE_AGENT_LATENCY:TOTAL:10_20S'));
-    for(const line of logs) assert.match(line,/^VOICE_AGENT_LATENCY:(PREPARE|FAST_PATH|MODEL|TOOLS|GROUNDING|PERSIST|PLANNER|GROUNDED_REPLY|TOTAL):(LT_100MS|100_499MS|500_999MS|1_2S|2_5S|5_10S|10_20S|GE_20S|UNKNOWN)$/);
+    for(const line of logs.filter(line=>line.startsWith('VOICE_AGENT_LATENCY:'))) assert.match(line,/^VOICE_AGENT_LATENCY:(PREPARE|FAST_PATH|MODEL|TOOLS|GROUNDING|PERSIST|PLANNER|GROUNDED_REPLY|TOTAL):(LT_100MS|100_499MS|500_999MS|1_2S|2_5S|5_10S|10_20S|GE_20S|UNKNOWN)$/);
   } finally {clock.mock.restore();logging.mock.restore();}
 });
 

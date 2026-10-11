@@ -1473,6 +1473,7 @@ async function handleAgentMessageInternal({
 
     let workflowPlan=null;
     if(session.state?.taskWorkflow&&['collecting','awaiting_confirmation'].includes(session.state.taskWorkflow.status)) {
+      console.info('AGENT_ROUTE:ACTIVE_WORKFLOW');
       workflowPlan=await planAgentMessage({provider,message:boundedMessage,contextSlice:{...buildAgentContextSlice({language,screenContext:context.screenContext,sessionState:session.state,conversationContext}),...(clientUi?{clientUi}:{}),taskWorkflow:session.state.taskWorkflow}});
       const titleCommand=workflowPlan.plan?.appHelpClarification?null:pendingTitleCommand(session.state.taskWorkflow,boundedMessage,workflowPlan.ok?workflowPlan.plan:null);
       if(titleCommand)return handleTaskCommand({pool,userId,session,command:titleCommand,message:boundedMessage,language});
@@ -1530,14 +1531,17 @@ async function handleAgentMessageInternal({
     // Current semantic creation takes precedence over unrelated pointers.
     // Other plans still fail closed on the same reference checks below.
     if(planned.ok&&planned.plan.taskCommand?.kind==='start') {
+      console.info('AGENT_ROUTE:WORKFLOW_START');
       presentation.text=planned.plan.displayTranscript;
       return handleTaskCommand({pool,userId,session,command:planned.plan.taskCommand,message:boundedMessage,language});
     }
     if(planned.ok&&planned.plan.memoryCommand) {
+      console.info('AGENT_ROUTE:MEMORY');
       presentation.text=planned.plan.displayTranscript;
       return handleNameMemoryCommand({pool,userId,session,command:planned.plan.memoryCommand,message:boundedMessage,language});
     }
     if(planned.ok&&planned.plan.appHelpClarification) {
+      console.info('AGENT_ROUTE:APP_ENTITY_CLARIFICATION');
       presentation.text=planned.plan.displayTranscript;
       const topic=contextSlice.conversationTopic;
       const workflow=session.state.taskWorkflow;
@@ -1549,6 +1553,7 @@ async function handleAgentMessageInternal({
       referenceResolution.status === 'ambiguous' ||
       referenceResolution.status === 'missing'
     ) {
+      console.info(referenceResolution.status==='ambiguous'?'AGENT_ROUTE:REFERENCE_AMBIGUOUS':'AGENT_ROUTE:REFERENCE_MISSING');
       const pendingClarification = createPendingReferenceClarification({
         resolution: referenceResolution,
         message: boundedMessage,
@@ -1581,6 +1586,7 @@ async function handleAgentMessageInternal({
     }
 
     if (!planned.ok) {
+      console.info('AGENT_ROUTE:PLANNER_REJECTED');
       if (planned.code === 'AGENT_MESSAGE_EMPTY') {
         return {
           ok: false,
@@ -1602,8 +1608,7 @@ async function handleAgentMessageInternal({
         reply: localizedAgentText(
           denied ? 'agentPermissionDenied' :
             (planned.code==='AGENT_PRODUCT_FACT_SELECTION_INVALID'?'agentProductUnverified':
-             (planned.failureClass!=='GROUNDING_REPAIRABLE'&&['AGENT_PROVIDER_FAILED','AGENT_PROVIDER_UNCONFIGURED','AGENT_PROMPT_TOO_LARGE'].includes(planned.code)
-              ?'agentConversationUnavailable':'agentConversationClarify')),
+             'agentConversationUnavailable'),
           language,
         ),
         fallbackCode: planned.code,
@@ -1617,14 +1622,18 @@ async function handleAgentMessageInternal({
     }
 
     const plan = planned.plan;
+    if(plan.category==='app_help')console.info('AGENT_ROUTE:APP_HELP');
+    if(plan.category==='ambiguous')console.info('AGENT_ROUTE:AMBIGUOUS');
+    if(plan.category==='unsupported')console.info('AGENT_ROUTE:UNSUPPORTED');
     presentation.text=plan.displayTranscript;
-    if(plan.languageCommand)return handleLanguageCommand({pool,userId,session,command:plan.languageCommand,language,profileLanguage,clientContext});
+    if(plan.languageCommand){console.info('AGENT_ROUTE:LANGUAGE_CONTROL');return handleLanguageCommand({pool,userId,session,command:plan.languageCommand,language,profileLanguage,clientContext});}
     if(plan.taskCommand)return handleTaskCommand({pool,userId,session,command:plan.taskCommand,message:boundedMessage,language});
     const referenceBinding = reviewPlanAgainstResolvedReference({
       plan,
       resolution: referenceResolution,
     });
     if (!referenceBinding.ok) {
+      console.info('AGENT_ROUTE:REFERENCE_REJECTED');
       return finishAgentTurn({
         pool,
         userId,
@@ -1670,6 +1679,7 @@ async function handleAgentMessageInternal({
     // --- execute validated READ/DRAFT calls (bounded by the gateway) ---
     const toolsStarted=performance.now();
     const capabilityResults = [];
+    if(plan.capabilityCalls.length)console.info('AGENT_ROUTE:CAPABILITY_EXECUTION');
     const successfulCapabilityCalls = [];
     let capabilityFailureCode = null;
     let pendingDraft = null;
@@ -1744,6 +1754,7 @@ async function handleAgentMessageInternal({
 
     if (voiceReply) recordVoiceLatency('TOOLS',toolsStarted);
     if (capabilityFailureCode) {
+      console.info('AGENT_ROUTE:CAPABILITY_REJECTED');
       return finishAgentTurn({
         pool,
         userId,
@@ -1814,6 +1825,7 @@ async function handleAgentMessageInternal({
             : {}),
         });
       } else {
+        console.info('AGENT_ROUTE:NAVIGATION_REJECTED');
         await auditBestEffort({
           db: pool,
           userId,
@@ -1867,6 +1879,7 @@ async function handleAgentMessageInternal({
         conversationalSummary = replyResult.conversationalSummary ||
           (['conversation','ambiguous'].includes(plan.category) ? productConversationSummary({category:plan.category,topic:plan.intent}) : null);
       } else {
+        console.info('AGENT_ROUTE:REPLY_REJECTED');
         const deterministicReply = deterministicNextTaskReply({
           capabilityResults,
           language,
@@ -1884,7 +1897,8 @@ async function handleAgentMessageInternal({
           const zeroTool=['app_help','conversation','ambiguous'].includes(plan.category)&&capabilityResults.length===0;
           const fallback= !zeroTool?'agentUnavailable':
             replyResult.failureClass==='PROVIDER_UNAVAILABLE'?'agentConversationUnavailable':
-            plan.category==='app_help'?'agentProductUnverified':'agentConversationClarify';
+            plan.category==='app_help'?'agentProductUnverified':
+            plan.category==='ambiguous'?'agentConversationClarify':'agentConversationUnavailable';
           reply = localizedAgentText(fallback, language);
           fallbackCode = replyResult.code || 'AGENT_REPLY_FAILED';
         }
@@ -1936,10 +1950,12 @@ async function handleAgentMessageInternal({
 
 async function handleTaskCommand({pool,userId,session,command,message,language}) {
   if(command.kind==='start'&&session.state?.taskWorkflow?.status==='awaiting_confirmation') {
+    console.info('AGENT_ROUTE:PENDING_CONFIRMATION');
     return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(session.state.taskWorkflow,language),
       reply:confirmationText('alreadyAwaiting',language),navigation:null};
   }
   if(command.kind==='start'&&hasActivePendingDraft(session.state)) {
+    console.info('AGENT_ROUTE:PENDING_CONFIRMATION');
     return {ok:true,sessionId:session.id,language,reply:confirmationText('alreadyAwaiting',language),
       fallbackCode:'AGENT_CONFIRMATION_ALREADY_PENDING',confirmation:responseConfirmationFromDraft(session.state.pendingDraft,language),
       actionStatus:'awaiting_confirmation',navigation:null,clarification:null,referencedEntities:[],
@@ -1950,6 +1966,7 @@ async function handleTaskCommand({pool,userId,session,command,message,language})
   const saved=await updateAgentSessionState({db:pool,userId,sessionId:session.id,state:{...session.state,languageQuestion:null,
     ...(command.kind==='start'?{pendingClarification:null}:{}),taskWorkflow:reduced.workflow},expectedState:session.state});
   if(!saved.ok)return {ok:false,code:saved.code,message:taskWorkflowText('failed',language)};
+  if(reduced.workflow.status==='collecting'&&reduced.workflow.awaitingField==='title')console.info('AGENT_ROUTE:TITLE_COLLECTION');
   return {ok:true,sessionId:session.id,language,...taskWorkflowResponse(reduced.workflow,language),
     ...(command.kind==='start'?{navigation:{target:'care_plan_new',params:{}}}:{}),
     ...(command.kind==='resume'&&reduced.workflow.status==='collecting'?{reply:taskWorkflowText('continue',language)}:{})};
@@ -2000,9 +2017,10 @@ async function handleNameMemoryCommand({pool,userId,session,command,message,lang
    const evidenceRef=`name:${randomUUID()}`;
    try {
     const receipt=await createAgentMemory({db:pool,userId,deduplicate:true,item:{kind:'CONFIRMED_FACT',key:'identity.name',value:{name},source:'user_api',evidenceRef,confirmedByUser:true},evidence:{explicitUser:true,ref:evidenceRef}});
-    if(receipt.ok===true) status='succeeded';
+    if(receipt.ok===true) {status='succeeded';console.info('AGENT_MEMORY_RECEIPT:VERIFIED');}
+    else console.info('AGENT_MEMORY_WRITE_FAILED:RECEIPT:UNVERIFIED');
    } catch { /* No receipt: fail closed, including timeout/ambiguous commit. */ }
-  }
+  } else console.info('AGENT_MEMORY_WRITE_FAILED:SOURCE:EVIDENCE_INVALID');
  } else {
   try {
    const items=await readRelevantAgentMemory({db:pool,userId,keys:['identity.name'],review:true,limit:1});

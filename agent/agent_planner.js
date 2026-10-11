@@ -1,4 +1,5 @@
 import {validateLanguageCommand} from './agent_language_control.js';
+import {logAgentPlanOutput,logAgentPlanFailure} from './agent_diagnostics.js';
 import {validateTaskCommand} from './agent_task_workflow.js';
 /**
  * Agent Planner (Phase B).
@@ -102,7 +103,8 @@ const RECOVERABLE_PLANNING_FAILURES = new Set([
 
 const SAFE_FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{1,80}$/;
 
-function invalidPlan(message) {
+function invalidPlan(message,reason='SHAPE') {
+  console.info(`AGENT_PLAN_REJECTED:${reason}`);
   return {
     ok: false,
     code: 'AGENT_PLAN_INVALID',
@@ -420,13 +422,13 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
   }
   for (const key of Object.keys(rawPlan)) {
     if (key !== 'category' && key !== 'intent' && key !== 'capabilityCalls' && key !== 'navigationIntent' && key !== 'productFactIds' && key !== 'uiOperations' && key !== 'memoryProposal' && key !== 'taskCommand' && key !== 'taskInput' && key !== 'languageCommand' && key !== 'memoryCommand' && key !== 'appHelpClarification') {
-      return invalidPlan(`Plan has an unknown field: ${key}.`);
+      return invalidPlan(`Plan has an unknown field: ${key}.`,'UNKNOWN_FIELD');
     }
   }
 
   if ((requireCategory || rawPlan.category !== undefined) &&
       !AGENT_SEMANTIC_CATEGORIES.includes(rawPlan.category)) {
-    return invalidPlan('A closed semantic category is required.');
+    return invalidPlan('A closed semantic category is required.','CATEGORY');
   }
   // Normalize the CURRENT planner's canonical creation action to its server
   // workflow. This is semantic output, not user-phrase matching or old memory.
@@ -434,19 +436,20 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
   // Never discard competing operations or accept unknown schema as a repair.
   if(rawPlan.intent==='create_care_plan'&&['task_workflow','action','conversation','ambiguous'].includes(rawPlan.category)&&rawPlan.taskCommand===undefined) {
     if((rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.languageCommand||rawPlan.taskInput!==undefined) {
-      return invalidPlan('Care-plan creation must use only the task workflow.');
+      return invalidPlan('Care-plan creation must use only the task workflow.','CREATION_CONFLICT');
     }
     rawPlan={...rawPlan,category:'task_workflow',taskCommand:{kind:'start',workflowKind:'create_care_plan'}};
+    console.info('AGENT_PLAN_STAGE:CREATE_NORMALIZED');
   }
-  if(rawPlan.taskCommand!==undefined&&(!validateTaskCommand(rawPlan.taskCommand)||rawPlan.category!=='task_workflow'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal))return invalidPlan('Task command must use the closed task workflow route.');
-  if(rawPlan.category==='task_workflow'&&rawPlan.taskCommand===undefined)return invalidPlan('Task workflow command required.');
-  if(rawPlan.taskInput!==undefined&&(!['title','continuation','change_topic'].includes(rawPlan.taskInput)||!['conversation','ambiguous'].includes(rawPlan.category)))return invalidPlan('Invalid contextual slot decision.');
-  if(rawPlan.languageCommand!==undefined&&(!validateLanguageCommand(rawPlan.languageCommand)||rawPlan.category!=='conversation'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.taskCommand))return invalidPlan('Invalid language command.');
-  if(rawPlan.memoryCommand!==undefined&&(!validateAgentMemoryCommand(rawPlan.memoryCommand)||rawPlan.category!=='memory'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.taskCommand||rawPlan.languageCommand||rawPlan.taskInput!==undefined||rawPlan.appHelpClarification))return invalidPlan('Invalid memory command.');
-  if(rawPlan.category==='memory'&&!rawPlan.memoryCommand)return invalidPlan('Memory command required.');
+  if(rawPlan.taskCommand!==undefined&&(!validateTaskCommand(rawPlan.taskCommand)||rawPlan.category!=='task_workflow'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal))return invalidPlan('Task command must use the closed task workflow route.','TASK_COMMAND');
+  if(rawPlan.category==='task_workflow'&&rawPlan.taskCommand===undefined)return invalidPlan('Task workflow command required.','TASK_COMMAND_MISSING');
+  if(rawPlan.taskInput!==undefined&&(!['title','continuation','change_topic'].includes(rawPlan.taskInput)||!['conversation','ambiguous'].includes(rawPlan.category)))return invalidPlan('Invalid contextual slot decision.','TASK_INPUT');
+  if(rawPlan.languageCommand!==undefined&&(!validateLanguageCommand(rawPlan.languageCommand)||rawPlan.category!=='conversation'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.taskCommand))return invalidPlan('Invalid language command.','LANGUAGE_COMMAND');
+  if(rawPlan.memoryCommand!==undefined&&(!validateAgentMemoryCommand(rawPlan.memoryCommand)||rawPlan.category!=='memory'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.taskCommand||rawPlan.languageCommand||rawPlan.taskInput!==undefined||rawPlan.appHelpClarification))return invalidPlan('Invalid memory command.','MEMORY_COMMAND');
+  if(rawPlan.category==='memory'&&!rawPlan.memoryCommand)return invalidPlan('Memory command required.','MEMORY_COMMAND_MISSING');
   if(rawPlan.appHelpClarification!==undefined) {
     const c=rawPlan.appHelpClarification;
-    if(!isPlainObject(c)||Object.keys(c).join(',')!=='featureId'||(c.featureId!==null&&c.featureId!=='feature_care_plan_name')||rawPlan.category!=='ambiguous'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.taskCommand||rawPlan.languageCommand||rawPlan.taskInput!==undefined)return invalidPlan('Invalid app-help clarification.');
+    if(!isPlainObject(c)||Object.keys(c).join(',')!=='featureId'||(c.featureId!==null&&c.featureId!=='feature_care_plan_name')||rawPlan.category!=='ambiguous'||(rawPlan.capabilityCalls??[]).length||rawPlan.navigationIntent||rawPlan.uiOperations?.length||rawPlan.memoryProposal||rawPlan.taskCommand||rawPlan.languageCommand||rawPlan.taskInput!==undefined)return invalidPlan('Invalid app-help clarification.','APP_HELP_CLARIFICATION');
   }
   let selection=null;
   if(rawPlan.category==='app_help') {
@@ -491,6 +494,8 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
     const capability = resolveAgentCapability(call.name);
     const validatedArgs = validateAgentCapabilityInput(capability, call.args ?? {});
     if (!validatedArgs.ok) {
+      console.info('AGENT_PLAN_REJECTED:CAPABILITY_ARGUMENTS');
+      if(capability.inputSchema.required.some(key=>call.args?.[key]===undefined))console.info('AGENT_PLAN_REJECTED:ARGUMENT_MISSING');
       return {
         ok: false,
         code: validatedArgs.code,
@@ -516,7 +521,7 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
   if(memory&&!memory.ok) return invalidPlan('Memory proposal is unsupported.');
   if(ui.operations.length&&rawPlan.category!=='ui_guidance') return invalidPlan('UI operations require UI guidance.');
   if (rawPlan.category !== undefined && !reviewSemanticRoute(rawPlan.category,capabilityCalls,navigationIntent,ui.operations,rawPlan.taskCommand,rawPlan.memoryCommand)) {
-    return invalidPlan('Semantic category conflicts with planned capability/navigation use.');
+    return invalidPlan('Semantic category conflicts with planned capability/navigation use.','CATEGORY_CONFLICT');
   }
   return {
     ok: true,
@@ -534,14 +539,17 @@ export function validateAgentPlan(rawPlan, {requireCategory=false,uiContext=null
 }
 
 async function requestAndValidatePlan({ provider, systemPrompt, userPrompt, contextSlice, message }) {
+  console.info('AGENT_PLAN_STAGE:REQUEST');
   const completion = await timeVoiceStage('MODEL',()=>provider.planAgentTurn({ systemPrompt, userPrompt }));
   if (!completion.ok) {
+    logAgentPlanFailure(completion);
     return completion;
   }
 
   // Presentation is not execution authority. Validate it separately against the
   // exact original message; a failed rendering cannot alter/deny a valid plan.
   const {displayTranscript,...executionPlan}=completion.data.json;
+  logAgentPlanOutput(executionPlan);
 
   const planForValidation = bindRawPlanToResolvedReference(
     executionPlan,
@@ -549,8 +557,10 @@ async function requestAndValidatePlan({ provider, systemPrompt, userPrompt, cont
   );
   const validated = validateAgentPlan(planForValidation,{requireCategory:true,uiContext:contextSlice?.clientUi});
   if (!validated.ok) {
+    logAgentPlanFailure(validated);
     return validated;
   }
+  console.info('AGENT_PLAN_STAGE:VALIDATED');
 
   const selected=validated.plan.languageCommand?.scope==='conversation'?validated.plan.languageCommand.language:null;
   const presentation=validateDisplayTranscript({raw:message,candidate:displayTranscript,language:selected??contextSlice?.language});
@@ -613,6 +623,7 @@ export async function planAgentMessage({
     message: boundedMessage,
   });
   if (first.ok || !isRecoverablePlanningFailure(first)) return first;
+  console.info('AGENT_PLAN_STAGE:REPAIR');
 
   const repairPrompt = buildAgentPlannerRepairPrompt({
     message: boundedMessage,

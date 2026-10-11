@@ -1,4 +1,5 @@
 import { CopilotError, missingCopilotSchema, requireId, withCopilotTransaction } from './agent_copilot_store.js';
+import {agentMemoryFailureReason,logAgentMemoryWriteFailure} from './agent_diagnostics.js';
 
 const exact = (value, fields) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
 const choice = (value, choices) => choices.includes(value);
@@ -32,38 +33,52 @@ function validateMemory(input, evidence, now = Date.now()) {
   return { ...input, confidence, confirmedByUser: !inferred, expiresAt, sensitivityClass: input.sensitivityClass || (input.key.includes('constraint') || input.key.startsWith('routine.') ? 'operational' : 'preference') };
 }
 const fromRow = row => ({ id: String(row.id), kind: row.kind, key: row.memory_key, value: JSON.parse(row.value_json), source: row.source, evidenceRef: row.evidence_ref, confidence: Number(row.confidence), confirmedByUser: Boolean(row.confirmed_by_user), status: row.status, expiresAt: row.expires_at, supersededBy: row.superseded_by ? String(row.superseded_by) : null, sensitivityClass: row.sensitivity_class, createdAt: row.created_at, updatedAt: row.updated_at, lastUsedAt: row.last_used_at });
-async function storage(work) {
-  try { return await work(); } catch (error) { if (missingCopilotSchema(error)) throw new CopilotError('AGENT_MEMORY_STORAGE_UNAVAILABLE', 503); throw error; }
+async function storage(work,onFailure=null) {
+  try { return await work(); } catch (error) { onFailure?.(error); if (missingCopilotSchema(error)) throw new CopilotError('AGENT_MEMORY_STORAGE_UNAVAILABLE', 503); throw error; }
 }
-export async function createAgentMemory({ db, userId, item, evidence, supersedesId = null, deduplicate = true }) {
+export async function createAgentMemory(args) {
+  const trace={stage:'VALIDATION',failure:null};
+  try {return await createAgentMemoryInternal(args,trace);}
+  catch(error) {logAgentMemoryWriteFailure(trace.stage,trace.failure??error);throw error;}
+}
+async function createAgentMemoryInternal({ db, userId, item, evidence, supersedesId = null, deduplicate = true },trace) {
   userId = requireId(userId);
   const safe = validateMemory(item, evidence);
   if (supersedesId) requireId(supersedesId);
   let supersededExisting = false;
   let reused = false;
+  trace.stage='TRANSACTION';
+  console.info('AGENT_MEMORY_WRITE_STAGE:TRANSACTION');
   const result = await storage(() => withCopilotTransaction(db, async connection => {
     // A user-row lock serializes same-user corrections, including first insert.
+    trace.stage='ACCOUNT_LOCK';
     const [users] = await connection.execute('SELECT id FROM users WHERE id = ? FOR UPDATE', [userId]);
     if (!users.length) throw new CopilotError('AGENT_MEMORY_NOT_FOUND', 404);
     if (deduplicate && !supersedesId && safe.kind !== 'INFERRED_PATTERN') {
+      trace.stage='DEDUP_READ';
       const [current] = await connection.execute(`SELECT * FROM agent_memory WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) AND memory_key IN (?) ORDER BY id DESC LIMIT 1 FOR UPDATE`, [userId, safe.key]);
       if (current.length && current[0].kind === safe.kind && JSON.stringify(fromRow(current[0]).value) === JSON.stringify(safe.value)) {
         reused = true;
+        trace.stage='COMMIT_OR_RELEASE';
         return {ok:true,memory:fromRow(current[0])};
       }
     }
     if (supersedesId) {
+      trace.stage='SUPERSEDE_READ';
       const [old] = await connection.execute(`SELECT id, memory_key FROM agent_memory WHERE id = ? AND user_id = ? AND status = 'active' FOR UPDATE`, [String(supersedesId), userId]);
       if (!old.length || old[0].memory_key !== safe.key) throw new CopilotError('AGENT_MEMORY_NOT_FOUND', 404);
     }
+    trace.stage='INSERT';
     const [result] = await connection.execute(`INSERT INTO agent_memory (user_id, kind, memory_key, value_json, source, evidence_ref, confidence, confirmed_by_user, expires_at, sensitivity_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [userId, safe.kind, safe.key, JSON.stringify(safe.value), safe.source, safe.evidenceRef, safe.confidence, Number(safe.confirmedByUser), safe.expiresAt, safe.sensitivityClass]);
     const id = String(result.insertId);
     // Preserve history, but never leave contradictory active values in a class.
+    trace.stage='SUPERSEDE_UPDATE';
     const [superseded] = await connection.execute(`UPDATE agent_memory SET status = 'superseded', superseded_by = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND memory_key = ? AND (kind = ? OR (kind <> 'INFERRED_PATTERN' AND ? <> 'INFERRED_PATTERN')) AND status = 'active' AND id <> ?`, [id, userId, safe.key, safe.kind, safe.kind, id]);
     supersededExisting = Number(superseded.affectedRows || 0) > 0 || supersedesId !== null;
     if (supersedesId) await connection.execute(`UPDATE agent_memory SET status = 'superseded', superseded_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND id <> ?`, [id, String(supersedesId), userId, id]);
+    trace.stage='COMMIT_OR_RELEASE';
     return { ok: true, memory: { id, ...safe, status: 'active' } };
-  }));
+  }),error=>{trace.failure=error;});
   // Fixed markers only, after the transaction committed. No IDs, values or evidence.
   if (!reused) console.info(safe.kind === 'INFERRED_PATTERN' ? 'AGENT_MEMORY:INFERENCE' : supersededExisting ? 'AGENT_MEMORY:UPDATED' : 'AGENT_MEMORY:CREATED');
   return result;
@@ -102,7 +117,7 @@ export async function readRelevantAgentMemory({ db, userId, screenId, keys, limi
       for(const item of items) item.lastUsedAt=usedAt;
     }
     return items;
-  } catch (error) { if (missingCopilotSchema(error)) return []; throw error; }
+  } catch (error) { console.info(`AGENT_MEMORY_READ_FAILED:${agentMemoryFailureReason(error)}`); if (missingCopilotSchema(error)) return []; throw error; }
 }
 // Called only with server-owned capability execution envelopes. UI snapshots,
 // model prose and single-day summaries never become inferred memory.

@@ -261,13 +261,14 @@ test('non-object model JSON is repairable while transport errors remain provider
   }
 });
 
-test('an invalid semantic plan asks for clarification instead of implying infrastructure failure',async()=>{
+test('invalid provider schema reports answer failure without inventing semantic ambiguity',async()=>{
   let calls=0;
   const provider=createAgentProvider({generateJson:async()=>{calls++;return {json:{unexpected:true}};}});
   const result=await handleAgentMessage({pool:database(),userId:'42',sessionId:'501',
     message:'Could you elaborate a little?',provider});
-  assert.equal(calls,2); assert.match(result.reply,/clarify|mean/i);
-  assert.doesNotMatch(result.reply,/Nothing was changed|try again/i);
+  assert.equal(calls,2); assert.equal(result.fallbackCode,'AGENT_PLAN_INVALID');
+  assert.equal(result.reply,"I couldn't answer that right now. Please try again.");
+  assert.doesNotMatch(result.reply,/Nothing was changed|clarify|mean/i);
 });
 
 test('negation about one claim cannot authorize another prohibited claim',async()=>{
@@ -313,7 +314,7 @@ test('app-help diagnostics remain fixed and contain no message or generated cont
       {messageTemplate:'SehatMate can explain verified care plans.'}]});
     await run('PRIVATE_USER_TEXT',{outputs:[{unexpected:true}]});
     await run('PRIVATE_USER_TEXT',{productFactIds:['PRIVATE_UNKNOWN_FACT']});
-    const allowed=/^(?:AGENT_APP_HELP:(?:FACT_SELECTION_OK|FACT_SELECTION_INVALID|REPLY_OK|REPAIR_STARTED|REPAIR_OK|REPAIR_FAILED)|AGENT_REPLY_FAILURE:(?:INVALID_OUTPUT|LANGUAGE|FACT_UNKNOWN|FACT_CONFLICT|PRODUCT_GROUNDING|PRODUCT_SELECTION|ZERO_EVIDENCE|PROVIDER))$/;
+    const allowed=/^(?:AGENT_APP_HELP:(?:FACT_SELECTION_OK|FACT_SELECTION_INVALID|REPLY_OK|REPAIR_STARTED|REPAIR_OK|REPAIR_FAILED)|AGENT_REPLY_FAILURE:(?:INVALID_OUTPUT|LANGUAGE|FACT_UNKNOWN|FACT_CONFLICT|PRODUCT_GROUNDING|PRODUCT_SELECTION|ZERO_EVIDENCE|PROVIDER)|AGENT_PLAN_STAGE:(?:REQUEST|REPAIR|VALIDATED)|AGENT_PLAN_OUTPUT:APP_HELP|AGENT_PLAN_CREATE_INTENT:OTHER|AGENT_PLAN_FAILED:PRODUCT_SELECTION|AGENT_ROUTE:(?:APP_HELP|PLANNER_REJECTED|REPLY_REJECTED))$/;
     assert.ok(logs.every(s=>allowed.test(s)));
     for(const marker of ['FACT_SELECTION_OK','FACT_SELECTION_INVALID','REPAIR_STARTED','REPAIR_OK','REPAIR_FAILED']) {
       assert.ok(logs.includes(`AGENT_APP_HELP:${marker}`));
