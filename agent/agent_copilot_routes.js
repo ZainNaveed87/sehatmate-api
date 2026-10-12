@@ -32,7 +32,7 @@ export function mountAgentCopilotRoutes({ app, authenticate, pool, limiter = (_r
     if (!exact(req.body, ['sessionId', 'planId', 'actionId', 'targetId', 'status', 'source', 'screenVersionBefore', 'screenVersionAfter', 'resultCode', 'confirmationRef', 'workflowId'])) throw new CopilotError('INVALID_AGENT_RECEIPT');
     return recordCopilotReceipt({ ...req.body, db: pool, userId: user(req) });
   }));
-  app.get('/api/agent/copilot/memory', authenticate, limiter, route(req => readRelevantAgentMemory({ db: pool, userId: user(req), review: true, limit: 12 })));
+  app.get('/api/agent/copilot/memory', authenticate, limiter, route(req => readRelevantAgentMemory({ db: pool, userId: user(req), review: true, strict: true, limit: 12 })));
   app.post('/api/agent/copilot/memory', authenticate, limiter, route(async req => {
     if (!exact(req.body, ['sessionId', 'item'])) throw new CopilotError('INVALID_AGENT_MEMORY');
     if (req.body.sessionId) await requireCopilotSession({ db: pool, userId: user(req), sessionId: req.body.sessionId });

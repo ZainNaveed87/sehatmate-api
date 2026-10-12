@@ -132,6 +132,7 @@ import {unsupportedAgentReply,currentTaskFallbackAllowed} from './agent_semantic
 import {validateAgentUiContext,buildAgentUiPlan} from './agent_ui_protocol.js';
 import {readCopilotContext,saveCopilotPlan} from './agent_copilot_store.js';
 import {createAgentMemory,requestedAgentName,agentNameMemoryReply,readRelevantAgentMemory,rememberVerifiedAgentPatterns} from './agent_memory.js';
+import {personalMemoryItem,personalMemoryText,personalMemoryConfirmation} from './agent_personal_memory.js';
 import {conflictsFromToolResults} from './agent_conflicts.js';
 import {
   cleanText,
@@ -415,6 +416,7 @@ function hasActivePendingDraft(state, now = Date.now()) {
 }
 
 function responseConfirmationFromDraft(draft, language = 'en') {
+  if(draft?.kind==='personal_memory')return personalMemoryConfirmation(draft,language);
   if (!draft || !DRAFT_KINDS.has(draft.kind)) return null;
   return {
     confirmationId: draft.confirmationId,
@@ -962,6 +964,7 @@ function finishAgentConfirmationTurn({
   confirmation = null,
   actionStatus = null,
   language = session.language,
+  memoryReceipt = null,
 }) {
   return {
     ok: true,
@@ -972,6 +975,7 @@ function finishAgentConfirmationTurn({
     confirmation,
     actionStatus,
     referencedEntities: [],
+    ...(memoryReceipt?{memoryReceipt}:{}),
     ...(fallbackCode ? { fallbackCode } : {}),
   };
 }
@@ -1058,6 +1062,8 @@ async function handleAgentConfirmation({
 
   const pendingDraft = claimed.data.pendingDraft;
   const claimedSession = claimed.data.session;
+
+  if(pendingDraft.kind==='personal_memory')return handlePersonalMemoryConfirmation({pool,userId,session:claimedSession,draft:pendingDraft,decision:confirmationRequest.decision,language});
 
   if (confirmationRequest.decision === 'cancel') {
     return deniedTurn({
@@ -1391,6 +1397,7 @@ async function handleAgentMessageInternal({
         return {ok:true,sessionId:session.id,language,reply:{en:'Language selection cancelled.',ur:'زبان کا انتخاب منسوخ کر دیا۔',roman_ur:'Language ka intikhab cancel kar diya.'}[language],navigation:null,confirmation:null,clarification:null,referencedEntities:[]};
       }
     }
+    if(conversationalDecision&&session.state.pendingDraft?.kind==='personal_memory')return handleAgentConfirmation({pool,userId,session,confirmationRequest:{ok:true,confirmationId:session.state.pendingConfirmation?.confirmationId,decision:conversationalDecision},language});
     if(conversationalDecision&&session.state?.taskWorkflow?.status==='collecting')return handleTaskCommand({pool,userId,session,command:{kind:conversationalDecision==='cancel'?'cancel':'resume'},message:boundedMessage,language});
     if(conversationalDecision&&session.state?.taskWorkflow?.status==='awaiting_confirmation') {
       return handleTaskConfirmation({pool,userId,session,request:{ok:true,confirmationId:session.state.taskWorkflow.confirmationId,decision:conversationalDecision},language});
@@ -1540,6 +1547,7 @@ async function handleAgentMessageInternal({
       presentation.text=planned.plan.displayTranscript;
       return handleNameMemoryCommand({pool,userId,session,command:planned.plan.memoryCommand,message:boundedMessage,language});
     }
+    if(planned.ok&&planned.plan.memoryProposal)return proposePersonalMemory({pool,userId,session,item:planned.plan.memoryProposal,language});
     if(planned.ok&&planned.plan.appHelpClarification) {
       console.info('AGENT_ROUTE:APP_ENTITY_CLARIFICATION');
       presentation.text=planned.plan.displayTranscript;
@@ -2010,28 +2018,65 @@ async function handleLanguageCommand({pool,userId,session,command,language,profi
 
 async function handleNameMemoryCommand({pool,userId,session,command,message,language}) {
  const operation=command.kind;
+ const key=operation==='recall'?(command.key??'identity.name'):'identity.name';
  let name='',status=operation==='remember'?'failed':'missing';
  if(operation==='remember') {
   name=requestedAgentName(command,message) || '';
   if(name) {
-   const evidenceRef=`name:${randomUUID()}`;
-   try {
-    const receipt=await createAgentMemory({db:pool,userId,deduplicate:true,item:{kind:'CONFIRMED_FACT',key:'identity.name',value:{name},source:'user_api',evidenceRef,confirmedByUser:true},evidence:{explicitUser:true,ref:evidenceRef}});
-    if(receipt.ok===true) {status='succeeded';console.info('AGENT_MEMORY_RECEIPT:VERIFIED');}
-    else console.info('AGENT_MEMORY_WRITE_FAILED:RECEIPT:UNVERIFIED');
-   } catch { /* No receipt: fail closed, including timeout/ambiguous commit. */ }
+   return proposePersonalMemory({pool,userId,session,item:{kind:'CONFIRMED_FACT',key:'identity.name',value:{name}},language});
   } else console.info('AGENT_MEMORY_WRITE_FAILED:SOURCE:EVIDENCE_INVALID');
  } else {
   try {
-   const items=await readRelevantAgentMemory({db:pool,userId,keys:['identity.name'],review:true,limit:1});
-   name=items.find(item=>item.kind==='CONFIRMED_FACT')?.value.name || '';
+   const items=await readRelevantAgentMemory({db:pool,userId,keys:[key],review:true,strict:true,limit:1});
+   const remembered=items.find(item=>item.confirmedByUser&&item.kind!=='INFERRED_PATTERN');
+   if(key!=='identity.name') {
+    const reply=remembered?{en:`Your saved preference (${key}) is ${JSON.stringify(remembered.value)}.`,roman_ur:`Aap ki save ki hui preference (${key}) ${JSON.stringify(remembered.value)} hai.`,ur:`آپ کی محفوظ ترجیح (${key}) ${JSON.stringify(remembered.value)} ہے۔`}[language]:{en:'That preference is not saved in Agent Memory.',roman_ur:'Yeh preference Agent Memory mein save nahi hai.',ur:'یہ ترجیح Agent Memory میں محفوظ نہیں ہے۔'}[language];
+    return finishAgentTurn({pool,userId,session,language,reply,intent:'agent_memory',capabilityCalls:[],navigation:null,...pendingTaskConfirmationEnvelope(session,language),memoryReceipt:{operation,status:remembered?'found':'missing',key}});
+   }
+   name=remembered?.value.name || '';
    if(name)status='found';
   } catch {status='failed';}
  }
  const reply=status==='failed'&&operation==='recall'
   ? {en:'I could not read Agent Memory right now.',roman_ur:'Abhi Agent Memory parh nahi saka.',ur:'ابھی Agent Memory پڑھ نہیں سکا۔'}[language]
   : agentNameMemoryReply({language,operation,status,name});
- return finishAgentTurn({pool,userId,session,language,reply,intent:'agent_memory',capabilityCalls:[],navigation:null,navigationEntity:null,screenEntity:null,...pendingTaskConfirmationEnvelope(session,language),memoryReceipt:{operation,status,key:'identity.name'}});
+ return finishAgentTurn({pool,userId,session,language,reply,intent:'agent_memory',capabilityCalls:[],navigation:null,navigationEntity:null,screenEntity:null,...pendingTaskConfirmationEnvelope(session,language),memoryReceipt:{operation,status,key}});
+}
+
+async function proposePersonalMemory({pool,userId,session,item,language}) {
+ if(hasActivePendingDraft(session.state)||session.state.taskWorkflow?.status==='awaiting_confirmation') {
+  const confirmation=hasActivePendingDraft(session.state)?responseConfirmationFromDraft(session.state.pendingDraft,language):taskWorkflowResponse(session.state.taskWorkflow,language).confirmation;
+  return finishAgentTurn({pool,userId,session,language,reply:confirmationText('alreadyAwaiting',language),intent:'confirmation_already_pending',capabilityCalls:[],navigation:null,confirmation,actionStatus:'awaiting_confirmation',fallbackCode:'AGENT_CONFIRMATION_ALREADY_PENDING'});
+ }
+ const confirmationId=randomUUID();
+ const draft={kind:'personal_memory',toolName:'agent_personal_memory',confirmationId,
+  expiresAt:new Date(Date.now()+CONFIRMATION_TTL_MS).toISOString(),memoryItem:JSON.stringify(item)};
+ const confirmation=personalMemoryConfirmation(draft,language);
+ // Reject rather than truncate the canonical value in the bounded session store.
+ if(!confirmation||draft.memoryItem.length>200)return finishAgentTurn({pool,userId,session,language,reply:localizedAgentText('agentUnavailable',language),intent:'agent_memory',capabilityCalls:[],navigation:null,fallbackCode:'INVALID_AGENT_MEMORY_PROPOSAL'});
+ console.info('AGENT_MEMORY_CONFIRMATION:PENDING');
+ return finishAgentTurn({pool,userId,session,language,reply:confirmation.message,intent:'agent_memory',capabilityCalls:[],navigation:null,pendingDraft:draft,pendingConfirmation:confirmation,confirmation,actionStatus:'awaiting_confirmation'});
+}
+
+async function handlePersonalMemoryConfirmation({pool,userId,session,draft,decision,language}) {
+ const item=personalMemoryItem(draft);
+ if(!item)return finishAgentConfirmationTurn({session,language,reply:confirmationText('rejected',language),actionStatus:'rejected',fallbackCode:'INVALID_AGENT_MEMORY_PROPOSAL'});
+ if(decision==='cancel') {
+  console.info('AGENT_MEMORY_CONFIRMATION:CANCELLED');
+  return finishAgentConfirmationTurn({session,language,reply:confirmationText('cancelled',language),actionStatus:'cancelled',memoryReceipt:{operation:'remember',status:'cancelled',key:item.key}});
+ }
+ console.info('AGENT_MEMORY_CONFIRMATION:CLAIMED');
+ let status='failed',fallbackCode='AGENT_MEMORY_WRITE_FAILED';
+ const evidenceRef=`memory-confirm:${draft.confirmationId}`;
+ try {
+  const receipt=await createAgentMemory({db:pool,userId,deduplicate:true,item:{...item,source:'user_confirmation',evidenceRef,confirmedByUser:true},evidence:{explicitUser:true,ref:evidenceRef}});
+  if(receipt?.ok===true&&receipt.memory?.confirmedByUser===true&&receipt.memory.key===item.key&&receipt.memory.kind===item.kind&&JSON.stringify(receipt.memory.value)===JSON.stringify(item.value)) {
+   status='succeeded';fallbackCode=null;console.info('AGENT_MEMORY_RECEIPT:VERIFIED');
+  }else console.info('AGENT_MEMORY_WRITE_FAILED:RECEIPT:UNVERIFIED');
+ } catch(error) {
+  if(error?.code==='AGENT_MEMORY_VERIFICATION_FAILED'){status='verification_failed';fallbackCode='AGENT_MEMORY_VERIFICATION_FAILED';}
+ }
+ return finishAgentConfirmationTurn({session,language,reply:personalMemoryText(item,language,status),actionStatus:status==='succeeded'?'confirmed':'rejected',fallbackCode,memoryReceipt:{operation:'remember',status,key:item.key}});
 }
 
 // Keep the existing workflow/confirmation pair valid on these zero-tool routes.

@@ -42,7 +42,11 @@ function model(plan,reply='A natural clarification.') {
  return {provider,requests};
 }
 async function run(db,plan,message=nameMessage,reply,context={screenId:'care_plan_upload'}) {
- const m=model(plan,reply);const result=await handleAgentMessage({pool:db,userId:'1',sessionId:'11',message,provider:m.provider,clientContext:context});
+ const m=model(plan,reply);let result=await handleAgentMessage({pool:db,userId:'1',sessionId:'11',message,provider:m.provider,clientContext:context});
+ if(plan.memoryCommand?.kind==='remember'&&result.confirmation?.kind==='personal_memory') {
+  assert.equal(result.actionStatus,'awaiting_confirmation');
+  result=await handleAgentMessage({pool:db,userId:'1',sessionId:'11',confirmation:{confirmationId:result.confirmation.confirmationId,decision:'confirm'},provider:m.provider});
+ }
  return {result,...m};
 }
 

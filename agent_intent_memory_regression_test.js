@@ -35,7 +35,11 @@ function model(plan,reply='A supported explanation.') {
 }
 async function run(plan,message,reply,db=new Database()) {
  const m=model(plan,reply);
- const result=await handleAgentMessage({pool:db,userId:'1',sessionId:'11',message,provider:m.provider,clientContext:{screenId:'care_plan_upload'}});
+ let result=await handleAgentMessage({pool:db,userId:'1',sessionId:'11',message,provider:m.provider,clientContext:{screenId:'care_plan_upload'}});
+ if(plan.memoryCommand?.kind==='remember'&&result.confirmation?.kind==='personal_memory') {
+  assert.equal(result.actionStatus,'awaiting_confirmation');
+  result=await handleAgentMessage({pool:db,userId:'1',sessionId:'11',confirmation:{confirmationId:result.confirmation.confirmationId,decision:'confirm'},provider:m.provider});
+ }
  return {result,db,...m};
 }
 async function capture(work) {

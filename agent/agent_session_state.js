@@ -1,5 +1,6 @@
 import {validateLanguageCommand,validateConversationLanguage} from './agent_language_control.js';
 import {validateTaskWorkflow} from './agent_task_workflow.js';
+import {personalMemoryItem} from './agent_personal_memory.js';
 /**
  * Canonical bounded state contract for agent sessions (Phase A2).
  *
@@ -171,6 +172,14 @@ function sanitizePendingDraft(value) {
     if (count >= AGENT_STATE_LIMITS.draftMaxEntries) break;
     const key = cleanText(rawKey, AGENT_STATE_LIMITS.draftKeyMaxLength);
     if (!key || typeof rawValue !== 'string') continue;
+    if(key==='memoryItem'&&value.kind==='personal_memory') {
+      // JSON is a bounded validated candidate, not prose: normalizing whitespace
+      // inside it could change the very value the user is asked to confirm.
+      if(rawValue.length<=AGENT_STATE_LIMITS.draftValueMaxLength&&personalMemoryItem(value)) {
+        draft[key]=rawValue;count+=1;
+      }
+      continue;
+    }
     const stored = cleanText(rawValue, AGENT_STATE_LIMITS.draftValueMaxLength);
     if (!stored) continue;
     draft[key] = stored;

@@ -79,6 +79,16 @@ async function createAgentMemoryInternal({ db, userId, item, evidence, supersede
     trace.stage='COMMIT_OR_RELEASE';
     return { ok: true, memory: { id, ...safe, status: 'active' } };
   }),error=>{trace.failure=error;});
+  // Commit is necessary but insufficient: verify the same owned, active row
+  // through the canonical memory source before issuing a success receipt.
+  trace.stage='READ_BACK';
+  const [rows]=await storage(()=>db.execute(`SELECT * FROM agent_memory WHERE id = ? AND user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) LIMIT 1`,[result.memory.id,userId]),error=>{trace.failure=error;});
+  const stored=rows.length?fromRow(rows[0]):null;
+  if(!stored||stored.id!==result.memory.id||stored.kind!==safe.kind||stored.key!==safe.key||
+    stored.confirmedByUser!==safe.confirmedByUser||!AGENT_MEMORY_KEYS[stored.key]?.validate(stored.value)||
+    JSON.stringify(stored.value)!==JSON.stringify(safe.value))throw new CopilotError('AGENT_MEMORY_VERIFICATION_FAILED',503);
+  result.memory=stored;
+  console.info('AGENT_MEMORY_WRITE_STAGE:READ_BACK_VERIFIED');
   // Fixed markers only, after the transaction committed. No IDs, values or evidence.
   if (!reused) console.info(safe.kind === 'INFERRED_PATTERN' ? 'AGENT_MEMORY:INFERENCE' : supersededExisting ? 'AGENT_MEMORY:UPDATED' : 'AGENT_MEMORY:CREATED');
   return result;
@@ -101,7 +111,7 @@ export async function deactivateAgentMemory({ db, userId, memoryId }) {
   if (!result.affectedRows) throw new CopilotError('AGENT_MEMORY_NOT_FOUND', 404);
   return { ok: true };
 }
-export async function readRelevantAgentMemory({ db, userId, screenId, keys, limit = 8, review = false }) {
+export async function readRelevantAgentMemory({ db, userId, screenId, keys, limit = 8, review = false, strict = false }) {
   requireId(userId);
   screenId = ({ care_plan_detail: 'care_plan_details', care_plans: 'care_plan', routine_settings: 'tasks', today: 'tasks', family_care: 'caregiver', simulation: 'care_plan', care_gaps: 'care_plan', care_gap_detail: 'care_plan' })[screenId] || screenId;
   const requested = Array.isArray(keys) ? keys.filter(key => Object.hasOwn(AGENT_MEMORY_KEYS, key)) : null;
@@ -117,7 +127,7 @@ export async function readRelevantAgentMemory({ db, userId, screenId, keys, limi
       for(const item of items) item.lastUsedAt=usedAt;
     }
     return items;
-  } catch (error) { console.info(`AGENT_MEMORY_READ_FAILED:${agentMemoryFailureReason(error)}`); if (missingCopilotSchema(error)) return []; throw error; }
+  } catch (error) { console.info(`AGENT_MEMORY_READ_FAILED:${agentMemoryFailureReason(error)}`); if (missingCopilotSchema(error)) {if(strict)throw new CopilotError('AGENT_MEMORY_STORAGE_UNAVAILABLE',503);return [];} throw error; }
 }
 // Called only with server-owned capability execution envelopes. UI snapshots,
 // model prose and single-day summaries never become inferred memory.
@@ -140,10 +150,11 @@ export async function rememberVerifiedAgentPatterns({db,userId,toolResults=[]}) 
 // Semantic decisions come from the existing planner; this fence checks only
 // closed structure and explicit source evidence, never substitutes user text.
 export function validateAgentMemoryCommand(command) {
-  if (!exact(command, ['kind', 'nameSpan', 'requestSpan'])) return false;
-  if (command.kind === 'recall') return Object.keys(command).length === 1;
+  if (!exact(command, ['kind', 'nameSpan', 'requestSpan','key'])) return false;
+  if (command.kind === 'recall') return !command.nameSpan&&!command.requestSpan&&
+    (command.key===undefined||Object.hasOwn(AGENT_MEMORY_KEYS,command.key)&&command.key!=='routine.missed_pattern');
   const span = s => exact(s, ['start','end']) && Number.isInteger(s.start) && Number.isInteger(s.end) && s.start >= 0 && s.end > s.start;
-  return command.kind === 'remember' && span(command.nameSpan) && span(command.requestSpan);
+  return command.kind === 'remember' && command.key===undefined && span(command.nameSpan) && span(command.requestSpan);
 }
 export function requestedAgentName(command, message) {
   if (!validateAgentMemoryCommand(command) || command.kind !== 'remember' || typeof message !== 'string') return null;
